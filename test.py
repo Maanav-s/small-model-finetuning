@@ -1,19 +1,28 @@
-"""Smoke test: load google/gemma-4-E4B-it in 4-bit and run one generation.
+"""Phase 1 agentic loop: restaurant name -> menu JSON.
 
-Requires (one-time):
-  - `huggingface-cli login` with a token from an account that has
-    accepted the Gemma license at huggingface.co/google/gemma-4-E4B-it
-Run with:
+Drives Gemma 4 (MODEL_ID from agent.py) through a tool-call loop, using the
+canonical function-calling API (`tokenizer.parse_response`, bundled
+`tool_responses`) per ai.google.dev/gemma/docs/capabilities/text/function-calling-gemma4.
+
+The `web_search` tool is currently stubbed (returns sample_menu.md) so the loop
+is deterministic and offline. Run with:
   uv run python test.py
 """
+
+import json
+import re
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
-MODEL_ID = "google/gemma-4-E4B-it"
+from agent import MODEL_ID, TOOL_REGISTRY, TOOLS, build_messages
 
-# 4-bit quantization so the model fits in the RTX 4050's 6 GB of VRAM.
-# bf16 compute dtype matches what the GPU reported as supported.
+MAX_TOOL_CALLS = 4          # tool-call budget per episode (plan: 2-3 expected)
+MAX_NEW_TOKENS = 2560       # the full menu JSON can be long
+
+# ---------------------------------------------------------------------------
+# Load the model: 4-bit, pinned to GPU 0 (see CLAUDE.md for why not "auto").
+# ---------------------------------------------------------------------------
 quant_config = BitsAndBytesConfig(
     load_in_4bit=True,
     bnb_4bit_quant_type="nf4",
@@ -21,38 +30,105 @@ quant_config = BitsAndBytesConfig(
     bnb_4bit_use_double_quant=True,
 )
 
-print(f"Loading tokenizer for {MODEL_ID} ...")
+assert torch.cuda.is_available(), "CUDA not available - check the torch install"
+
+print(f"Loading {MODEL_ID} (4-bit) ...")
 tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
-
-assert torch.cuda.is_available(), "CUDA not available — check the torch install"
-
-print(f"Loading model {MODEL_ID} (4-bit) ...")
 model = AutoModelForCausalLM.from_pretrained(
     MODEL_ID,
     quantization_config=quant_config,
-    # Pin the whole model to GPU 0. "auto" can silently offload to CPU on a
-    # small card, which makes inference unusably slow.
     device_map={"": 0},
 )
 model.eval()
+print(f"Loaded on {model.device}, {torch.cuda.memory_allocated() / 1e9:.2f} GB VRAM")
 
-print(f"Model loaded on: {model.device}")
-print(f"VRAM allocated: {torch.cuda.memory_allocated() / 1e9:.2f} GB")
 
-# Quick sanity generation using the chat template.
-messages = [{"role": "user", "content": "Hello there, who are you and what is your purpose?"}]
-inputs = tokenizer.apply_chat_template(
-    messages,
-    add_generation_prompt=True,
-    return_tensors="pt",
-    return_dict=True,
-).to(model.device)
+def generate_turn(messages: list[dict]) -> str:
+    """Render `messages`, generate one model turn, return the decoded text.
 
-with torch.no_grad():
-    output = model.generate(**inputs, max_new_tokens=64, do_sample=False)
+    Keeps special tokens (skip_special_tokens=False) so parse_response can see
+    the <|tool_call> markers.
+    """
+    inputs = tokenizer.apply_chat_template(
+        messages,
+        tools=TOOLS,
+        add_generation_prompt=True,
+        return_tensors="pt",
+        return_dict=True,
+    ).to(model.device)
+    prompt_len = inputs["input_ids"].shape[-1]
 
-# Only decode the newly generated tokens, not the prompt.
-prompt_len = inputs["input_ids"].shape[-1]
-response = tokenizer.decode(output[0][prompt_len:], skip_special_tokens=True)
-print("\n--- Model output ---")
-print(response)
+    with torch.no_grad():
+        output = model.generate(
+            **inputs,
+            max_new_tokens=MAX_NEW_TOKENS,
+            do_sample=False,
+            # Stop right after a tool call so the model can't hallucinate its
+            # own tool response; normal turns still stop at EOS.
+            stop_strings=["<tool_call|>"],
+            tokenizer=tokenizer,
+        )
+    return tokenizer.decode(output[0][prompt_len:], skip_special_tokens=False)
+
+
+def run_episode(restaurant_name: str) -> str:
+    """Run the tool-call loop for one restaurant; return the final answer text."""
+    messages = build_messages(restaurant_name)
+
+    for step in range(MAX_TOOL_CALLS + 1):
+        text = generate_turn(messages)
+        parsed = tokenizer.parse_response(text)  # {role, [thinking], content?, tool_calls?}
+        tool_calls = parsed.get("tool_calls")
+
+        if not tool_calls:
+            return (parsed.get("content") or "").strip()  # final answer
+
+        # Execute every call the model made this turn, collecting responses.
+        tool_responses = []
+        for tc in tool_calls:
+            fn = tc["function"]
+            name, args = fn["name"], fn["arguments"]
+            print(f"  [step {step}] tool call: {name}({args})")
+            if name not in TOOL_REGISTRY:
+                print(f"  [warn] unknown tool {name!r}")
+                response = f"Error: unknown tool {name!r}"
+            else:
+                response = TOOL_REGISTRY[name](**args)
+                print(f"  [step {step}] -> {len(response)} chars returned")
+            tool_responses.append({"name": name, "response": response})
+
+        # Append the assistant turn (its tool_calls) + the tool results, bundled
+        # in one message as Gemma 4 expects.
+        messages.append({**parsed, "tool_responses": tool_responses})
+
+    print(f"  [warn] hit MAX_TOOL_CALLS={MAX_TOOL_CALLS} without a final answer")
+    return ""
+
+
+def extract_json(text: str):
+    """Best-effort: strip markdown fences and parse the answer as JSON."""
+    text = re.sub(r"^```(?:json)?|```$", "", text.strip(), flags=re.MULTILINE).strip()
+    try:
+        return json.loads(text), None
+    except json.JSONDecodeError as e:
+        return None, str(e)
+
+
+if __name__ == "__main__":
+    RESTAURANT = "Pagliacci Pizza, Seattle"
+    print(f"\n=== Episode: {RESTAURANT} ===")
+    answer = run_episode(RESTAURANT)
+
+    print("\n=== RAW FINAL ANSWER ===")
+    print(answer)
+
+    parsed, err = extract_json(answer)
+    print("\n=== SCHEMA CHECK ===")
+    if parsed is None:
+        print(f"INVALID JSON: {err}")
+    else:
+        sections = parsed.get("menu", [])
+        n_items = sum(len(s.get("items", [])) for s in sections)
+        print(f"Valid JSON. restaurant_name={parsed.get('restaurant_name')!r}, "
+              f"cuisine={parsed.get('cuisine')!r}, "
+              f"{len(sections)} sections, {n_items} items")
