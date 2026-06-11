@@ -6,9 +6,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Fine-tune a small open-weight LLM (`google/gemma-4-E4B-it`) to take a restaurant name as input and return its menu as structured JSON, using **Firecrawl** (web search + scraping) as an inference-time tool. The full multi-phase plan — agentic tool-call loop → SFT distillation → GRPO RL → eval — lives in [project_plan.md](project_plan.md). Read it before working on any phase; it defines the target JSON schema and reward design.
 
-> **Tooling note:** the plan switched from Tavily to **Firecrawl**. [project_plan.md](project_plan.md) still says Tavily in places, and the `web_search` tool in [agent.py](agent.py) still has a Tavily call body — both are pending migration to Firecrawl. The *tool interface* (a `web_search(query)` Python function passed to the chat template) stays the same; only the implementation inside it changes.
+> **Tooling note:** the plan switched from Tavily to **Firecrawl**. [project_plan.md](project_plan.md) still says Tavily in places, and the `web_search` tool in [src/agent.py](src/agent.py) still has a Tavily call body — both are pending migration to Firecrawl. The *tool interface* (a `web_search(query)` Python function passed to the chat template) stays the same; only the implementation inside it changes.
 
-**Status:** early scaffold. `main.py` is a stub. `test.py` is a smoke test for loading the model in 4-bit (verified working on GPU). `agent.py` defines the system prompt + tool schema (Phase 1). The generate/execute loop is not built yet.
+**Status:** early scaffold. Code lives in [src/](src/): [src/agent.py](src/agent.py) defines the system prompt + tool schema (Phase 1), and [src/run_agent.py](src/run_agent.py) drives the generate/execute tool-call loop (run with `uv run python src/run_agent.py`; pass `--quantize` for 4-bit on a small card). `main.py` in the root is an unused stub. Dev utilities live in [scripts/](scripts/) — e.g. [scripts/free_vram.sh](scripts/free_vram.sh) kills orphaned CUDA processes that pin VRAM after an interrupted run.
 
 ## Environment & commands
 
@@ -30,7 +30,7 @@ Local dev is a Windows laptop with an **RTX 4050, 6 GB VRAM**. This is the bindi
 
 ## Gemma 4 chat template & tool calling
 
-Gemma 4's template differs from Gemma 2/3 — verify behavior against the live tokenizer (see [inspect_template.py](inspect_template.py)) rather than assuming older-Gemma conventions. What we confirmed:
+Gemma 4's template differs from Gemma 2/3 — verify behavior against the live tokenizer (render with `apply_chat_template(..., tokenize=False)`; cf. the `__main__` block in [src/agent.py](src/agent.py)) rather than assuming older-Gemma conventions. What we confirmed:
 
 - **System role is supported natively** (`<|turn>system ... <turn|>`). No need to fold system text into the first user turn (that was a Gemma 2/3 limitation).
 - **Define tools as plain Python functions** (typed signature + Google-style docstring) and pass them via `apply_chat_template(tools=[...])`. transformers auto-converts them to Gemma's schema; do **not** hand-write the tool-declaration string. System prompt and tool declarations coexist in the same system turn.

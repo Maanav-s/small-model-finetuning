@@ -11,11 +11,12 @@ from __future__ import annotations
 
 from pathlib import Path
 
-# Single source of truth for the model id (imported by test.py / scratch tools).
-# Local dev uses the smaller E2B: the 4-bit E4B needs ~9.3 GB and overflows the
-# 6 GB RTX 4050 into shared system memory (very slow). Scale up to E4B on the
-# cluster - the tool-calling code is identical (same template family).
-MODEL_ID = "google/gemma-4-E2B-it"
+# Single source of truth for the model id (imported by run_agent.py / scratch tools).
+# E4B is the target model: it fits comfortably in bf16 (~9 GB) on a 23 GB card
+# and is far better at tool calling than E2B (which would skip the web_search
+# call and answer from memory). E2B was only ever a stopgap for the old 6 GB
+# RTX 4050; pass --quantize in run_agent.py if you ever run this on a small card.
+MODEL_ID = "google/gemma-4-E4B-it"
 
 # ---------------------------------------------------------------------------
 # System prompt
@@ -28,8 +29,7 @@ You are a restaurant menu extraction assistant.
 
 You have NO prior knowledge of any restaurant's menu. You MUST call the \
 `web_search` tool at least once and base your answer ONLY on what it returns - \
-never answer from memory and never invent items. You may call `web_search` up \
-to 3 times to gather enough information, then return the menu as a single JSON \
+never answer from memory and never invent items. Return the menu as a single JSON \
 object.
 
 Output rules:
