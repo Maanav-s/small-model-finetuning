@@ -13,16 +13,17 @@ Fine-tune a small open-weight LLM (`google/gemma-4-E4B-it`) to take a restaurant
 ## Environment & commands
 
 - Package manager is **uv**. Run anything in the venv with `uv run python <script>.py` — do **not** call a bare `python`, and do not `pip install`.
-- Add deps with `uv add <pkg>`; on the Linux cluster, reproduce the env with `uv sync`. Commit `pyproject.toml` + `uv.lock`.
-- The shell here is **PowerShell**, not bash — use PowerShell syntax for terminal commands (`$env:VAR`, `Test-Path`, `;` to chain).
+- Add deps with `uv add <pkg>`; reproduce the env with `uv sync`. Commit `pyproject.toml` + `uv.lock`.
+- The shell here is **bash** — use POSIX syntax for terminal commands (`$VAR`, `[ -f path ]`, `&&` to chain).
 
 ## Hardware constraints (these drive real code decisions)
 
-Local dev is a Windows laptop with an **RTX 4050, 6 GB VRAM**. This is the binding constraint for anything that loads the model:
+Dev runs on an **Ubuntu instance with a 24 GB GPU** (e.g. RTX 3090/4090 / A10). With 24 GB the model is no longer VRAM-bound the way the old 6 GB laptop was, so some earlier constraints have relaxed:
 
-- **`torch` is pinned to the CUDA `cu128` wheel index** via `[[tool.uv.index]]` + `[tool.uv.sources]` in [pyproject.toml](pyproject.toml). `explicit = true` means only torch uses it; everything else is PyPI. The same config produces Linux CUDA wheels on the cluster — no changes needed unless the cluster driver is unusually old (then drop to `cu126`).
-- **The model will not fit in bf16** (~8–9 GB weights). Load it in **4-bit** via `BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4", bnb_4bit_compute_dtype=torch.bfloat16)` (~3.5 GB). bf16 is the right compute dtype — the GPU supports it.
-- **Use `device_map={"": 0}`, not `device_map="auto"`.** On a 6 GB card `"auto"` silently offloads the whole model to CPU (symptom: `Model loaded on: cpu`, `0.00 GB VRAM`, generation hangs for minutes). Pin to GPU 0 explicitly.
+- **`torch` is pinned to the CUDA `cu128` wheel index** via `[[tool.uv.index]]` + `[tool.uv.sources]` in [pyproject.toml](pyproject.toml). `explicit = true` means only torch uses it; everything else is PyPI. Drop to `cu126` only if the instance driver is unusually old.
+- **bf16 now fits** (~8–9 GB weights), so 4-bit is **optional, not required**. For plain inference, load in bf16 (`torch_dtype=torch.bfloat16`) for full quality with headroom to spare. Keep **4-bit** (`BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4", bnb_4bit_compute_dtype=torch.bfloat16)`, ~3.5 GB) when you want to leave room for training/RL batches and optimizer states (QLoRA). `test.py` still loads 4-bit — fine as a smoke test, not a mandate.
+- **Use `device_map={"": 0}`, not `device_map="auto"`.** Pin to GPU 0 explicitly; `"auto"` can still offload across devices in ways you don't want. (On the old 6 GB card `"auto"` silently dumped the whole model to CPU — symptom: `Model loaded on: cpu`, `0.00 GB VRAM`, generation hangs.)
+- **Flash Attention is now worth it.** On Linux `flash-attn` installs cleanly (no Windows build pain), and the 24 GB card supports FA2 — useful for the long prefills this project produces when scraped Firecrawl content is fed back as tool results. Pass `attn_implementation="flash_attention_2"` to `from_pretrained`; `"sdpa"` (torch built-in, no extra dep) is the zero-install fallback. Decode is still weight-bandwidth-bound, so the gains are mostly on prefill + memory.
 
 ## Library version gotchas (transformers 5.x)
 
@@ -42,4 +43,4 @@ Gemma 4's template differs from Gemma 2/3 — verify behavior against the live t
 
 ## Model access
 
-`google/gemma-4-E4B-it` is **gated**. First load requires `huggingface-cli login` with a token from an account that has accepted the license on the model's HF page. Weights cache to `C:\Users\<user>\.cache\huggingface\hub` (outside the OneDrive-synced project dir — keep it that way). On Windows the HF symlink warning is harmless (no Developer Mode → files are copied, not symlinked).
+`google/gemma-4-E4B-it` is **gated**. First load requires `huggingface-cli login` with a token from an account that has accepted the license on the model's HF page. Weights cache to `~/.cache/huggingface/hub`.
