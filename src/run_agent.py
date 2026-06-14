@@ -6,9 +6,10 @@ canonical function-calling API (`tokenizer.parse_response`, bundled
 
 The `web_search` tool is currently stubbed (returns sample_menu.md) so the loop
 is deterministic and offline. Run with:
-  uv run python test.py
+  uv run python src/run_agent.py
 """
 
+import argparse
 import json
 import re
 
@@ -21,24 +22,36 @@ MAX_TOOL_CALLS = 4          # tool-call budget per episode (plan: 2-3 expected)
 MAX_NEW_TOKENS = 2560       # the full menu JSON can be long
 
 # ---------------------------------------------------------------------------
-# Load the model: 4-bit, pinned to GPU 0 (see CLAUDE.md for why not "auto").
+# CLI: 4-bit quantization is opt-in. On a card with enough VRAM, load the
+# weights in bf16 (default); pass --quantize on small cards (e.g. 6 GB).
 # ---------------------------------------------------------------------------
-quant_config = BitsAndBytesConfig(
-    load_in_4bit=True,
-    bnb_4bit_quant_type="nf4",
-    bnb_4bit_compute_dtype=torch.bfloat16,
-    bnb_4bit_use_double_quant=True,
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument(
+    "--quantize",
+    action="store_true",
+    help="Load the model in 4-bit (nf4). Off by default; use on low-VRAM GPUs.",
 )
+cli_args = parser.parse_args()
 
+# ---------------------------------------------------------------------------
+# Load the model, pinned to GPU 0 (see CLAUDE.md for why not "auto").
+# ---------------------------------------------------------------------------
 assert torch.cuda.is_available(), "CUDA not available - check the torch install"
 
-print(f"Loading {MODEL_ID} (4-bit) ...")
+load_kwargs = {"device_map": {"": 0}, "low_cpu_mem_usage": True}
+if cli_args.quantize:
+    load_kwargs["quantization_config"] = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_compute_dtype=torch.bfloat16,
+        bnb_4bit_use_double_quant=True,
+    )
+else:
+    load_kwargs["dtype"] = torch.bfloat16
+
+print(f"Loading {MODEL_ID} ({'4-bit' if cli_args.quantize else 'bf16'}) ...")
 tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
-model = AutoModelForCausalLM.from_pretrained(
-    MODEL_ID,
-    quantization_config=quant_config,
-    device_map={"": 0},
-)
+model = AutoModelForCausalLM.from_pretrained(MODEL_ID, **load_kwargs)
 model.eval()
 print(f"Loaded on {model.device}, {torch.cuda.memory_allocated() / 1e9:.2f} GB VRAM")
 
@@ -53,6 +66,7 @@ def generate_turn(messages: list[dict]) -> str:
         messages,
         tools=TOOLS,
         add_generation_prompt=True,
+        enable_thinking=True,
         return_tensors="pt",
         return_dict=True,
     ).to(model.device)

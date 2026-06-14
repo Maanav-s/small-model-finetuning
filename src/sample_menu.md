@@ -18,14 +18,6 @@
 | **Verde Vito** | Plant-based take: Plant Ahead mozzarella, BE-Hive vegan sausage, peperonata peppers, spinach, over crushed Italian tomatoes. | $27.99 | $31.99 | $36.99 |
 | **12th Fan Primo** | Pepperoni, salami, chicken, Mama Lil's peppers, olives and mozzarella on seasoned tomato sauce. | $27.99 | $31.99 | $36.99 |
 | **Diavola** | Soppressata, mozzarella and romano over seasoned tomato sauce, finished with hot honey after bake. | $23.49 | $27.49 | $32.49 |
-| **AGOG Primo** | Tomatoes, mushrooms, roasted garlic, Kalamata olives, goat cheese, fontina, mozzarella and parsley over olive oil. | $27.99 | $31.99 | $36.99 |
-| **Brooklyn Bridge** | Pepperoni, Cascioppo's Italian sausage, mushrooms, olives, green peppers, onions and mozzarella over seasoned tomato sauce. | $27.99 | $31.99 | $36.99 |
-| **Chicken Primo** | Marinated chicken, thyme-roasted artichoke hearts, pickled red onions, peperonata peppers, mozzarella, ricotta and parsley over olive oil. | $27.99 | $31.99 | $36.99 |
-| **Double Mushroom** | A veritable blanket of mushrooms over mozzarella and seasoned tomato sauce. | $22.99 | $26.99 | $31.49 |
-| **Extra Pepperoni** | A veritable blanket of pepperoni over mozzarella and seasoned tomato sauce. | $22.99 | $26.99 | $31.49 |
-| **Fresh Veggie** | Tomatoes, mushrooms, green peppers, onions, olives, mozzarella and parsley over seasoned tomato sauce. | $24.49 | $28.49 | $33.49 |
-| **Funghi Salsiccia** | Cascioppo's Italian sausage, mushrooms, fresh mozzarella, sea salt and olive oil with crushed Italian tomatoes. | $24.49 | $28.49 | $33.49 |
-| **Grand Salami Primo** | Salami, Hill's Canadian bacon, Cascioppo's Italian sausage, pepperoni and mozzarella over seasoned tomato sauce. | $27.99 | $31.99 | $36.99 |
 
 ---
 
