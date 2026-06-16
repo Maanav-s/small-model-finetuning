@@ -1,102 +1,146 @@
-"""Phase 1 building blocks: the system prompt and tool definitions for the
-restaurant-menu extraction agent.
+"""The agentic loop: restaurant name -> menu JSON.
 
-This module deliberately stops short of the generate/execute loop -it defines
-*what the model sees* (system prompt + tool schema) and how to assemble the
-initial message list. Run `uv run python agent.py` to print the fully rendered
-prompt the model will receive.
+Drives Gemma 4 through a tool-call loop using the canonical function-calling API
+(`tokenizer.parse_response`, bundled `tool_responses`) per
+ai.google.dev/gemma/docs/capabilities/text/function-calling-gemma4.
+
+This module is the reusable engine — it takes `model`/`tokenizer`/`tools` as
+arguments and has no CLI or model-loading side effects, so you can drive it from
+run_agent.py (the CLI) or a REPL/notebook for fast iteration (load the model
+once, re-run episodes as you edit prompts.py / tools.py). Loading lives in
+model.py, tools in tools.py, prompts in prompts.py, the JSON contract in schema.py.
 """
 
 from __future__ import annotations
 
-from pathlib import Path
+import re
 
-# Single source of truth for the model id (imported by run_agent.py / scratch tools).
-# E4B is the target model: it fits comfortably in bf16 (~9 GB) on a 23 GB card
-# and is far better at tool calling than E2B (which would skip the web_search
-# call and answer from memory). E2B was only ever a stopgap for the old 6 GB
-# RTX 4050; pass --quantize in run_agent.py if you ever run this on a small card.
-MODEL_ID = "google/gemma-4-E4B-it"
+import torch
 
-# ---------------------------------------------------------------------------
-# System prompt
-#
-# Encodes the task and the exact output contract. The JSON schema here is the
-# single source of truth for what the model must emit (mirrors project_plan.md).
-# ---------------------------------------------------------------------------
-SYSTEM_PROMPT = """\
-You are a restaurant menu extraction assistant.
+from prompts import SYSTEM_PROMPT
 
-You have NO prior knowledge of any restaurant's menu. You MUST call the \
-`web_search` tool at least once and base your answer ONLY on what it returns - \
-never answer from memory and never invent items. Return the menu as a single JSON \
-object.
-
-Output rules:
-- Your final reply must be ONLY the JSON object - no prose, no markdown fences.
-- The JSON must match this schema exactly:
-
-{
-  "restaurant_name": "string",
-  "cuisine": "string",
-  "menu": [
-    {
-      "section": "string",
-      "items": [
-        {"name": "string", "description": "string", "price": number or null}
-      ]
-    }
-  ],
-  "source_url": "string or null"
-}
-
-- `price` must be a number (e.g. 12.5) or null - never a string like "$12.50".
-- Use null for fields you cannot determine. Do not invent menu items that are \
-not supported by the search results.
-"""
+MAX_TOOL_CALLS = 4          # tool-call budget per episode (plan: 2-3 expected)
+MAX_NEW_TOKENS = 2560       # the full menu JSON can be long
 
 
-# ---------------------------------------------------------------------------
-# Tools
-#
-# Defined as plain Python functions. `apply_chat_template(tools=[...])` reads the
-# signature + docstring (Google style) and converts it to the schema Gemma wants.
-# Keep the docstring accurate -it becomes the tool description the model sees.
-# ---------------------------------------------------------------------------
-_SAMPLE_MENU = Path(__file__).with_name("sample_menu.md")
-
-
-def web_search(query: str) -> str:
-    """Search the web for a restaurant's menu information.
-
-    Args:
-        query: Search query, e.g. the restaurant name plus its city and the
-            word "menu".
-    """
-    # TEMP STUB: ignores the query and returns a fixed sample menu, so the
-    # agentic loop can be developed before Firecrawl is wired in. Replace this
-    # body with a real Firecrawl search/scrape later (keep the signature).
-    return _SAMPLE_MENU.read_text(encoding="utf-8")
-
-
-# Passed to apply_chat_template(tools=...). The loop will dispatch parsed calls
-# through TOOL_REGISTRY by name.
-TOOLS = [web_search]
-TOOL_REGISTRY = {fn.__name__: fn for fn in TOOLS}
-
-
-def build_messages(restaurant_name: str) -> list[dict]:
+def build_messages(restaurant_name: str, system_prompt: str = SYSTEM_PROMPT) -> list[dict]:
     """Assemble the initial chat history for one extraction episode."""
     return [
-        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "system", "content": system_prompt},
         {"role": "user", "content": restaurant_name},
     ]
 
 
+def generate_turn(model, tokenizer, messages: list[dict], tools: list) -> str:
+    """Render `messages`, generate one model turn, return the decoded text.
+
+    Keeps special tokens (skip_special_tokens=False) so parse_response can see
+    the <|tool_call> markers.
+    """
+    inputs = tokenizer.apply_chat_template(
+        messages,
+        tools=tools,
+        add_generation_prompt=True,
+        enable_thinking=True,
+        return_tensors="pt",
+        return_dict=True,
+    ).to(model.device)
+    prompt_len = inputs["input_ids"].shape[-1]
+
+    with torch.no_grad():
+        output = model.generate(
+            **inputs,
+            max_new_tokens=MAX_NEW_TOKENS,
+            do_sample=False,
+            # Stop right after a tool call so the model can't hallucinate its
+            # own tool response; normal turns still stop at EOS.
+            stop_strings=["<tool_call|>"],
+            tokenizer=tokenizer,
+        )
+    return tokenizer.decode(output[0][prompt_len:], skip_special_tokens=False)
+
+
+def run_episode(
+    model,
+    tokenizer,
+    restaurant_name: str,
+    tools: list,
+    tool_registry: dict,
+    system_prompt: str,
+) -> str:
+    """Run the tool-call loop for one restaurant; return the final answer text."""
+    messages = build_messages(restaurant_name, system_prompt=system_prompt)
+
+    for step in range(MAX_TOOL_CALLS + 1):
+        text = generate_turn(model, tokenizer, messages, tools)
+        try:
+            parsed = tokenizer.parse_response(text)  # {role, [thinking], content?, tool_calls?}
+        except (ValueError, TypeError) as e:
+            # Gemma's parser raises when a tool call's JSON arguments are
+            # malformed - e.g. the model degenerated into a recursive/truncated
+            # `jsonOptions.schema` blob. Don't crash the episode: feed the error
+            # back and let the model retry within the remaining tool-call budget.
+            #
+            # Deliver it as a TOOL response, never a user turn: Gemma's template
+            # strips reasoning from assistant turns before the last user message,
+            # so a mid-episode user turn rewrites earlier tokens and breaks the
+            # prefix-preservation GRPO rollouts rely on. A bare {"role": "tool"}
+            # message won't work either - the template only renders a tool
+            # response paired with an *open* assistant tool_call, so one appended
+            # after our bundled turns is silently dropped (and with greedy
+            # decoding the model would just re-emit the same bad output). So
+            # synthesize a minimal assistant tool_call to carry the error; this
+            # renders, adds context, and keeps the prefix intact (verified).
+            print(f"  [step {step}] [warn] could not parse model turn: {e}")
+            m = re.search(r"call:([A-Za-z_]\w*)", text)
+            name = m.group(1) if m else next(iter(tool_registry), "web_search")
+            error_msg = (
+                "Your previous reply could not be parsed as a valid tool call. "
+                "Emit either a single, well-formed tool call or the final JSON "
+                "answer - do not nest or truncate tool arguments."
+            )
+            messages.append({
+                "role": "assistant",
+                "tool_calls": [
+                    {"type": "function", "function": {"name": name, "arguments": {}}}
+                ],
+                "tool_responses": [{"name": name, "response": error_msg}],
+            })
+            continue
+        tool_calls = parsed.get("tool_calls")
+
+        if not tool_calls:
+            return (parsed.get("content") or "").strip()  # final answer
+
+        # Execute every call the model made this turn, collecting responses.
+        tool_responses = []
+        for tc in tool_calls:
+            fn = tc["function"]
+            name, args = fn["name"], fn["arguments"]
+            print(f"  [step {step}] tool call: {name}({args})")
+            if name not in tool_registry:
+                print(f"  [warn] unknown tool {name!r}")
+                response = f"Error: unknown tool {name!r}"
+            else:
+                response = tool_registry[name](**args)
+                print(f"  [step {step}] -> {len(response)} chars returned")
+            tool_responses.append({"name": name, "response": response})
+
+        # Append the assistant turn (its tool_calls) + the tool results, bundled
+        # in one message as Gemma 4 expects.
+        messages.append({**parsed, "tool_responses": tool_responses})
+
+    print(f"  [warn] hit MAX_TOOL_CALLS={MAX_TOOL_CALLS} without a final answer")
+    return ""
+
+
 if __name__ == "__main__":
-    # Render-only demo: confirms the system prompt and tool schema coexist in
-    # the prompt the model receives. Tokenizer-only, so no GPU / weights needed.
+    # Render-only demo: confirms the system prompt and tool schema coexist in the
+    # prompt the model receives. Tokenizer-only, so no GPU / weights needed.
     from transformers import AutoTokenizer
+
+    from model import MODEL_ID
+    from tools import TOOLS
 
     tok = AutoTokenizer.from_pretrained(MODEL_ID)
     rendered = tok.apply_chat_template(
