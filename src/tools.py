@@ -58,11 +58,13 @@ DEFAULT_MCP_TOOL_ALLOWLIST = ("firecrawl_search", "firecrawl_scrape")
 # of what args the model emits.
 SEARCH_RESULT_LIMIT = 3
 
-# Hard cap on a single tool result before it enters the message history. This
-# bounds the worst case (one huge scraped page) that sets the peak context
-# length -> peak VRAM, regardless of page size. A blind char cap can clip the
-# tail of a very long menu; a hit is warned about (below) so it's never silent.
-MAX_TOOL_CHARS = 8000
+# Hard cap on a single tool result before it enters the message history, as a
+# backstop against a pathologically huge page. The earlier tight cap was there to
+# avoid OOM; that pressure is gone now that generation forces SDPA's O(seq) mem-
+# efficient kernel (see generate_turn in agent.py), so a full menu page fits
+# comfortably. A blind char cap can still clip the tail of a very long menu; a
+# hit is warned about (below) so it's never silent.
+MAX_TOOL_CHARS = 50000
 
 
 def _apply_arg_policy(name: str, kwargs: dict) -> dict:

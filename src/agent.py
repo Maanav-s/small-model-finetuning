@@ -20,7 +20,7 @@ import torch
 from prompts import SYSTEM_PROMPT
 
 MAX_TOOL_CALLS = 4          # tool-call budget per episode (plan: 2-3 expected)
-MAX_NEW_TOKENS = 2560       # the full menu JSON can be long
+MAX_NEW_TOKENS = 4096       # the full menu JSON can be long
 
 
 def build_messages(restaurant_name: str, system_prompt: str = SYSTEM_PROMPT) -> list[dict]:
@@ -47,6 +47,12 @@ def generate_turn(model, tokenizer, messages: list[dict], tools: list) -> str:
     ).to(model.device)
     prompt_len = inputs["input_ids"].shape[-1]
 
+    # The long-context OOM fix lives in model.py's load_model (it forces SDPA's
+    # mem-efficient kernel on Gemma 4's head_dim=512 global layers by making
+    # transformers expand GQA KV heads instead of passing enable_gqa). With that
+    # in place, default SDPA dispatch already picks the efficient kernel here, so
+    # no sdpa_kernel(...) override is needed -- an explicit one was measured to be
+    # a no-op (the GQA broadcast, not the kernel-priority, was the disqualifier).
     with torch.no_grad():
         output = model.generate(
             **inputs,
