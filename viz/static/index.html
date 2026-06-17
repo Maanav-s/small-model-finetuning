@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Menu Visualizer</title>
+<style>
+  :root {
+    --bg: #f6f3ee; --card: #fffdf9; --ink: #2b2620; --muted: #8a8175;
+    --line: #e4ddd0; --accent: #8c4a2f;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font-family: Georgia, "Times New Roman", serif;
+    line-height: 1.45;
+  }
+  .wrap { max-width: 760px; margin: 0 auto; padding: 32px 20px 80px; }
+  h1 { font-size: 20px; letter-spacing: .12em; text-transform: uppercase;
+       color: var(--muted); font-weight: normal; text-align: center; }
+  form { display: flex; gap: 8px; margin: 20px 0 8px; }
+  input {
+    flex: 1; padding: 12px 14px; font-size: 16px; font-family: inherit;
+    border: 1px solid var(--line); border-radius: 6px; background: #fff;
+  }
+  button {
+    padding: 12px 20px; font-size: 15px; font-family: inherit; cursor: pointer;
+    border: none; border-radius: 6px; background: var(--accent); color: #fff;
+  }
+  button:disabled { opacity: .5; cursor: progress; }
+  .status { text-align: center; color: var(--muted); font-style: italic;
+            min-height: 20px; margin: 8px 0; }
+
+  .menu {
+    background: var(--card); border: 1px solid var(--line); border-radius: 10px;
+    padding: 36px 40px; margin-top: 20px;
+    box-shadow: 0 1px 3px rgba(0,0,0,.05);
+  }
+  .menu-head { text-align: center; border-bottom: 2px solid var(--ink);
+               padding-bottom: 16px; margin-bottom: 8px; }
+  .menu-head h2 { margin: 0; font-size: 30px; letter-spacing: .04em; }
+  .cuisine { color: var(--accent); font-style: italic; margin-top: 4px; }
+
+  .section { margin-top: 28px; }
+  .section > h3 {
+    font-size: 13px; letter-spacing: .18em; text-transform: uppercase;
+    color: var(--accent); margin: 0 0 12px; text-align: center;
+  }
+  .item { display: flex; align-items: baseline; gap: 10px; margin: 10px 0; }
+  .item .name { font-weight: bold; white-space: nowrap; }
+  .item .dots { flex: 1; border-bottom: 1px dotted var(--line); transform: translateY(-4px); }
+  .item .price { white-space: nowrap; color: var(--ink); }
+  .item .desc { display: block; color: var(--muted); font-size: 14px;
+                font-style: italic; margin: 2px 0 0 2px; }
+  .item-block { margin: 12px 0; }
+
+  .source { text-align: center; margin-top: 28px; font-size: 13px; }
+  .source a { color: var(--muted); }
+
+  .error {
+    background: #fff3f0; border: 1px solid #e0b4a8; border-radius: 8px;
+    padding: 16px 20px; margin-top: 20px; color: #8c2f1f;
+  }
+  pre { white-space: pre-wrap; word-break: break-word; font-size: 12px;
+        font-family: ui-monospace, Menlo, monospace; color: var(--muted);
+        background: #fafafa; padding: 12px; border-radius: 6px; margin-top: 10px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Menu Visualizer</h1>
+  <form id="form">
+    <input id="query" placeholder="Restaurant name, e.g. Pagliacci Pizza, Seattle"
+           autocomplete="off" autofocus />
+    <button id="go" type="submit">Find Menu</button>
+  </form>
+  <div class="status" id="status"></div>
+  <div id="out"></div>
+</div>
+
+<script>
+  const form = document.getElementById("form");
+  const input = document.getElementById("query");
+  const btn = document.getElementById("go");
+  const statusEl = document.getElementById("status");
+  const out = document.getElementById("out");
+
+  const esc = (s) => String(s ?? "").replace(/[&<>"]/g, c =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+
+  function fmtPrice(p) {
+    if (p === null || p === undefined || p === "") return "";
+    return typeof p === "number" ? "$" + p.toFixed(2) : esc(p);
+  }
+
+  function renderItem(it) {
+    const price = fmtPrice(it.price);
+    const desc = it.description ? `<span class="desc">${esc(it.description)}</span>` : "";
+    return `<div class="item-block">
+      <div class="item">
+        <span class="name">${esc(it.name)}</span>
+        <span class="dots"></span>
+        <span class="price">${price}</span>
+      </div>${desc}
+    </div>`;
+  }
+
+  function renderMenu(m) {
+    const sections = Array.isArray(m.menu) ? m.menu : [];
+    const body = sections.map(s => `
+      <div class="section">
+        <h3>${esc(s.section)}</h3>
+        ${(s.items || []).map(renderItem).join("")}
+      </div>`).join("");
+    const source = m.source_url
+      ? `<div class="source">source: <a href="${esc(m.source_url)}" target="_blank" rel="noopener">${esc(m.source_url)}</a></div>`
+      : "";
+    return `<div class="menu">
+      <div class="menu-head">
+        <h2>${esc(m.restaurant_name || "Menu")}</h2>
+        ${m.cuisine ? `<div class="cuisine">${esc(m.cuisine)}</div>` : ""}
+      </div>
+      ${body || '<div class="status">No menu sections returned.</div>'}
+      ${source}
+    </div>`;
+  }
+
+  function renderError(data) {
+    out.innerHTML = `<div class="error">
+      <strong>Couldn't render a menu.</strong><br>${esc(data.error || "Unknown error.")}
+      ${data.raw ? `<pre>${esc(data.raw)}</pre>` : ""}
+    </div>`;
+  }
+
+  form.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const query = input.value.trim();
+    if (!query) return;
+    btn.disabled = true;
+    out.innerHTML = "";
+    statusEl.textContent = "Searching the web and extracting the menu… (this can take a minute)";
+    try {
+      const res = await fetch("/api/extract", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ query }),
+      });
+      const data = await res.json();
+      statusEl.textContent = "";
+      if (data.ok) out.innerHTML = renderMenu(data.menu);
+      else renderError(data);
+    } catch (err) {
+      statusEl.textContent = "";
+      renderError({ error: "Request failed: " + err.message });
+    } finally {
+      btn.disabled = false;
+    }
+  });
+</script>
+</body>
+</html>
