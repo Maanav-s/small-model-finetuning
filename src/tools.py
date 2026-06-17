@@ -84,11 +84,12 @@ def _apply_arg_policy(name: str, kwargs: dict) -> dict:
         # firecrawl_scrape a single chosen URL for the full page.
         args.pop("scrapeOptions", None)
     elif name == "firecrawl_scrape":
-        # Force a single compact markdown payload (never raw HTML or the
-        # json/jsonOptions extraction path, which bloats output and lets the
-        # model author malformed schemas). Keep onlyMainContent off: it tends
-        # to strip sidebars/sections that hold real menu items.
-        args["formats"] = ["markdown"]
+        # Force HTML (never the json/jsonOptions extraction path, which lets the
+        # model author malformed schemas). Keep onlyMainContent off: it tends to
+        # strip sidebars/sections that hold real menu items.
+        # NOTE: HTML is much more verbose than markdown, so it hits MAX_TOOL_CHARS
+        # far sooner -- watch the truncation warning below if menus get clipped.
+        args["formats"] = ["html"]
         args["onlyMainContent"] = False
         args.pop("jsonOptions", None)  # dead once we're not requesting json
     return args
@@ -96,7 +97,12 @@ def _apply_arg_policy(name: str, kwargs: dict) -> dict:
 
 def _dispatch(client, name: str, kwargs: dict) -> str:
     """Apply the arg policy, call the tool, and cap the returned text."""
-    text = client.call_tool(name, _apply_arg_policy(name, kwargs))
+    # Log the EFFECTIVE args (post-policy) -- the loop's own "tool call: ..." line
+    # prints what the model *requested*, before this clamp/override runs, so
+    # onlyMainContent/formats show here as actually sent, not as the model asked.
+    effective = _apply_arg_policy(name, kwargs)
+    print(f"  [dispatch] {name} effective args: {effective}", flush=True)
+    text = client.call_tool(name, effective)
     if len(text) > MAX_TOOL_CHARS:
         print(
             f"  [warn] {name} returned {len(text)} chars; truncating to "

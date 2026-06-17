@@ -22,14 +22,28 @@ viz/
 One Python process does everything — there is no separate frontend server.
 
 - **Backend ([server.py](server.py))** — FastAPI. On startup it loads the Gemma
-  model and the Firecrawl MCP tools **once** (in-process, via `src/`'s
-  `load_model` and `setup_tools`) and keeps them resident. It exposes:
+  model, an Anthropic client, and the Firecrawl MCP tools **once** (in-process,
+  via `src/`'s `load_model`, `anthropic.Anthropic`, and `setup_tools`) and keeps
+  them resident. It exposes:
   - `GET /` → serves `static/index.html`
-  - `POST /api/extract` `{"query": "<restaurant>"}` → runs one extraction episode
-    and returns `{"ok": true, "menu": {...}, "raw": "..."}`, or
-    `{"ok": false, "error": "...", "raw": "..."}` when the model's output isn't
-    valid JSON. Validation reuses `schema.extract_json`, so the page and the
-    eval/reward share one contract.
+  - `POST /api/extract` `{"query": "<restaurant>", "agent": "gemma"|"claude"}` →
+    runs one extraction episode with the chosen agent and returns
+    `{"ok": true, "menu": {...}, "raw": "...", "agent": "..."}`, or
+    `{"ok": false, "error": "...", "raw": "...", "agent": "..."}` when the
+    model's output isn't valid JSON. `agent` defaults to `gemma`. Validation
+    reuses `schema.extract_json`, so the page and the eval/reward share one
+    contract.
+
+### Choosing the agent
+
+The page has a dropdown to pick **Gemma (local)** or **Claude (API)**; both run
+the *same* tools, system prompt, and JSON contract — only the loop differs
+(`gemma/agent.py` vs `claude/claude_agent.py`), so the two are directly
+comparable. The rendered menu shows which agent produced it.
+
+Claude is optional: it's wired up only if `ANTHROPIC_API_KEY` is present at
+startup. Without the key the server still boots Gemma-only, and a Claude request
+returns an error explaining the key is missing (rather than failing at startup).
 - **Frontend ([static/index.html](static/index.html))** — plain HTML + vanilla
   JS, no framework and no build step. It `fetch()`es `/api/extract`, then renders
   `menu[].section` / `items[].{name, description, price}` as a menu card (dotted
@@ -39,12 +53,15 @@ One Python process does everything — there is no separate frontend server.
 
 ### Why one process, and why serialized
 
-The model and the single dev GPU are a shared singleton. `server.py` wraps
-generation in a `threading.Lock`, so episodes run **one at a time** no matter how
-many browser tabs hit the endpoint — concurrent `generate()` calls on one GPU
-would race or OOM. The sync endpoint runs in FastAPI's threadpool, so the lock
-(not the event loop) does the gating. This is fine for a local demo; it is not a
-multi-tenant server.
+`server.py` wraps every episode in a single `threading.Lock`, so they run **one
+at a time** no matter how many browser tabs (or which agent) hit the endpoint.
+For Gemma this is essential — the model and the single dev GPU are a shared
+singleton, and concurrent `generate()` calls would race or OOM. The lock also
+guards the shared Firecrawl MCP subprocess that *both* agents call. The sync
+endpoint runs in FastAPI's threadpool, so the lock (not the event loop) does the
+gating. This is fine for a local demo; it is not a multi-tenant server. (A
+consequence: a slow Gemma run will block a concurrent Claude request until it
+finishes.)
 
 ## Running it
 
@@ -62,6 +79,8 @@ Then open <http://127.0.0.1:8000>.
   in the repo-root `.env` (same requirement as `run_agent.py --mcp`), and
   Node/`npx` must be on `PATH`. The server spins up `npx -y firecrawl-mcp` at
   startup and tears it down on shutdown.
+- To enable the **Claude** agent, add `ANTHROPIC_API_KEY` to the repo-root `.env`
+  (same key `run_claude.py` uses). Gemma needs no extra key.
 
 ### Notes / knobs
 

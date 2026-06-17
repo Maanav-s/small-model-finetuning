@@ -11,7 +11,7 @@ from schema import SCHEMA_SNIPPET
 # Restaurant used as the episode input while testing the loop end-to-end. Both
 # runners (gemma/run_agent.py, claude/run_claude.py) read this. Temporary: real
 # eval will iterate over a dataset of restaurants rather than a single name.
-TEST_RESTAURANT = "Pagliacci Pizza, Seattle"
+TEST_RESTAURANT = "Thai Trio, Sammamish, WA"
 
 SYSTEM_PROMPT = f"""\
 You are a restaurant menu extraction assistant.

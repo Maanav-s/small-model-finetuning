@@ -23,6 +23,11 @@
     flex: 1; padding: 12px 14px; font-size: 16px; font-family: inherit;
     border: 1px solid var(--line); border-radius: 6px; background: #fff;
   }
+  select {
+    padding: 12px 10px; font-size: 15px; font-family: inherit;
+    border: 1px solid var(--line); border-radius: 6px; background: #fff;
+    color: var(--ink); cursor: pointer;
+  }
   button {
     padding: 12px 20px; font-size: 15px; font-family: inherit; cursor: pointer;
     border: none; border-radius: 6px; background: var(--accent); color: #fff;
@@ -40,6 +45,8 @@
                padding-bottom: 16px; margin-bottom: 8px; }
   .menu-head h2 { margin: 0; font-size: 30px; letter-spacing: .04em; }
   .cuisine { color: var(--accent); font-style: italic; margin-top: 4px; }
+  .by { color: var(--muted); font-size: 11px; letter-spacing: .14em;
+        text-transform: uppercase; margin-top: 8px; }
 
   .section { margin-top: 28px; }
   .section > h3 {
@@ -72,6 +79,10 @@
   <form id="form">
     <input id="query" placeholder="Restaurant name, e.g. Pagliacci Pizza, Seattle"
            autocomplete="off" autofocus />
+    <select id="agent" title="Which model runs the extraction">
+      <option value="gemma">Gemma (local)</option>
+      <option value="claude">Claude (API)</option>
+    </select>
     <button id="go" type="submit">Find Menu</button>
   </form>
   <div class="status" id="status"></div>
@@ -81,9 +92,12 @@
 <script>
   const form = document.getElementById("form");
   const input = document.getElementById("query");
+  const agentSel = document.getElementById("agent");
   const btn = document.getElementById("go");
   const statusEl = document.getElementById("status");
   const out = document.getElementById("out");
+
+  const AGENT_LABEL = { gemma: "Gemma (local)", claude: "Claude (API)" };
 
   const esc = (s) => String(s ?? "").replace(/[&<>"]/g, c =>
     ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
@@ -105,7 +119,7 @@
     </div>`;
   }
 
-  function renderMenu(m) {
+  function renderMenu(m, agent) {
     const sections = Array.isArray(m.menu) ? m.menu : [];
     const body = sections.map(s => `
       <div class="section">
@@ -115,10 +129,14 @@
     const source = m.source_url
       ? `<div class="source">source: <a href="${esc(m.source_url)}" target="_blank" rel="noopener">${esc(m.source_url)}</a></div>`
       : "";
+    const by = agent
+      ? `<div class="by">extracted by ${esc(AGENT_LABEL[agent] || agent)}</div>`
+      : "";
     return `<div class="menu">
       <div class="menu-head">
         <h2>${esc(m.restaurant_name || "Menu")}</h2>
         ${m.cuisine ? `<div class="cuisine">${esc(m.cuisine)}</div>` : ""}
+        ${by}
       </div>
       ${body || '<div class="status">No menu sections returned.</div>'}
       ${source}
@@ -136,18 +154,19 @@
     e.preventDefault();
     const query = input.value.trim();
     if (!query) return;
+    const agent = agentSel.value;
     btn.disabled = true;
     out.innerHTML = "";
-    statusEl.textContent = "Searching the web and extracting the menu… (this can take a minute)";
+    statusEl.textContent = `Running ${AGENT_LABEL[agent] || agent}: searching the web and extracting the menu… (this can take a minute)`;
     try {
       const res = await fetch("/api/extract", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ query }),
+        body: JSON.stringify({ query, agent }),
       });
       const data = await res.json();
       statusEl.textContent = "";
-      if (data.ok) out.innerHTML = renderMenu(data.menu);
+      if (data.ok) out.innerHTML = renderMenu(data.menu, data.agent);
       else renderError(data);
     } catch (err) {
       statusEl.textContent = "";
