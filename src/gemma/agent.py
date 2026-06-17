@@ -14,10 +14,17 @@ model.py, tools in tools.py, prompts in prompts.py, the JSON contract in schema.
 from __future__ import annotations
 
 import re
+import sys
+from pathlib import Path
 
-import torch
+# Shared modules (schema/prompts/tools/mcp_client) live in src/, the parent of
+# this gemma/ folder; put it on the path so flat imports resolve whether this
+# file is run directly or imported by run_agent.py.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from prompts import SYSTEM_PROMPT
+import torch  # noqa: E402
+
+from prompts import SYSTEM_PROMPT  # noqa: E402
 
 MAX_TOOL_CALLS = 4          # tool-call budget per episode (plan: 2-3 expected)
 MAX_NEW_TOKENS = 4096       # the full menu JSON can be long

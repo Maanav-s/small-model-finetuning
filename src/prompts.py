@@ -8,6 +8,11 @@ from __future__ import annotations
 
 from schema import SCHEMA_SNIPPET
 
+# Restaurant used as the episode input while testing the loop end-to-end. Both
+# runners (gemma/run_agent.py, claude/run_claude.py) read this. Temporary: real
+# eval will iterate over a dataset of restaurants rather than a single name.
+TEST_RESTAURANT = "Pagliacci Pizza, Seattle"
+
 SYSTEM_PROMPT = f"""\
 You are a restaurant menu extraction assistant.
 
@@ -22,6 +27,8 @@ Output rules:
 
 {SCHEMA_SNIPPET}
 
+- Include ONLY main course menu items (entrees / mains). Do NOT include \
+appetizers, starters, sides, desserts, or drinks/beverages.
 - `price` must be a number (e.g. 12.5) or null - never a string like "$12.50".
 - Use null for fields you cannot determine. Do not invent menu items that are \
 not supported by the search results.

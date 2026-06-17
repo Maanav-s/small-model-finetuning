@@ -5,24 +5,30 @@ source (tools.py), runs one episode (agent.py), and reports/validates the result
 (schema.py). The reusable pieces live in those modules so the SFT/eval scripts
 and a REPL can call them without going through this CLI.
 
-  uv run python src/run_agent.py             # bf16, offline stub tools
-  uv run python src/run_agent.py --mcp       # Firecrawl MCP tools
-  uv run python src/run_agent.py --quantize  # 4-bit (low-VRAM / fast load)
+  uv run python src/gemma/run_agent.py             # bf16, offline stub tools
+  uv run python src/gemma/run_agent.py --mcp       # Firecrawl MCP tools
+  uv run python src/gemma/run_agent.py --quantize  # 4-bit (low-VRAM / fast load)
 """
 
 import argparse
+import sys
 from pathlib import Path
 
-from dotenv import load_dotenv
+# Shared modules (schema/prompts/tools/mcp_client) live in src/, the parent of
+# this gemma/ folder; put it on the path so the flat imports below resolve.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from agent import run_episode
-from model import load_model
-from schema import extract_json
-from tools import setup_tools
+from dotenv import load_dotenv  # noqa: E402
+
+from agent import run_episode  # noqa: E402
+from model import load_model  # noqa: E402
+from prompts import TEST_RESTAURANT  # noqa: E402
+from schema import extract_json  # noqa: E402
+from tools import setup_tools  # noqa: E402
 
 # Load FIRECRAWL_API_KEY (and anything else) from the repo-root .env, regardless
-# of the current working directory (this file lives in src/).
-load_dotenv(Path(__file__).resolve().parent.parent / ".env")
+# of the current working directory (this file lives in src/gemma/).
+load_dotenv(Path(__file__).resolve().parents[2] / ".env")
 
 
 def parse_args():
@@ -73,7 +79,7 @@ def main():
     model, tokenizer = load_model(quantize=args.quantize, attn=args.attn)
     tools, tool_registry, system_prompt, mcp_client = setup_tools(args.mcp)
     try:
-        restaurant = "Pagliacci Pizza, Seattle"
+        restaurant = TEST_RESTAURANT
         print(f"\n=== Episode: {restaurant} ===")
         answer = run_episode(
             model, tokenizer, restaurant, tools, tool_registry, system_prompt

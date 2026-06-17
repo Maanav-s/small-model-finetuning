@@ -10,7 +10,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-RUN_AGENT = Path(__file__).parent / "src" / "run_agent.py"
+RUN_AGENT = Path(__file__).parent / "src" / "gemma" / "run_agent.py"
 
 
 def main():
