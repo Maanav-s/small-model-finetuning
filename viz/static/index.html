@@ -28,16 +28,6 @@
     border: 1px solid var(--line); border-radius: 6px; background: #fff;
     color: var(--ink); cursor: pointer;
   }
-  .controls {
-    display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: center;
-    justify-content: center; margin: 0 0 4px;
-  }
-  .controls label {
-    display: inline-flex; align-items: center; gap: 6px;
-    font-size: 12px; letter-spacing: .1em; text-transform: uppercase;
-    color: var(--muted);
-  }
-  .controls select { padding: 7px 8px; font-size: 14px; }
   button {
     padding: 12px 20px; font-size: 15px; font-family: inherit; cursor: pointer;
     border: none; border-radius: 6px; background: var(--accent); color: #fff;
@@ -96,14 +86,6 @@
     </select>
     <button id="go" type="submit">Find Menu</button>
   </form>
-  <div class="controls">
-    <label>Search
-      <select id="searchBackend" title="Provider backing web_search"></select>
-    </label>
-    <label>Scrape
-      <select id="scrapeBackend" title="Provider backing scrape_url"></select>
-    </label>
-  </div>
   <div class="status" id="status"></div>
   <div id="out"></div>
 </div>
@@ -112,8 +94,6 @@
   const form = document.getElementById("form");
   const input = document.getElementById("query");
   const agentSel = document.getElementById("agent");
-  const searchSel = document.getElementById("searchBackend");
-  const scrapeSel = document.getElementById("scrapeBackend");
   const btn = document.getElementById("go");
   const statusEl = document.getElementById("status");
   const out = document.getElementById("out");
@@ -123,28 +103,6 @@
     claude: "Claude Sonnet (API)",
     "claude-haiku": "Claude Haiku (API)",
   };
-
-  // Populate the search/scrape selectors from the server: which providers exist
-  // and which have an API key set (keyless ones are shown but flagged + sorted last,
-  // so picking one that errors isn't a surprise). The default is preselected.
-  function fillBackends(sel, opts, dflt) {
-    const ordered = [...opts].sort((a, b) => (b.available - a.available));
-    sel.innerHTML = ordered.map(o =>
-      `<option value="${esc(o.name)}"${o.name === dflt ? " selected" : ""}>` +
-      `${esc(o.name)}${o.available ? "" : " (no key)"}</option>`).join("");
-  }
-
-  async function loadBackends() {
-    try {
-      const res = await fetch("/api/backends");
-      const data = await res.json();
-      fillBackends(searchSel, data.search, data.default);
-      fillBackends(scrapeSel, data.scrape, data.default);
-    } catch (err) {
-      // Leave the (empty) selects; the extract call will still report a clear error.
-      console.error("Could not load backends:", err);
-    }
-  }
 
   const esc = (s) => String(s ?? "").replace(/[&<>"]/g, c =>
     ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
@@ -178,8 +136,7 @@
       : "";
     const agent = meta && meta.agent;
     const by = agent
-      ? `<div class="by">extracted by ${esc(AGENT_LABEL[agent] || agent)} ` +
-        `· search: ${esc(meta.search_backend)} · scrape: ${esc(meta.scrape_backend)}</div>`
+      ? `<div class="by">extracted by ${esc(AGENT_LABEL[agent] || agent)}</div>`
       : "";
     return `<div class="menu">
       <div class="menu-head">
@@ -204,17 +161,15 @@
     const query = input.value.trim();
     if (!query) return;
     const agent = agentSel.value;
-    const search_backend = searchSel.value;
-    const scrape_backend = scrapeSel.value;
     btn.disabled = true;
     out.innerHTML = "";
-    statusEl.textContent = `Running ${AGENT_LABEL[agent] || agent} (search: ${search_backend}, scrape: ${scrape_backend}): ` +
+    statusEl.textContent = `Running ${AGENT_LABEL[agent] || agent}: ` +
       `searching the web and extracting the menu… (this can take a minute)`;
     try {
       const res = await fetch("/api/extract", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ query, agent, search_backend, scrape_backend }),
+        body: JSON.stringify({ query, agent }),
       });
       const data = await res.json();
       statusEl.textContent = "";
@@ -227,8 +182,6 @@
       btn.disabled = false;
     }
   });
-
-  loadBackends();
 </script>
 </body>
 </html>

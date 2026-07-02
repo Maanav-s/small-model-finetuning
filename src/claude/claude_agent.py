@@ -6,7 +6,7 @@ the Anthropic Messages API, so the two models' outputs are directly comparable.
 
 The tool source is shared: setup_tools() in tools.py returns the same
 `(tools, tool_registry, system_prompt)` whether you're driving Gemma or Claude.
-Both the offline stub and the live Firecrawl tools are plain Python callables, so
+Both the offline stub and the live web tools are plain Python callables, so
 the only translation needed is the tool *declaration* format — Gemma's template
 reads the callables directly, while the Anthropic API wants
 `{"name", "description", "input_schema"}`. to_anthropic_tools does that; the
@@ -85,7 +85,7 @@ def _callable_to_anthropic(fn) -> dict:
 def to_anthropic_tools(tools: list) -> list[dict]:
     """Translate the tool list from setup_tools() into Anthropic tool decls.
 
-    Both tool sources (the offline stub and the live Firecrawl tools) are plain
+    Both tool sources (the offline stub and the live web tools) are plain
     Python callables, so the same setup_tools() result drives Claude unchanged.
     """
     converted = []

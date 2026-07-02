@@ -6,11 +6,11 @@ reports/validates the result against the **same** JSON contract (schema.py). No
 model weights are loaded — this talks to the Anthropic API — so it runs without
 a GPU and is fast to iterate on.
 
-  uv run python src/claude/run_claude.py             # live Firecrawl tools
+  uv run python src/claude/run_claude.py             # live web tools (Brave + Jina)
   uv run python src/claude/run_claude.py --offline   # offline web_search stub
 
 Requires ANTHROPIC_API_KEY in the env (or repo-root .env); the live (default)
-tool path additionally requires FIRECRAWL_API_KEY.
+tool path additionally requires BRAVE_API_KEY and JINA_API_KEY.
 """
 
 import argparse
@@ -25,15 +25,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import anthropic  # noqa: E402
 from dotenv import load_dotenv  # noqa: E402
 
-from backends import DEFAULT_BACKEND, SCRAPE_BACKENDS, SEARCH_BACKENDS  # noqa: E402
 from claude_agent import MODEL_ID, run_episode  # noqa: E402
 from prompts import TEST_RESTAURANT  # noqa: E402
 from schema import extract_json  # noqa: E402
 from tools import setup_tools  # noqa: E402
 
-# Load ANTHROPIC_API_KEY / FIRECRAWL_API_KEY from the repo-root .env regardless
-# of cwd (this file lives in src/claude/). FIRECRAWL_API_KEY is needed for the
-# default live tool path; --offline needs only ANTHROPIC_API_KEY.
+# Load ANTHROPIC_API_KEY / BRAVE_API_KEY / JINA_API_KEY from the repo-root .env
+# regardless of cwd (this file lives in src/claude/). The search/scrape keys are
+# needed for the default live tool path; --offline needs only ANTHROPIC_API_KEY.
 load_dotenv(Path(__file__).resolve().parents[2] / ".env")
 
 
@@ -43,22 +42,8 @@ def parse_args():
         "--offline",
         action="store_true",
         help="Use the deterministic local web_search stub (returns sample_menu.md) "
-        "instead of the live web tools. Default is live, which requires the "
-        "selected backend's API key in the env.",
-    )
-    parser.add_argument(
-        "--search-backend",
-        choices=SEARCH_BACKENDS,
-        default=DEFAULT_BACKEND,
-        help=f"Provider backing web_search (default: {DEFAULT_BACKEND}). Needs that "
-        "provider's API key in the env. Ignored with --offline.",
-    )
-    parser.add_argument(
-        "--scrape-backend",
-        choices=SCRAPE_BACKENDS,
-        default=DEFAULT_BACKEND,
-        help=f"Provider backing scrape_url (default: {DEFAULT_BACKEND}). Needs that "
-        "provider's API key in the env. Ignored with --offline.",
+        "instead of the live web tools. Default is live, which requires "
+        "BRAVE_API_KEY and JINA_API_KEY in the env.",
     )
     parser.add_argument(
         "--model",
@@ -94,11 +79,7 @@ def main():
         )
 
     client = anthropic.Anthropic()
-    tools, tool_registry, system_prompt = setup_tools(
-        offline=args.offline,
-        search_backend=args.search_backend,
-        scrape_backend=args.scrape_backend,
-    )
+    tools, tool_registry, system_prompt = setup_tools(offline=args.offline)
     restaurant = TEST_RESTAURANT
     print(f"\n=== Episode ({args.model}): {restaurant} ===")
     answer = run_episode(

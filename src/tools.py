@@ -1,9 +1,8 @@
 """Tool sources for the agent loop.
 
 Two sources, selected by setup_tools():
-  - live web tools (`web_search` + `scrape_url`) whose *backends* are pluggable --
-    pick a search provider and a scrape provider independently (see backends.py;
-    firecrawl/tavily/brave/jina/browserless). This is the default, and
+  - live web tools (`web_search` + `scrape_url`), backed by Brave (search) and
+    Jina (scrape) -- see backends.py. This is the default, and
   - an offline `web_search` stub (deterministic, returns sample_menu.md) for
     developing the loop without a network/key (setup_tools(offline=True)).
 
@@ -14,21 +13,15 @@ to Anthropic decls -- so the agent loops are identical across sources.
 
 The model only ever sees ONE search and ONE scrape tool, both named generically
 (web_search / scrape_url) with fixed docstrings (build_model_tools), so the
-*backend can be swapped underneath without the model noticing* -- this is how we
-A/B providers on the same task. The generic names also keep vendor branding out
-of the SFT/GRPO training data the tool calls get baked into later.
+*backend stays invisible to the model*. The generic names also keep vendor
+branding out of the SFT/GRPO training data the tool calls get baked into later.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
 
-from backends import (
-    DEFAULT_BACKEND,
-    SCRAPE_BACKENDS,
-    SEARCH_BACKENDS,
-    build_backend,
-)
+from backends import build_scrape, build_search
 from prompts import LIVE_SYSTEM_PROMPT, SYSTEM_PROMPT
 
 # ---------------------------------------------------------------------------
@@ -72,7 +65,7 @@ def web_search(query: str) -> str:
     """
     # TEMP STUB: ignores the query and returns a fixed sample menu, so the
     # agentic loop can be developed offline. setup_tools(offline=False) replaces
-    # this with the live Firecrawl web_search/scrape_url tools below.
+    # this with the live web_search/scrape_url tools below (Brave + Jina).
     return _SAMPLE_MENU.read_text(encoding="utf-8")
 
 
@@ -84,16 +77,16 @@ STUB_REGISTRY = {fn.__name__: fn for fn in STUB_TOOLS}
 # Live tools -- the model-facing wrappers
 # ---------------------------------------------------------------------------
 # The model is handed exactly two tools, named generically with fixed docstrings,
-# so it sees the *same* tools no matter which provider backs them. The selected
-# backend's search_fn/scrape_fn (from backends.py) do the actual network call;
-# these wrappers add the MAX_TOOL_CHARS cap and nothing else.
+# so it never sees which provider backs them. The backend's search_fn/scrape_fn
+# (from backends.py) do the actual network call; these wrappers add the
+# MAX_TOOL_CHARS cap and nothing else.
 def build_model_tools(search_fn, scrape_fn):
-    """Wrap a backend's (search_fn, scrape_fn) as the model-facing tools.
+    """Wrap the backend's (search_fn, scrape_fn) as the model-facing tools.
 
     Returns (tools, registry) matching the stub's shape: `tools` is a list of
     plain functions (for apply_chat_template / to_anthropic_tools) and `registry`
     maps name -> callable(**kwargs) -> str. The docstrings here are what the model
-    reads, so they stay vendor-neutral and identical across backends.
+    reads, so they stay vendor-neutral.
     """
 
     def web_search(query: str) -> str:
@@ -124,47 +117,17 @@ def build_model_tools(search_fn, scrape_fn):
 # ---------------------------------------------------------------------------
 # Selection
 # ---------------------------------------------------------------------------
-def setup_tools(
-    offline: bool = False,
-    search_backend: str = DEFAULT_BACKEND,
-    scrape_backend: str = DEFAULT_BACKEND,
-):
+def setup_tools(offline: bool = False):
     """Pick the tool source and return (tools, tool_registry, system_prompt).
 
-    offline=False (default): live `web_search`/`scrape_url`, each backed by the
-    chosen provider (see backends.py). The search and scrape providers are picked
-    independently -- e.g. search via 'brave', scrape via 'jina' -- so any pair can
-    be A/B tested on the same task. Only the selected providers' API keys are read.
+    offline=False (default): live `web_search` (Brave) + `scrape_url` (Jina) --
+    see backends.py; reads BRAVE_API_KEY and JINA_API_KEY.
     offline=True: the deterministic `web_search` stub that returns sample_menu.md,
     for developing the loop without a key or network.
     """
     if offline:
         return STUB_TOOLS, STUB_REGISTRY, SYSTEM_PROMPT
 
-    if search_backend not in SEARCH_BACKENDS:
-        raise SystemExit(
-            f"{search_backend!r} has no web_search; pick --search-backend from "
-            f"{SEARCH_BACKENDS}."
-        )
-    if scrape_backend not in SCRAPE_BACKENDS:
-        raise SystemExit(
-            f"{scrape_backend!r} has no scrape_url; pick --scrape-backend from "
-            f"{SCRAPE_BACKENDS}."
-        )
-
-    # Build each requested provider once (the same backend may serve both roles).
-    built: dict = {}
-
-    def get(name):
-        if name not in built:
-            built[name] = build_backend(name)
-        return built[name]
-
-    search_fn = get(search_backend)[0]
-    scrape_fn = get(scrape_backend)[1]
-    tools, registry = build_model_tools(search_fn, scrape_fn)
-    print(
-        f"Live tools: web_search via {search_backend!r}, "
-        f"scrape_url via {scrape_backend!r}"
-    )
+    tools, registry = build_model_tools(build_search(), build_scrape())
+    print("Live tools: web_search via Brave, scrape_url via Jina")
     return tools, registry, LIVE_SYSTEM_PROMPT

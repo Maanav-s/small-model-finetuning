@@ -23,23 +23,17 @@ One Python process does everything — there is no separate frontend server.
 
 - **Backend ([server.py](server.py))** — FastAPI. On startup it loads the Gemma
   model and an Anthropic client **once** (in-process, via `src/`'s `load_model`
-  and `anthropic.Anthropic`) and keeps them resident. The web tools are built
-  **lazily per backend combo and cached** (via `setup_tools`), so the server
-  boots with no web key and only needs a combo's key the first time you run it.
-  It exposes:
+  and `anthropic.Anthropic`) and keeps them resident. The web tools (Brave search
+  + Jina scrape) are built **lazily once and cached** (via `setup_tools`), so the
+  server boots with no web key and only needs the keys the first time you run an
+  extraction. It exposes:
   - `GET /` → serves `static/index.html`
-  - `GET /api/backends` → `{"search": [{"name","available"}…], "scrape": […],
-    "default": "firecrawl"}` — which providers exist and which have an API key
-    set; drives the page's two backend selectors.
   - `POST /api/extract`
-    `{"query": "<restaurant>", "agent": "gemma"|"claude", "search_backend": "…",
-    "scrape_backend": "…"}` → runs one extraction episode and returns
-    `{"ok": true, "menu": {...}, "raw": "...", "agent": "...",
-    "search_backend": "...", "scrape_backend": "..."}`, or
-    `{"ok": false, "error": "...", ...}` on a missing key / invalid backend /
-    non-JSON output. `agent` defaults to `gemma`; the backends default to
-    `firecrawl`. Validation reuses `schema.extract_json`, so the page and the
-    eval/reward share one contract.
+    `{"query": "<restaurant>", "agent": "gemma"|"claude"}` → runs one extraction
+    episode and returns `{"ok": true, "menu": {...}, "raw": "...", "agent": "..."}`,
+    or `{"ok": false, "error": "...", ...}` on a missing key / non-JSON output.
+    `agent` defaults to `gemma`. Validation reuses `schema.extract_json`, so the
+    page and the eval/reward share one contract.
 
 ### Choosing the agent
 
@@ -52,19 +46,9 @@ Claude is optional: it's wired up only if `ANTHROPIC_API_KEY` is present at
 startup. Without the key the server still boots Gemma-only, and a Claude request
 returns an error explaining the key is missing (rather than failing at startup).
 
-### Choosing the search/scrape backends
+The web tools are fixed: **Brave** backs `web_search` and **Jina** backs
+`scrape_url` (see [src/backends.py](../src/backends.py)).
 
-Two more dropdowns pick which provider backs `web_search` and `scrape_url`
-**independently** (see [src/backends.py](../src/backends.py)) — so you can run the
-same restaurant through different combinations (e.g. `brave`+`jina` vs
-`firecrawl`+`firecrawl`) and compare the menus. Options are populated from
-`GET /api/backends`; a provider whose API key isn't set is shown flagged
-`(no key)` and sorted last (picking it returns a clear error). The rendered menu
-header is labelled with the agent **and** the `search`/`scrape` combo that
-produced it, so successive runs are easy to tell apart.
-
-- Search providers: `firecrawl`, `tavily`, `brave`, `jina`.
-- Scrape providers: `firecrawl`, `tavily`, `jina`, `browserless`.
 - **Frontend ([static/index.html](static/index.html))** — plain HTML + vanilla
   JS, no framework and no build step. It `fetch()`es `/api/extract`, then renders
   `menu[].section` / `items[].{name, description, price}` as a menu card (dotted
@@ -95,11 +79,9 @@ Then open <http://127.0.0.1:8000>.
 
 - Startup loads the model first (tens of seconds to ~1.5 min on this box); the
   page won't serve until you see `Visualizer ready -> ...` in the log.
-- Tool calls use whichever backend combo you select. Set the API key for each
-  provider you want to use in the repo-root `.env` — `FIRECRAWL_API_KEY`,
-  `TAVILY_API_KEY`, `BRAVE_API_KEY`, `JINA_API_KEY`, `BROWSERLESS_API_KEY` (see
-  [.env.example](../.env.example)). You only need the key(s) for the combos you
-  actually run; the startup log prints which providers have keys.
+- Tool calls use Brave (search) + Jina (scrape). Set `BRAVE_API_KEY` and
+  `JINA_API_KEY` in the repo-root `.env` (see [.env.example](../.env.example));
+  the startup log prints whether each key is set.
 - To enable the **Claude** agent, add `ANTHROPIC_API_KEY` to the repo-root `.env`
   (same key `run_claude.py` uses). Gemma needs no extra key.
 
@@ -108,8 +90,8 @@ Then open <http://127.0.0.1:8000>.
 - **Quantization:** 4-bit by default (matches this 15 GB-host-RAM box — see the
   repo `CLAUDE.md`). Set `VIZ_QUANTIZE=0` to load full-quality bf16 on a
   bigger-RAM machine.
-- **Latency:** a request runs a full episode — Firecrawl search/scrape plus up to
-  several generation turns — so it can take a couple of minutes, especially in
+- **Latency:** a request runs a full episode — Brave search / Jina scrape plus up
+  to several generation turns — so it can take a couple of minutes, especially in
   4-bit. The page shows a loading state; expect minutes, not milliseconds. If you
   script against the API with `curl`, set a generous `--max-time`.
 - **Remote box:** bind `--host 0.0.0.0` to reach it from your laptop to the GPU

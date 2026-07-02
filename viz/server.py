@@ -2,22 +2,15 @@
 
 A single FastAPI process that:
   - loads the Gemma model + an Anthropic client ONCE at startup (in-process),
-  - serves the static page (static/index.html) at "/",
-  - exposes POST /api/extract
-    {"query", "agent": "gemma"|"claude", "search_backend", "scrape_backend"}
-    -> menu JSON, and
-  - exposes GET /api/backends -> which search/scrape providers are usable (their
-    API key is present), so the page can populate its selectors.
+  - serves the static page (static/index.html) at "/", and
+  - exposes POST /api/extract {"query", "agent": "gemma"|"claude"} -> menu JSON.
 
 Either agent runs the SAME tools / system prompt / JSON contract (only the loop
 differs): the local Gemma model (gemma/agent.py) or Claude via the Anthropic API
 (claude/claude_agent.py). The default is gemma.
 
-The web tools are pluggable (see src/backends.py): each request picks a search
-provider and a scrape provider independently, so you can compare combinations
-(e.g. brave+jina vs firecrawl+firecrawl) on the same restaurant. Tool sets are
-built lazily per (search, scrape) combo and cached, so the server boots without
-any web key and only needs the key for a combo when you first run it.
+The web tools are Brave (search) + Jina (scrape) -- see src/backends.py -- built
+once at startup.
 
 Episodes are serialized behind one lock: one runs at a time no matter how many
 browser tabs hit it. For Gemma this is essential (concurrent generate() calls on
@@ -27,11 +20,9 @@ so the lock -- not the event loop -- does the gating.
 Run from the repo root:
     uv run uvicorn viz.server:app --host 127.0.0.1 --port 8000
 
-Set the API key(s) for whichever backend(s) you want to use in the repo-root .env
-(FIRECRAWL_API_KEY / TAVILY_API_KEY / BRAVE_API_KEY / JINA_API_KEY /
-BROWSERLESS_API_KEY). The Claude agent additionally needs ANTHROPIC_API_KEY;
-without it, only Gemma is offered (a Claude request returns an error rather than
-failing at startup).
+Set BRAVE_API_KEY and JINA_API_KEY in the repo-root .env for the live tools. The
+Claude agent additionally needs ANTHROPIC_API_KEY; without it, only Gemma is
+offered (a Claude request returns an error rather than failing at startup).
 """
 
 from __future__ import annotations
@@ -56,18 +47,13 @@ _SRC = _REPO / "src"
 for _p in (_SRC, _SRC / "gemma", _SRC / "claude"):
     sys.path.insert(0, str(_p))
 
-load_dotenv(_REPO / ".env")  # FIRECRAWL_API_KEY (+ ANTHROPIC_API_KEY for Claude)
+load_dotenv(_REPO / ".env")  # BRAVE_API_KEY / JINA_API_KEY (+ ANTHROPIC_API_KEY for Claude)
 
 # Imported after sys.path is set. model.py sets PYTORCH_CUDA_ALLOC_CONF before it
 # touches torch, so it must be the first of these to import. The two run_episode
 # loops share a name, so alias them.
 from model import load_model                          # noqa: E402
-from backends import (                                 # noqa: E402
-    DEFAULT_BACKEND,
-    SCRAPE_BACKENDS,
-    SEARCH_BACKENDS,
-    backend_has_key,
-)
+from backends import has_scrape_key, has_search_key   # noqa: E402
 from tools import setup_tools                          # noqa: E402
 from agent import run_episode as run_gemma_episode     # noqa: E402
 from claude_agent import (                              # noqa: E402
@@ -88,26 +74,23 @@ _QUANTIZE = os.environ.get("VIZ_QUANTIZE", "1") != "0"
 _ENGINE: dict = {}                 # model/tokenizer/client, populated at startup
 _EPISODE_LOCK = threading.Lock()   # serialize episodes (single GPU: concurrent generate() would race/OOM)
 
-# Tool sets are built lazily per (search_backend, scrape_backend) combo and cached
-# here, so the server boots with no web key and each combo's key is only needed the
-# first time it's used. _TOOLS_LOCK guards the cache against concurrent first builds.
-_TOOLS_CACHE: dict[tuple[str, str], tuple] = {}
+# The live tools (Brave + Jina) are built lazily once and cached here, so the
+# server boots with no web key and the key is only needed the first time an
+# extraction runs. _TOOLS_LOCK guards the cache against concurrent first builds.
+_TOOLS_CACHE: list = []
 _TOOLS_LOCK = threading.Lock()
 
 
-def _get_tools(search_backend: str, scrape_backend: str) -> tuple:
-    """Return (tools, registry, system_prompt) for a combo, building+caching once.
+def _get_tools() -> tuple:
+    """Return (tools, registry, system_prompt), building+caching once.
 
-    Raises SystemExit (from setup_tools) if a chosen backend's key is missing; the
-    caller turns that into a clean API error instead of crashing the server.
+    Raises SystemExit (from setup_tools) if a web key is missing; the caller turns
+    that into a clean API error instead of crashing the server.
     """
-    key = (search_backend, scrape_backend)
     with _TOOLS_LOCK:
-        if key not in _TOOLS_CACHE:
-            _TOOLS_CACHE[key] = setup_tools(
-                search_backend=search_backend, scrape_backend=scrape_backend
-            )
-        return _TOOLS_CACHE[key]
+        if not _TOOLS_CACHE:
+            _TOOLS_CACHE.append(setup_tools())
+        return _TOOLS_CACHE[0]
 
 
 @asynccontextmanager
@@ -123,9 +106,8 @@ async def lifespan(app: FastAPI):
         anthropic_client=anthropic_client,
     )
     print(f"Agents available: gemma{' + claude' if anthropic_client else ' (claude disabled: no ANTHROPIC_API_KEY)'}")
-    avail = lambda names: [n for n in names if backend_has_key(n)] or ["(none — set an API key)"]
-    print(f"Search backends with keys: {avail(SEARCH_BACKENDS)}")
-    print(f"Scrape backends with keys: {avail(SCRAPE_BACKENDS)}")
+    print(f"web_search (Brave): {'key set' if has_search_key() else 'NO KEY — set BRAVE_API_KEY'}")
+    print(f"scrape_url (Jina): {'key set' if has_scrape_key() else 'NO KEY — set JINA_API_KEY'}")
     print("Visualizer ready -> http://127.0.0.1:8000")
     yield
 
@@ -137,21 +119,6 @@ _STATIC = Path(__file__).resolve().parent / "static"
 class ExtractRequest(BaseModel):
     query: str
     agent: str = "gemma"  # "gemma" (local model) or "claude" (Anthropic API)
-    search_backend: str = DEFAULT_BACKEND
-    scrape_backend: str = DEFAULT_BACKEND
-
-
-@app.get("/api/backends")
-def backends() -> dict:
-    """Report selectable search/scrape backends and whether each has an API key.
-
-    Drives the page's two backend selectors; `available` lets the UI flag (or
-    disable) a provider whose key isn't set so a failed run isn't a surprise.
-    """
-    def opts(names):
-        return [{"name": n, "available": backend_has_key(n)} for n in names]
-
-    return {"search": opts(SEARCH_BACKENDS), "scrape": opts(SCRAPE_BACKENDS), "default": DEFAULT_BACKEND}
 
 
 # Sync def -> FastAPI runs it in a threadpool; _EPISODE_LOCK keeps episodes serial.
@@ -159,10 +126,8 @@ def backends() -> dict:
 def extract(req: ExtractRequest) -> dict:
     query = req.query.strip()
     agent = (req.agent or "gemma").lower()
-    search_backend = req.search_backend or DEFAULT_BACKEND
-    scrape_backend = req.scrape_backend or DEFAULT_BACKEND
-    # Echoed back on every response so the page can label which combo produced it.
-    meta = {"agent": agent, "search_backend": search_backend, "scrape_backend": scrape_backend}
+    # Echoed back on every response so the page can label which agent produced it.
+    meta = {"agent": agent}
 
     def fail(error: str, raw: str = ""):
         return {"ok": False, "error": error, "raw": raw, **meta}
@@ -173,26 +138,18 @@ def extract(req: ExtractRequest) -> dict:
         return fail(f"Unknown agent {req.agent!r}.")
     if agent in CLAUDE_AGENTS and _ENGINE.get("anthropic_client") is None:
         return fail("Claude is unavailable: set ANTHROPIC_API_KEY and restart the server.")
-    if search_backend not in SEARCH_BACKENDS:
-        return fail(f"Unknown search backend {search_backend!r}; choose from {SEARCH_BACKENDS}.")
-    if scrape_backend not in SCRAPE_BACKENDS:
-        return fail(f"Unknown scrape backend {scrape_backend!r}; choose from {SCRAPE_BACKENDS}.")
 
-    # Resolve (and lazily build/cache) the tools for this combo. A missing key
-    # surfaces here as SystemExit -> a clean error instead of a server crash.
+    # Resolve (and lazily build/cache) the live tools. A missing key surfaces
+    # here as SystemExit -> a clean error instead of a server crash.
     try:
-        tools, registry, system_prompt = _get_tools(search_backend, scrape_backend)
+        tools, registry, system_prompt = _get_tools()
     except SystemExit as e:
         return fail(str(e))
 
     # Mark the start of the episode so the buffered tool-call prints below can be
-    # attributed to a query/agent/combo. flush=True so it shows immediately even
-    # though stdout is block-buffered through uvicorn's pipe.
-    print(
-        f"\n=== Episode (agent={agent}, search={search_backend}, "
-        f"scrape={scrape_backend}): {query!r} ===",
-        flush=True,
-    )
+    # attributed to a query/agent. flush=True so it shows immediately even though
+    # stdout is block-buffered through uvicorn's pipe.
+    print(f"\n=== Episode (agent={agent}): {query!r} ===", flush=True)
 
     with _EPISODE_LOCK:
         if agent == "gemma":
