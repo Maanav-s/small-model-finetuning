@@ -170,10 +170,16 @@ class Cache:
         return hashlib.sha256(raw).hexdigest()
 
     def _get(self, namespace: str, key: str) -> sqlite3.Row | None:
-        cur = self._conn.execute(
-            "SELECT * FROM cache WHERE key_hash = ?", (self._key_hash(namespace, key),)
-        )
-        return cur.fetchone()
+        # The lock serializes ALL access to the shared connection. Reads need it
+        # too: concurrent execute() calls on one sqlite3 connection clobber each
+        # other's in-flight cursors -- observed as InterfaceError("bad parameter
+        # or other API misuse") AND, worse, one thread receiving another thread's
+        # row (silent cross-talk) under the WS-C thread pool.
+        with self._lock:
+            cur = self._conn.execute(
+                "SELECT * FROM cache WHERE key_hash = ?", (self._key_hash(namespace, key),)
+            )
+            return cur.fetchone()
 
     def _set(self, namespace, key, args, response, provider, status):
         row = (
@@ -217,34 +223,40 @@ class Cache:
                 # serve only good rows and treat a stored 'error' as a miss, so a
                 # transient failure gets re-fetched on the next populate pass.
                 if self.miss_policy == "canned" or row["status"] in ("ok", "empty"):
-                    self._hits += 1
+                    with self._lock:  # += is a non-atomic read-modify-write
+                        self._hits += 1
                     return row["response"]
 
             # miss: absent key, or a stored 'error' under live/error policy.
-            self._misses += 1
+            with self._lock:
+                self._misses += 1
             if self.miss_policy == "canned":
                 return CANNED[namespace]
             if self.miss_policy == "error":
                 raise CacheMiss(f"{namespace} miss for key={key!r} (policy=error)")
 
-            # live: call through, classify, store, return.
+            # live: call through, classify, store, return. The network call runs
+            # OUTSIDE the lock (two workers missing the same key both fetch and
+            # both write -- benign, INSERT OR REPLACE; see phase2_plan.md WS-C).
             response = fn(*args, **kwargs)
             status = classify(response)
             self._set(namespace, key, {"args": args, "kwargs": kwargs}, response, provider, status)
-            self._writes += 1
+            with self._lock:
+                self._writes += 1
             return response
 
         return wrapped
 
     def stats(self) -> dict:
         """Hit/miss/write counters for this process's lifetime."""
-        return {
-            "hits": self._hits,
-            "misses": self._misses,
-            "writes": self._writes,
-            "miss_policy": self.miss_policy,
-            "cache_version": self.cache_version,
-        }
+        with self._lock:  # consistent snapshot across the three counters
+            return {
+                "hits": self._hits,
+                "misses": self._misses,
+                "writes": self._writes,
+                "miss_policy": self.miss_policy,
+                "cache_version": self.cache_version,
+            }
 
     def close(self):
         self._conn.close()

@@ -15,6 +15,11 @@ The model only ever sees ONE search and ONE scrape tool, both named generically
 (web_search / scrape_url) with fixed docstrings (build_model_tools), so the
 *backend stays invisible to the model*. The generic names also keep vendor
 branding out of the SFT/GRPO training data the tool calls get baked into later.
+
+Caching (Phase 2): setup_tools(cache=Cache(...)) wraps the live backend closures
+in the content-addressed SQLite cache (src/cache.py) BEFORE build_model_tools
+applies the MAX_TOOL_CHARS cap, so the stored response is raw/uncapped and the
+cap stays retunable without re-scraping. cache=None (default) = uncached.
 """
 
 from __future__ import annotations
@@ -22,6 +27,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from backends import build_scrape, build_search
+from cache import norm_query, norm_scrape, scrape_status
 from prompts import build_system_prompt
 
 # ---------------------------------------------------------------------------
@@ -125,7 +131,12 @@ def build_model_tools(search_fn, scrape_fn):
 # ---------------------------------------------------------------------------
 # Selection
 # ---------------------------------------------------------------------------
-def setup_tools(offline: bool = False, dietary_restrictions=None, variant: str = "teacher"):
+def setup_tools(
+    offline: bool = False,
+    dietary_restrictions=None,
+    variant: str = "teacher",
+    cache=None,
+):
     """Pick the tool source and return (tools, tool_registry, system_prompt).
 
     offline=False (default): the live `web_search` (Brave) + `scrape_url` (local
@@ -137,11 +148,31 @@ def setup_tools(offline: bool = False, dietary_restrictions=None, variant: str =
     so the model filters the menu to complying items; empty means no filtering.
     variant ("teacher" | "student"): system-prompt variant (see prompts.py) --
     "teacher" (default) carries the source-selection guidance, "student" omits it.
+    cache (cache.Cache | None): when given (and not offline), it wraps the BACKEND
+    closures -- BEFORE the MAX_TOOL_CHARS cap above -- so the RAW uncapped response
+    is stored and the cap stays retunable without re-scraping. The cache's
+    miss_policy (live/canned/error) decides what a miss does; see src/cache.py.
+    Ignored for the offline stub (already deterministic, no network to cache).
     """
     if offline:
+        if cache is not None:
+            print(
+                "Note: cache is ignored for the offline stub (already deterministic); "
+                "running uncached."
+            )
         prompt = build_system_prompt(dietary_restrictions, live=False, variant=variant)
         return STUB_TOOLS, STUB_REGISTRY, prompt
 
-    tools, registry = build_model_tools(build_search(), build_scrape())
-    print("Live tools: web_search via Brave, scrape_url via local Chromium")
+    search_fn, scrape_fn = build_search(), build_scrape()
+    if cache is not None:
+        # scrape is 2-arg (url, mode); norm_scrape keys on BOTH so direct/browser
+        # renders are distinct entries. scrape_status marks failure sentinels
+        # 'error' so transient Chromium timeouts aren't frozen into the corpus.
+        search_fn = cache.wrap("search", search_fn, key_fn=norm_query, provider="brave")
+        scrape_fn = cache.wrap(
+            "scrape", scrape_fn, key_fn=norm_scrape, status_fn=scrape_status, provider="local"
+        )
+    tools, registry = build_model_tools(search_fn, scrape_fn)
+    cached = f", cached ({cache.miss_policy}) at {cache.path}" if cache is not None else ""
+    print(f"Live tools: web_search via Brave, scrape_url via local Chromium{cached}")
     return tools, registry, build_system_prompt(dietary_restrictions, live=True, variant=variant)

@@ -21,6 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from dotenv import load_dotenv  # noqa: E402
 
 from agent import run_episode  # noqa: E402
+from cache import MISS_POLICIES, Cache  # noqa: E402
 from model import load_model  # noqa: E402
 from prompts import TEST_RESTAURANT, normalize_dietary_restrictions  # noqa: E402
 from schema import extract_json  # noqa: E402
@@ -72,7 +73,31 @@ def parse_args():
         "delivery apps); 'student' omits it. The plan is to distill teacher "
         "behavior into the student via context distillation (see CLAUDE.md).",
     )
+    parser.add_argument(
+        "--cache-policy",
+        choices=[*MISS_POLICIES, "off"],
+        default="off",
+        help="Tool-call cache miss policy (see src/cache.py): 'live' fetches and "
+        "stores on a miss (SFT/populate), 'canned' returns frozen constants "
+        "(GRPO/replay), 'error' raises on a miss (strict debugging). Default "
+        "'off' = no cache (today's behavior).",
+    )
+    parser.add_argument(
+        "--cache-path",
+        default="data/cache.sqlite",
+        help="SQLite file for the tool-call cache (default: data/cache.sqlite; "
+        "only used when --cache-policy is not 'off').",
+    )
     return parser.parse_args()
+
+
+def build_cache(args):
+    """Build a Cache from --cache-policy/--cache-path, or None for 'off'."""
+    if args.cache_policy == "off":
+        return None
+    path = Path(args.cache_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return Cache(str(path), miss_policy=args.cache_policy)
 
 
 def report(answer: str) -> None:
@@ -97,11 +122,13 @@ def report(answer: str) -> None:
 
 def main():
     args = parse_args()
+    cache = build_cache(args)
     model, tokenizer = load_model(quantize=args.quantize, attn=args.attn)
     tools, tool_registry, system_prompt = setup_tools(
         offline=args.offline,
         dietary_restrictions=args.dietary,
         variant=args.prompt_variant,
+        cache=cache,
     )
     restaurant = TEST_RESTAURANT
     diet = normalize_dietary_restrictions(args.dietary)
@@ -113,6 +140,9 @@ def main():
     )
 
     report(answer)
+    if cache is not None:
+        print(f"\n=== CACHE STATS ===\n{cache.stats()}")
+        cache.close()
 
 
 if __name__ == "__main__":
