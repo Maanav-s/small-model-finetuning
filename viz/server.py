@@ -1,28 +1,37 @@
 """Local visualizer for the Gemma menu-extraction agent.
 
 A single FastAPI process that:
-  - loads the Gemma model + an Anthropic client + Firecrawl MCP tools ONCE at
-    startup (in-process),
+  - loads the Gemma model + an Anthropic client ONCE at startup (in-process),
   - serves the static page (static/index.html) at "/",
-  - exposes POST /api/extract {"query": "<restaurant>", "agent": "gemma"|"claude"}
-    -> menu JSON.
+  - exposes POST /api/extract
+    {"query", "agent": "gemma"|"claude", "search_backend", "scrape_backend"}
+    -> menu JSON, and
+  - exposes GET /api/backends -> which search/scrape providers are usable (their
+    API key is present), so the page can populate its selectors.
 
 Either agent runs the SAME tools / system prompt / JSON contract (only the loop
 differs): the local Gemma model (gemma/agent.py) or Claude via the Anthropic API
 (claude/claude_agent.py). The default is gemma.
 
+The web tools are pluggable (see src/backends.py): each request picks a search
+provider and a scrape provider independently, so you can compare combinations
+(e.g. brave+jina vs firecrawl+firecrawl) on the same restaurant. Tool sets are
+built lazily per (search, scrape) combo and cached, so the server boots without
+any web key and only needs the key for a combo when you first run it.
+
 Episodes are serialized behind one lock: one runs at a time no matter how many
 browser tabs hit it. For Gemma this is essential (concurrent generate() calls on
-the single GPU would race / OOM); it also guards the shared Firecrawl MCP
-subprocess that both agents call. FastAPI runs the sync endpoint in a threadpool,
+the single GPU would race / OOM). FastAPI runs the sync endpoint in a threadpool,
 so the lock -- not the event loop -- does the gating.
 
 Run from the repo root:
     uv run uvicorn viz.server:app --host 127.0.0.1 --port 8000
 
-Requires FIRECRAWL_API_KEY in the repo-root .env (the MCP tool path needs it).
-The Claude agent additionally needs ANTHROPIC_API_KEY; without it, only Gemma is
-offered (a Claude request returns an error rather than failing at startup).
+Set the API key(s) for whichever backend(s) you want to use in the repo-root .env
+(FIRECRAWL_API_KEY / TAVILY_API_KEY / BRAVE_API_KEY / JINA_API_KEY /
+BROWSERLESS_API_KEY). The Claude agent additionally needs ANTHROPIC_API_KEY;
+without it, only Gemma is offered (a Claude request returns an error rather than
+failing at startup).
 """
 
 from __future__ import annotations
@@ -53,43 +62,72 @@ load_dotenv(_REPO / ".env")  # FIRECRAWL_API_KEY (+ ANTHROPIC_API_KEY for Claude
 # touches torch, so it must be the first of these to import. The two run_episode
 # loops share a name, so alias them.
 from model import load_model                          # noqa: E402
+from backends import (                                 # noqa: E402
+    DEFAULT_BACKEND,
+    SCRAPE_BACKENDS,
+    SEARCH_BACKENDS,
+    backend_has_key,
+)
 from tools import setup_tools                          # noqa: E402
 from agent import run_episode as run_gemma_episode     # noqa: E402
-from claude_agent import run_episode as run_claude_episode  # noqa: E402
+from claude_agent import (                              # noqa: E402
+    HAIKU_MODEL_ID,
+    MODEL_ID as CLAUDE_SONNET_ID,
+    run_episode as run_claude_episode,
+)
 from schema import extract_json                        # noqa: E402
+
+# UI agent value -> Claude model id. Both run the SAME claude_agent loop; only the
+# model differs (and the loop picks the right thinking config per model).
+CLAUDE_AGENTS = {"claude": CLAUDE_SONNET_ID, "claude-haiku": HAIKU_MODEL_ID}
 
 # 4-bit by default on this box (15 GB host RAM; see CLAUDE.md). Set VIZ_QUANTIZE=0
 # on a bigger-RAM machine to load full-quality bf16 instead.
 _QUANTIZE = os.environ.get("VIZ_QUANTIZE", "1") != "0"
 
-_ENGINE: dict = {}                 # model/tokenizer/tools/client, populated at startup
-_EPISODE_LOCK = threading.Lock()   # serialize episodes (GPU + shared MCP subprocess)
+_ENGINE: dict = {}                 # model/tokenizer/client, populated at startup
+_EPISODE_LOCK = threading.Lock()   # serialize episodes (single GPU: concurrent generate() would race/OOM)
+
+# Tool sets are built lazily per (search_backend, scrape_backend) combo and cached
+# here, so the server boots with no web key and each combo's key is only needed the
+# first time it's used. _TOOLS_LOCK guards the cache against concurrent first builds.
+_TOOLS_CACHE: dict[tuple[str, str], tuple] = {}
+_TOOLS_LOCK = threading.Lock()
+
+
+def _get_tools(search_backend: str, scrape_backend: str) -> tuple:
+    """Return (tools, registry, system_prompt) for a combo, building+caching once.
+
+    Raises SystemExit (from setup_tools) if a chosen backend's key is missing; the
+    caller turns that into a clean API error instead of crashing the server.
+    """
+    key = (search_backend, scrape_backend)
+    with _TOOLS_LOCK:
+        if key not in _TOOLS_CACHE:
+            _TOOLS_CACHE[key] = setup_tools(
+                search_backend=search_backend, scrape_backend=scrape_backend
+            )
+        return _TOOLS_CACHE[key]
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Load the model, Anthropic client, and Firecrawl tools once; close MCP on exit."""
+    """Load the model and Anthropic client once at startup (tools are built lazily)."""
     model, tokenizer = load_model(quantize=_QUANTIZE, attn="sdpa")
-    tools, registry, system_prompt, mcp_client = setup_tools(use_mcp=True)
     # Claude is optional: only wire it up if a key is present, so the server still
     # boots (Gemma-only) without ANTHROPIC_API_KEY.
     anthropic_client = anthropic.Anthropic() if os.environ.get("ANTHROPIC_API_KEY") else None
     _ENGINE.update(
         model=model,
         tokenizer=tokenizer,
-        tools=tools,
-        registry=registry,
-        system_prompt=system_prompt,
-        mcp_client=mcp_client,
         anthropic_client=anthropic_client,
     )
     print(f"Agents available: gemma{' + claude' if anthropic_client else ' (claude disabled: no ANTHROPIC_API_KEY)'}")
+    avail = lambda names: [n for n in names if backend_has_key(n)] or ["(none — set an API key)"]
+    print(f"Search backends with keys: {avail(SEARCH_BACKENDS)}")
+    print(f"Scrape backends with keys: {avail(SCRAPE_BACKENDS)}")
     print("Visualizer ready -> http://127.0.0.1:8000")
-    try:
-        yield
-    finally:
-        if mcp_client is not None:
-            mcp_client.close()
+    yield
 
 
 app = FastAPI(title="Menu Visualizer", lifespan=lifespan)
@@ -99,6 +137,21 @@ _STATIC = Path(__file__).resolve().parent / "static"
 class ExtractRequest(BaseModel):
     query: str
     agent: str = "gemma"  # "gemma" (local model) or "claude" (Anthropic API)
+    search_backend: str = DEFAULT_BACKEND
+    scrape_backend: str = DEFAULT_BACKEND
+
+
+@app.get("/api/backends")
+def backends() -> dict:
+    """Report selectable search/scrape backends and whether each has an API key.
+
+    Drives the page's two backend selectors; `available` lets the UI flag (or
+    disable) a provider whose key isn't set so a failed run isn't a surprise.
+    """
+    def opts(names):
+        return [{"name": n, "available": backend_has_key(n)} for n in names]
+
+    return {"search": opts(SEARCH_BACKENDS), "scrape": opts(SCRAPE_BACKENDS), "default": DEFAULT_BACKEND}
 
 
 # Sync def -> FastAPI runs it in a threadpool; _EPISODE_LOCK keeps episodes serial.
@@ -106,46 +159,56 @@ class ExtractRequest(BaseModel):
 def extract(req: ExtractRequest) -> dict:
     query = req.query.strip()
     agent = (req.agent or "gemma").lower()
+    search_backend = req.search_backend or DEFAULT_BACKEND
+    scrape_backend = req.scrape_backend or DEFAULT_BACKEND
+    # Echoed back on every response so the page can label which combo produced it.
+    meta = {"agent": agent, "search_backend": search_backend, "scrape_backend": scrape_backend}
+
+    def fail(error: str, raw: str = ""):
+        return {"ok": False, "error": error, "raw": raw, **meta}
+
     if not query:
-        return {"ok": False, "error": "Empty query.", "raw": "", "agent": agent}
-    if agent not in ("gemma", "claude"):
-        return {"ok": False, "error": f"Unknown agent {req.agent!r}.", "raw": "", "agent": agent}
-    if agent == "claude" and _ENGINE.get("anthropic_client") is None:
-        return {
-            "ok": False,
-            "error": "Claude is unavailable: set ANTHROPIC_API_KEY and restart the server.",
-            "raw": "",
-            "agent": agent,
-        }
+        return fail("Empty query.")
+    if agent != "gemma" and agent not in CLAUDE_AGENTS:
+        return fail(f"Unknown agent {req.agent!r}.")
+    if agent in CLAUDE_AGENTS and _ENGINE.get("anthropic_client") is None:
+        return fail("Claude is unavailable: set ANTHROPIC_API_KEY and restart the server.")
+    if search_backend not in SEARCH_BACKENDS:
+        return fail(f"Unknown search backend {search_backend!r}; choose from {SEARCH_BACKENDS}.")
+    if scrape_backend not in SCRAPE_BACKENDS:
+        return fail(f"Unknown scrape backend {scrape_backend!r}; choose from {SCRAPE_BACKENDS}.")
+
+    # Resolve (and lazily build/cache) the tools for this combo. A missing key
+    # surfaces here as SystemExit -> a clean error instead of a server crash.
+    try:
+        tools, registry, system_prompt = _get_tools(search_backend, scrape_backend)
+    except SystemExit as e:
+        return fail(str(e))
 
     # Mark the start of the episode so the buffered tool-call prints below can be
-    # attributed to a query/agent. flush=True so it shows immediately even though
-    # stdout is block-buffered through uvicorn's pipe.
-    print(f"\n=== Episode (agent={agent}): {query!r} ===", flush=True)
+    # attributed to a query/agent/combo. flush=True so it shows immediately even
+    # though stdout is block-buffered through uvicorn's pipe.
+    print(
+        f"\n=== Episode (agent={agent}, search={search_backend}, "
+        f"scrape={scrape_backend}): {query!r} ===",
+        flush=True,
+    )
 
     with _EPISODE_LOCK:
         if agent == "gemma":
             answer = run_gemma_episode(
-                _ENGINE["model"],
-                _ENGINE["tokenizer"],
-                query,
-                _ENGINE["tools"],
-                _ENGINE["registry"],
-                _ENGINE["system_prompt"],
+                _ENGINE["model"], _ENGINE["tokenizer"], query, tools, registry, system_prompt
             )
         else:
             answer = run_claude_episode(
-                _ENGINE["anthropic_client"],
-                query,
-                _ENGINE["tools"],
-                _ENGINE["registry"],
-                _ENGINE["system_prompt"],
+                _ENGINE["anthropic_client"], query, tools, registry, system_prompt,
+                model=CLAUDE_AGENTS[agent],
             )
 
     parsed, err = extract_json(answer)
     if parsed is None:
-        return {"ok": False, "error": f"Model output was not valid JSON: {err}", "raw": answer, "agent": agent}
-    return {"ok": True, "menu": parsed, "raw": answer, "agent": agent}
+        return fail(f"Model output was not valid JSON: {err}", raw=answer)
+    return {"ok": True, "menu": parsed, "raw": answer, **meta}
 
 
 @app.get("/")

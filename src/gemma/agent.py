@@ -17,7 +17,7 @@ import re
 import sys
 from pathlib import Path
 
-# Shared modules (schema/prompts/tools/mcp_client) live in src/, the parent of
+# Shared modules (schema/prompts/tools) live in src/, the parent of
 # this gemma/ folder; put it on the path so flat imports resolve whether this
 # file is run directly or imported by run_agent.py.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -153,12 +153,12 @@ if __name__ == "__main__":
     from transformers import AutoTokenizer
 
     from model import MODEL_ID
-    from tools import TOOLS
+    from tools import STUB_TOOLS
 
     tok = AutoTokenizer.from_pretrained(MODEL_ID)
     rendered = tok.apply_chat_template(
         build_messages("Joe's Pizza, New York"),
-        tools=TOOLS,
+        tools=STUB_TOOLS,
         add_generation_prompt=True,
         tokenize=False,
     )

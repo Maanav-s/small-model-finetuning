@@ -1,25 +1,61 @@
 """Tool sources for the agent loop.
 
 Two sources, selected by setup_tools():
-  - the offline `web_search` stub (deterministic, returns sample_menu.md), and
-  - the live Firecrawl MCP server (search/scrape over a local npx subprocess).
+  - live web tools (`web_search` + `scrape_url`) whose *backends* are pluggable --
+    pick a search provider and a scrape provider independently (see backends.py;
+    firecrawl/tavily/brave/jina/browserless). This is the default, and
+  - an offline `web_search` stub (deterministic, returns sample_menu.md) for
+    developing the loop without a network/key (setup_tools(offline=True)).
 
-apply_chat_template(tools=...) accepts JSON-Schema dicts directly (not just
-Python callables), so an MCP tool maps cleanly to the OpenAI-style
-{"type": "function", "function": {...}} shape Gemma's template consumes — no
-need to synthesize fake Python functions with docstrings.
+Both sources expose tools as plain Python functions (typed signature + Google-
+style docstring). apply_chat_template(tools=...) converts those to Gemma's
+schema, and the Claude runner's to_anthropic_tools converts the same callables
+to Anthropic decls -- so the agent loops are identical across sources.
+
+The model only ever sees ONE search and ONE scrape tool, both named generically
+(web_search / scrape_url) with fixed docstrings (build_model_tools), so the
+*backend can be swapped underneath without the model noticing* -- this is how we
+A/B providers on the same task. The generic names also keep vendor branding out
+of the SFT/GRPO training data the tool calls get baked into later.
 """
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 
-from mcp_client import MCPStdioClient
-from prompts import MCP_SYSTEM_PROMPT, SYSTEM_PROMPT
+from backends import (
+    DEFAULT_BACKEND,
+    SCRAPE_BACKENDS,
+    SEARCH_BACKENDS,
+    build_backend,
+)
+from prompts import LIVE_SYSTEM_PROMPT, SYSTEM_PROMPT
 
 # ---------------------------------------------------------------------------
-# Local stub tool
+# Shared output bound
+# ---------------------------------------------------------------------------
+# Hard cap on a single tool result before it enters the message history, as a
+# backstop against a pathologically huge page. Generation forces SDPA's O(seq)
+# mem-efficient kernel (see generate_turn in agent.py), so a full menu page fits
+# comfortably; a blind char cap can still clip the tail of a very long menu, so a
+# hit is warned about (below) -- never silent.
+MAX_TOOL_CHARS = 75000
+
+
+def _cap(text: str, label: str) -> str:
+    """Truncate an over-long tool result, warning so a clipped menu isn't silent."""
+    if len(text) > MAX_TOOL_CHARS:
+        print(
+            f"  [warn] {label} returned {len(text)} chars; truncating to "
+            f"{MAX_TOOL_CHARS} (the tail is dropped - raise MAX_TOOL_CHARS or use "
+            f"a chunk/lookup tool if this clips the menu)"
+        )
+        text = text[:MAX_TOOL_CHARS]
+    return text
+
+
+# ---------------------------------------------------------------------------
+# Offline stub tool
 #
 # Defined as a plain Python function: apply_chat_template reads the signature +
 # Google-style docstring and converts it to the schema Gemma wants.
@@ -35,142 +71,100 @@ def web_search(query: str) -> str:
             word "menu".
     """
     # TEMP STUB: ignores the query and returns a fixed sample menu, so the
-    # agentic loop can be developed offline. The MCP path (setup_tools(use_mcp=
-    # True)) replaces this with real Firecrawl search/scrape.
+    # agentic loop can be developed offline. setup_tools(offline=False) replaces
+    # this with the live Firecrawl web_search/scrape_url tools below.
     return _SAMPLE_MENU.read_text(encoding="utf-8")
 
 
-TOOLS = [web_search]
-TOOL_REGISTRY = {fn.__name__: fn for fn in TOOLS}
+STUB_TOOLS = [web_search]
+STUB_REGISTRY = {fn.__name__: fn for fn in STUB_TOOLS}
 
 
 # ---------------------------------------------------------------------------
-# Firecrawl MCP tools
+# Live tools -- the model-facing wrappers
 # ---------------------------------------------------------------------------
-# Firecrawl exposes ~20 tools; for menu extraction we only want search (and an
-# optional follow-up scrape of a specific page). Whitelisting keeps the prompt
-# small and stops the model from reaching for crawl/extract/monitor tools.
-DEFAULT_MCP_TOOL_ALLOWLIST = ("firecrawl_search", "firecrawl_scrape")
+# The model is handed exactly two tools, named generically with fixed docstrings,
+# so it sees the *same* tools no matter which provider backs them. The selected
+# backend's search_fn/scrape_fn (from backends.py) do the actual network call;
+# these wrappers add the MAX_TOOL_CHARS cap and nothing else.
+def build_model_tools(search_fn, scrape_fn):
+    """Wrap a backend's (search_fn, scrape_fn) as the model-facing tools.
 
-# Reduce-at-the-source: cap how much each Firecrawl call returns so big pages
-# don't balloon the model's context (and the per-turn prefill that re-encodes
-# it). Enforced in the dispatch wrapper, not the prompt, so it holds regardless
-# of what args the model emits.
-SEARCH_RESULT_LIMIT = 3
-
-# Hard cap on a single tool result before it enters the message history, as a
-# backstop against a pathologically huge page. The earlier tight cap was there to
-# avoid OOM; that pressure is gone now that generation forces SDPA's O(seq) mem-
-# efficient kernel (see generate_turn in agent.py), so a full menu page fits
-# comfortably. A blind char cap can still clip the tail of a very long menu; a
-# hit is warned about (below) so it's never silent.
-MAX_TOOL_CHARS = 50000
-
-
-def _apply_arg_policy(name: str, kwargs: dict) -> dict:
-    """Clamp/override a tool's args before dispatch to bound the returned text."""
-    args = dict(kwargs)
-    if name == "firecrawl_search":
-        # Cap result count; honor a smaller value the model may have asked for.
-        limit = args.get("limit")
-        args["limit"] = (
-            min(limit, SEARCH_RESULT_LIMIT)
-            if isinstance(limit, int) and limit > 0
-            else SEARCH_RESULT_LIMIT
-        )
-        # Drop scrapeOptions: with it, search scrapes every result to full
-        # markdown and concatenates them (one call returned ~28k chars and OOM'd
-        # the prefill). Keep search to lightweight snippets; the model can then
-        # firecrawl_scrape a single chosen URL for the full page.
-        args.pop("scrapeOptions", None)
-    elif name == "firecrawl_scrape":
-        # Force HTML (never the json/jsonOptions extraction path, which lets the
-        # model author malformed schemas). Keep onlyMainContent off: it tends to
-        # strip sidebars/sections that hold real menu items.
-        # NOTE: HTML is much more verbose than markdown, so it hits MAX_TOOL_CHARS
-        # far sooner -- watch the truncation warning below if menus get clipped.
-        args["formats"] = ["html"]
-        args["onlyMainContent"] = False
-        args.pop("jsonOptions", None)  # dead once we're not requesting json
-    return args
-
-
-def _dispatch(client, name: str, kwargs: dict) -> str:
-    """Apply the arg policy, call the tool, and cap the returned text."""
-    # Log the EFFECTIVE args (post-policy) -- the loop's own "tool call: ..." line
-    # prints what the model *requested*, before this clamp/override runs, so
-    # onlyMainContent/formats show here as actually sent, not as the model asked.
-    effective = _apply_arg_policy(name, kwargs)
-    print(f"  [dispatch] {name} effective args: {effective}", flush=True)
-    text = client.call_tool(name, effective)
-    if len(text) > MAX_TOOL_CHARS:
-        print(
-            f"  [warn] {name} returned {len(text)} chars; truncating to "
-            f"{MAX_TOOL_CHARS} (the tail is dropped - raise MAX_TOOL_CHARS or "
-            f"use a chunk/lookup tool if this clips the menu)"
-        )
-        text = text[:MAX_TOOL_CHARS]
-    return text
-
-
-def _mcp_tool_to_schema(tool) -> dict:
-    """Convert an `mcp.types.Tool` to the JSON-Schema dict the template expects."""
-    return {
-        "type": "function",
-        "function": {
-            "name": tool.name,
-            "description": tool.description or "",
-            "parameters": tool.inputSchema or {"type": "object", "properties": {}},
-        },
-    }
-
-
-def build_mcp_tools(client, allowlist=DEFAULT_MCP_TOOL_ALLOWLIST):
-    """List the MCP server's tools and return (tools_schema, registry).
-
-    `tools_schema` goes to apply_chat_template(tools=...); `registry` maps each
-    tool name to a callable `(**kwargs) -> str` that dispatches to the server,
-    matching the calling convention the loop uses for local tools.
+    Returns (tools, registry) matching the stub's shape: `tools` is a list of
+    plain functions (for apply_chat_template / to_anthropic_tools) and `registry`
+    maps name -> callable(**kwargs) -> str. The docstrings here are what the model
+    reads, so they stay vendor-neutral and identical across backends.
     """
-    tools_schema, registry = [], {}
-    for tool in client.list_tools():
-        if allowlist and tool.name not in allowlist:
-            continue
-        tools_schema.append(_mcp_tool_to_schema(tool))
-        # bind `name` per-iteration so the closure captures the right tool
-        registry[tool.name] = (
-            lambda name: lambda **kwargs: _dispatch(client, name, kwargs)
-        )(tool.name)
-    if not tools_schema:
-        available = [t.name for t in client.list_tools()]
-        raise RuntimeError(
-            f"No MCP tools matched the allowlist {allowlist!r}. "
-            f"Server offers: {available}"
-        )
-    return tools_schema, registry
+
+    def web_search(query: str) -> str:
+        """Search the web for a restaurant's menu information.
+
+        Args:
+            query: Search query, e.g. the restaurant name plus its city and the
+                word "menu".
+        """
+        return _cap(search_fn(query), "web_search")
+
+    def scrape_url(url: str) -> str:
+        """Fetch the full contents of a web page as markdown.
+
+        Use this on a promising URL returned by web_search to read the full menu
+        page before writing the JSON.
+
+        Args:
+            url: The page URL to fetch (e.g. a result URL from web_search).
+        """
+        return _cap(scrape_fn(url), "scrape_url")
+
+    tools = [web_search, scrape_url]
+    registry = {fn.__name__: fn for fn in tools}
+    return tools, registry
 
 
 # ---------------------------------------------------------------------------
 # Selection
 # ---------------------------------------------------------------------------
-def setup_tools(use_mcp: bool):
-    """Pick the tool source: Firecrawl MCP server or the local stub.
+def setup_tools(
+    offline: bool = False,
+    search_backend: str = DEFAULT_BACKEND,
+    scrape_backend: str = DEFAULT_BACKEND,
+):
+    """Pick the tool source and return (tools, tool_registry, system_prompt).
 
-    Returns (tools, tool_registry, system_prompt, mcp_client). mcp_client is None
-    for the stub path; otherwise close() it when done.
+    offline=False (default): live `web_search`/`scrape_url`, each backed by the
+    chosen provider (see backends.py). The search and scrape providers are picked
+    independently -- e.g. search via 'brave', scrape via 'jina' -- so any pair can
+    be A/B tested on the same task. Only the selected providers' API keys are read.
+    offline=True: the deterministic `web_search` stub that returns sample_menu.md,
+    for developing the loop without a key or network.
     """
-    if not use_mcp:
-        return TOOLS, TOOL_REGISTRY, SYSTEM_PROMPT, None
+    if offline:
+        return STUB_TOOLS, STUB_REGISTRY, SYSTEM_PROMPT
 
-    api_key = os.environ.get("FIRECRAWL_API_KEY")
-    if not api_key:
+    if search_backend not in SEARCH_BACKENDS:
         raise SystemExit(
-            "--mcp requires FIRECRAWL_API_KEY in the environment "
-            "(get one at https://firecrawl.dev)."
+            f"{search_backend!r} has no web_search; pick --search-backend from "
+            f"{SEARCH_BACKENDS}."
         )
-    print("Starting Firecrawl MCP server (npx -y firecrawl-mcp) ...")
-    # Pass the full environment so npx resolves on PATH and the key is visible.
-    client = MCPStdioClient("npx", ["-y", "firecrawl-mcp"], env={**os.environ})
-    tools, registry = build_mcp_tools(client)
-    print(f"MCP tools available: {[t['function']['name'] for t in tools]}")
-    return tools, registry, MCP_SYSTEM_PROMPT, client
+    if scrape_backend not in SCRAPE_BACKENDS:
+        raise SystemExit(
+            f"{scrape_backend!r} has no scrape_url; pick --scrape-backend from "
+            f"{SCRAPE_BACKENDS}."
+        )
+
+    # Build each requested provider once (the same backend may serve both roles).
+    built: dict = {}
+
+    def get(name):
+        if name not in built:
+            built[name] = build_backend(name)
+        return built[name]
+
+    search_fn = get(search_backend)[0]
+    scrape_fn = get(scrape_backend)[1]
+    tools, registry = build_model_tools(search_fn, scrape_fn)
+    print(
+        f"Live tools: web_search via {search_backend!r}, "
+        f"scrape_url via {scrape_backend!r}"
+    )
+    return tools, registry, LIVE_SYSTEM_PROMPT

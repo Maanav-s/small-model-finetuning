@@ -5,11 +5,12 @@ the same system prompt, and the same JSON contract** through Claude Sonnet via
 the Anthropic Messages API, so the two models' outputs are directly comparable.
 
 The tool source is shared: setup_tools() in tools.py returns the same
-`(tools, tool_registry, system_prompt, client)` whether you're driving Gemma or
-Claude. The only translation needed is the tool *declaration* format — Gemma's
-template takes Python callables or OpenAI-style function dicts, while the
-Anthropic API wants `{"name", "description", "input_schema"}`. to_anthropic_tools
-handles both shapes; the registry (name -> callable returning str) is used as-is.
+`(tools, tool_registry, system_prompt)` whether you're driving Gemma or Claude.
+Both the offline stub and the live Firecrawl tools are plain Python callables, so
+the only translation needed is the tool *declaration* format — Gemma's template
+reads the callables directly, while the Anthropic API wants
+`{"name", "description", "input_schema"}`. to_anthropic_tools does that; the
+registry (name -> callable returning str) is used as-is.
 
 Like agent.py this module is the reusable engine — no CLI or key loading. Drive
 it from run_claude.py or a REPL. Adaptive thinking is on (the recommended
@@ -23,16 +24,36 @@ import inspect
 import sys
 from pathlib import Path
 
-# Shared modules (schema/prompts/tools/mcp_client) live in src/, the parent of
-# this claude/ folder; put it on the path so the flat imports (the __main__ demo
-# here, and run_claude.py) resolve whether run directly or imported.
+# Shared modules (schema/prompts/tools) live in src/, the parent of this claude/
+# folder; put it on the path so the flat imports (the __main__ demo here, and
+# run_claude.py) resolve whether run directly or imported.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import anthropic  # noqa: E402
 
-MODEL_ID = "claude-sonnet-4-6"  # user-requested: the Claude baseline runs on Sonnet
+MODEL_ID = "claude-sonnet-4-6"        # default Claude baseline (Sonnet)
+HAIKU_MODEL_ID = "claude-haiku-4-5"   # cheaper/faster comparison point (non-dated alias)
 MAX_TOOL_CALLS = 4              # tool-call budget per episode (matches agent.py)
-MAX_TOKENS = 8192              # the full menu JSON can be long (matches MAX_NEW_TOKENS)
+MAX_TOKENS = 16384            # the full menu JSON can be long (was 8192; output was truncating)
+
+# Thinking config is model-dependent. Sonnet 4.6 supports adaptive thinking; Haiku
+# 4.5 does NOT (verified via the Models API: thinking.types.adaptive.supported=false,
+# enabled.supported=true) and 400s on an adaptive request, so it uses legacy extended
+# thinking with a fixed budget. Newer models (Opus 4.7/4.8, Fable) instead reject
+# `budget_tokens`, so adaptive is the safe default and only known non-adaptive models
+# are listed here.
+LEGACY_THINKING_MODELS = {
+    "claude-haiku-4-5", "claude-haiku-4-5-20251001",
+    "claude-sonnet-4-5", "claude-sonnet-4-5-20250929",
+}
+THINK_BUDGET = 4096  # budget_tokens for the legacy path (must be < MAX_TOKENS, min 1024)
+
+
+def thinking_config(model: str) -> dict:
+    """Pick the thinking config a given Claude model accepts (adaptive vs budgeted)."""
+    if model in LEGACY_THINKING_MODELS:
+        return {"type": "enabled", "budget_tokens": THINK_BUDGET}
+    return {"type": "adaptive"}
 
 # Python annotation -> JSON Schema type, for converting the local web_search stub.
 _JSON_TYPES = {str: "string", int: "integer", float: "number", bool: "boolean"}
@@ -43,7 +64,7 @@ def _callable_to_anthropic(fn) -> dict:
 
     Mirrors what transformers' apply_chat_template does for Gemma: name from
     __name__, description from the docstring, input schema from the typed
-    signature. Used for the offline web_search stub (tools.TOOLS).
+    signature. Used for every tool now that both sources are Python callables.
     """
     properties, required = {}, []
     for name, param in inspect.signature(fn).parameters.items():
@@ -61,32 +82,17 @@ def _callable_to_anthropic(fn) -> dict:
     }
 
 
-def _schema_to_anthropic(tool: dict) -> dict:
-    """Convert an OpenAI-style {"type":"function","function":{...}} dict (the
-    shape build_mcp_tools emits for Firecrawl) to an Anthropic tool declaration.
-    """
-    fn = tool["function"]
-    return {
-        "name": fn["name"],
-        "description": fn.get("description", ""),
-        "input_schema": fn.get("parameters", {"type": "object", "properties": {}}),
-    }
-
-
 def to_anthropic_tools(tools: list) -> list[dict]:
     """Translate the tool list from setup_tools() into Anthropic tool decls.
 
-    Accepts either the stub path (Python callables) or the MCP path (function
-    dicts), so the same setup_tools(use_mcp=...) result drives Claude unchanged.
+    Both tool sources (the offline stub and the live Firecrawl tools) are plain
+    Python callables, so the same setup_tools() result drives Claude unchanged.
     """
     converted = []
     for tool in tools:
-        if callable(tool):
-            converted.append(_callable_to_anthropic(tool))
-        elif isinstance(tool, dict) and "function" in tool:
-            converted.append(_schema_to_anthropic(tool))
-        else:
-            raise TypeError(f"Unrecognized tool declaration: {tool!r}")
+        if not callable(tool):
+            raise TypeError(f"Expected a callable tool, got: {tool!r}")
+        converted.append(_callable_to_anthropic(tool))
     return converted
 
 
@@ -122,7 +128,7 @@ def run_episode(
             max_tokens=MAX_TOKENS,
             system=system_prompt,
             tools=[] if out_of_budget else anthropic_tools,
-            thinking={"type": "adaptive"},
+            thinking=thinking_config(model),
             messages=messages,
         )
 
@@ -170,6 +176,6 @@ if __name__ == "__main__":
     # tool source. No API key / network needed.
     import json
 
-    from tools import TOOLS
+    from tools import STUB_TOOLS
 
-    print(json.dumps(to_anthropic_tools(TOOLS), indent=2))
+    print(json.dumps(to_anthropic_tools(STUB_TOOLS), indent=2))

@@ -5,8 +5,8 @@ source (tools.py), runs one episode (agent.py), and reports/validates the result
 (schema.py). The reusable pieces live in those modules so the SFT/eval scripts
 and a REPL can call them without going through this CLI.
 
-  uv run python src/gemma/run_agent.py             # bf16, offline stub tools
-  uv run python src/gemma/run_agent.py --mcp       # Firecrawl MCP tools
+  uv run python src/gemma/run_agent.py             # bf16, live Firecrawl tools
+  uv run python src/gemma/run_agent.py --offline   # offline web_search stub
   uv run python src/gemma/run_agent.py --quantize  # 4-bit (low-VRAM / fast load)
 """
 
@@ -14,8 +14,8 @@ import argparse
 import sys
 from pathlib import Path
 
-# Shared modules (schema/prompts/tools/mcp_client) live in src/, the parent of
-# this gemma/ folder; put it on the path so the flat imports below resolve.
+# Shared modules (schema/prompts/tools) live in src/, the parent of this gemma/
+# folder; put it on the path so the flat imports below resolve.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from dotenv import load_dotenv  # noqa: E402
@@ -23,6 +23,7 @@ from dotenv import load_dotenv  # noqa: E402
 from agent import run_episode  # noqa: E402
 from model import load_model  # noqa: E402
 from prompts import TEST_RESTAURANT  # noqa: E402
+from backends import DEFAULT_BACKEND, SCRAPE_BACKENDS, SEARCH_BACKENDS  # noqa: E402
 from schema import extract_json  # noqa: E402
 from tools import setup_tools  # noqa: E402
 
@@ -48,11 +49,25 @@ def parse_args():
         "fit but need Hopper GPUs this box lacks). 'eager' is the slow reference path.",
     )
     parser.add_argument(
-        "--mcp",
+        "--offline",
         action="store_true",
-        help="Source tools from the Firecrawl MCP server (npx -y firecrawl-mcp) "
-        "instead of the local web_search stub. Requires FIRECRAWL_API_KEY in the env "
-        "and Node/npx on PATH.",
+        help="Use the deterministic local web_search stub (returns sample_menu.md) "
+        "instead of the live web tools. Default is live, which requires the "
+        "selected backend's API key in the env.",
+    )
+    parser.add_argument(
+        "--search-backend",
+        choices=SEARCH_BACKENDS,
+        default=DEFAULT_BACKEND,
+        help=f"Provider backing web_search (default: {DEFAULT_BACKEND}). Needs that "
+        "provider's API key in the env. Ignored with --offline.",
+    )
+    parser.add_argument(
+        "--scrape-backend",
+        choices=SCRAPE_BACKENDS,
+        default=DEFAULT_BACKEND,
+        help=f"Provider backing scrape_url (default: {DEFAULT_BACKEND}). Needs that "
+        "provider's API key in the env. Ignored with --offline.",
     )
     return parser.parse_args()
 
@@ -77,16 +92,16 @@ def report(answer: str) -> None:
 def main():
     args = parse_args()
     model, tokenizer = load_model(quantize=args.quantize, attn=args.attn)
-    tools, tool_registry, system_prompt, mcp_client = setup_tools(args.mcp)
-    try:
-        restaurant = TEST_RESTAURANT
-        print(f"\n=== Episode: {restaurant} ===")
-        answer = run_episode(
-            model, tokenizer, restaurant, tools, tool_registry, system_prompt
-        )
-    finally:
-        if mcp_client is not None:
-            mcp_client.close()
+    tools, tool_registry, system_prompt = setup_tools(
+        offline=args.offline,
+        search_backend=args.search_backend,
+        scrape_backend=args.scrape_backend,
+    )
+    restaurant = TEST_RESTAURANT
+    print(f"\n=== Episode: {restaurant} ===")
+    answer = run_episode(
+        model, tokenizer, restaurant, tools, tool_registry, system_prompt
+    )
 
     report(answer)
 

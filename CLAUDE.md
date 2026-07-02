@@ -6,31 +6,30 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Fine-tune a small open-weight LLM (`google/gemma-4-E4B-it`) to take a restaurant name as input and return its menu as structured JSON, using **Firecrawl** (web search + scraping) as an inference-time tool. The full multi-phase plan — agentic tool-call loop → SFT distillation → GRPO RL → eval — lives in [project_plan.md](project_plan.md). Read it before working on any phase; it defines the target JSON schema and reward design.
 
-> **Tooling note:** the plan switched from Tavily to **Firecrawl**, now wired in as an **MCP server** (`npx -y firecrawl-mcp`), not a direct API call — see "MCP integration" below. [project_plan.md](project_plan.md) still says Tavily in places (pending a docs pass). Two tool sources coexist: an offline `web_search` stub in [src/tools.py](src/tools.py) (returns [src/sample_menu.md](src/sample_menu.md); the deterministic default for dev) and the live Firecrawl MCP tools (enabled with `--mcp`).
+> **Tooling note:** the plan switched from Tavily to **Firecrawl**, called **directly via the `firecrawl-py` SDK** (not the older MCP-server wiring, which has been removed) — see "Firecrawl integration" below. [project_plan.md](project_plan.md) still says Tavily in places (pending a docs pass). Two tool sources coexist: the **live Firecrawl tools** (`web_search` + `scrape_url`, the **default**) and an offline `web_search` stub in [src/tools.py](src/tools.py) (returns [src/sample_menu.md](src/sample_menu.md); a deterministic dev fallback, selected with `--offline`).
 
 **Status:** early scaffold (Phase 1). Code lives in [src/](src/), split into **shared resources** (directly in `src/`) and two **per-model agent folders** ([src/gemma/](src/gemma/), [src/claude/](src/claude/)).
 
 **Shared (in `src/`)** — model-agnostic, imported by both agents:
 
 - [src/schema.py](src/schema.py) — the menu JSON **contract**: `SCHEMA_SNIPPET` (shown to the model), `MENU_SCHEMA` (machine-checkable), `extract_json`. The single source of truth the prompt, eval, and the future GRPO reward all import.
-- [src/prompts.py](src/prompts.py) — `SYSTEM_PROMPT` / `MCP_SYSTEM_PROMPT`, built from `schema.SCHEMA_SNIPPET` so prompt and validator can't drift; plus `TEST_RESTAURANT`, the single restaurant name both runners use as the episode input (temporary, for testing — real eval will iterate a dataset).
-- [src/tools.py](src/tools.py) — the `web_search` stub, `build_mcp_tools`, and `setup_tools(use_mcp)` (picks stub vs Firecrawl MCP, returns `(tools, registry, system_prompt, client)`).
-- [src/mcp_client.py](src/mcp_client.py) — `MCPStdioClient`, a sync wrapper around the async MCP stdio SDK.
+- [src/prompts.py](src/prompts.py) — `SYSTEM_PROMPT` / `LIVE_SYSTEM_PROMPT`, built from `schema.SCHEMA_SNIPPET` so prompt and validator can't drift; plus `TEST_RESTAURANT`, the single restaurant name both runners use as the episode input (temporary, for testing — real eval will iterate a dataset).
+- [src/tools.py](src/tools.py) — the `web_search` stub, `build_firecrawl_tools`, and `setup_tools(offline=False)` (picks live Firecrawl vs stub, returns `(tools, registry, system_prompt)`).
 
 **Gemma agent (in `src/gemma/`)** — the local fine-tuning target:
 
 - [src/gemma/model.py](src/gemma/model.py) — `MODEL_ID` + `load_model(quantize, attn) -> (model, tokenizer)`.
 - [src/gemma/agent.py](src/gemma/agent.py) — **the agentic loop** (`build_messages`, `generate_turn`, `run_episode`). Takes `model`/`tokenizer`/`tools` as args with no import-time side effects, so you can drive it from a REPL/notebook (load once, re-run episodes as you edit prompts/tools). `uv run python src/gemma/agent.py` renders the prompt only (tokenizer-only, no GPU).
-- [src/gemma/run_agent.py](src/gemma/run_agent.py) — thin CLI: `--quantize` (4-bit), `--attn sdpa|eager`, `--mcp` (Firecrawl). Loads `.env` for `FIRECRAWL_API_KEY`.
+- [src/gemma/run_agent.py](src/gemma/run_agent.py) — thin CLI: `--quantize` (4-bit), `--attn sdpa|eager`, `--offline` (stub instead of live Firecrawl). Loads `.env` for `FIRECRAWL_API_KEY`.
 
 **Claude baseline (in `src/claude/`)** — a comparison point on the *same* tools/prompts/schema. See "Claude baseline" below.
 
 - [src/claude/claude_agent.py](src/claude/claude_agent.py) — the loop driven through the Anthropic API (Claude Sonnet).
-- [src/claude/run_claude.py](src/claude/run_claude.py) — thin CLI: `--mcp`, `--model`. Loads `.env` for `ANTHROPIC_API_KEY`.
+- [src/claude/run_claude.py](src/claude/run_claude.py) — thin CLI: `--offline`, `--model`. Loads `.env` for `ANTHROPIC_API_KEY`.
 
 **Imports across the split:** the agent folders use flat imports (`from schema import ...`) and are run as scripts, so each entry module prepends the shared `src/` dir to `sys.path` (`sys.path.insert(0, str(Path(__file__).resolve().parent.parent))`) before importing shared modules — that's why those imports carry `# noqa: E402`. There are no `__init__.py` packages; keep the script-run convention.
 
-[main.py](main.py) forwards args to [src/gemma/run_agent.py](src/gemma/run_agent.py) with `--quantize` forced on (the default on this host; see Hardware constraints) — e.g. `uv run python main.py --mcp`. Dev utilities live in [scripts/](scripts/) — e.g. [scripts/free_vram.sh](scripts/free_vram.sh) kills orphaned CUDA processes that pin VRAM after an interrupted run (`./scripts/free_vram.sh`, or `DRY_RUN=1` to list only).
+[main.py](main.py) forwards args to [src/gemma/run_agent.py](src/gemma/run_agent.py) with `--quantize` forced on (the default on this host; see Hardware constraints) — e.g. `uv run python main.py` (live Firecrawl) or `uv run python main.py --offline`. Dev utilities live in [scripts/](scripts/) — e.g. [scripts/free_vram.sh](scripts/free_vram.sh) kills orphaned CUDA processes that pin VRAM after an interrupted run (`./scripts/free_vram.sh`, or `DRY_RUN=1` to list only).
 
 ## Environment & commands
 
@@ -75,23 +74,22 @@ The one way it breaks: the template's *reasoning guard* renders `reasoning`/`rea
 - If you capture this loop's traces for SFT, they re-render consistently with how they'd appear in training.
 - The thinking field the template reads is **`reasoning` / `reasoning_content`**, not `thinking`. `tokenizer.parse_response` may surface it under a different key — verify the round-trip if you need reasoning carried across tool turns in the inference loop.
 
-## MCP integration (Firecrawl)
+## Firecrawl integration (direct SDK)
 
-`--mcp` sources tools from the **Firecrawl MCP server** instead of the `web_search` stub. The pieces:
+By default the agent sources tools from **Firecrawl directly via the `firecrawl-py` SDK** (no MCP server, no `npx` subprocess); `--offline` swaps in the `web_search` stub. The pieces:
 
-- **[src/mcp_client.py](src/mcp_client.py)** — `MCPStdioClient` runs one persistent asyncio loop on a background thread and keeps a single MCP session open (so the `npx` subprocess isn't respawned per call). The stdio + session contexts are entered *and* exited in the **same task** to avoid anyio's "cancel scope in a different task" error; `list_tools()` / `call_tool()` are sync wrappers over `run_coroutine_threadsafe`.
-- **[src/tools.py](src/tools.py)** — `setup_tools(use_mcp=True)` launches `npx -y firecrawl-mcp` and calls `build_mcp_tools`, which lists the server's tools and converts each to the JSON-Schema dict `apply_chat_template(tools=...)` accepts directly (MCP tools have no Python signature, so this avoids synthesizing fake functions). Only `firecrawl_search` / `firecrawl_scrape` are **allowlisted** (Firecrawl exposes ~20 tools; the rest just bloat the prompt). `_apply_arg_policy` clamps args at dispatch — cap `firecrawl_search` `limit`, force `firecrawl_scrape` to compact markdown and never the `json`/`jsonOptions` extraction path — to bound context growth regardless of what the model emits.
-- **`FIRECRAWL_API_KEY`** is required (the `--mcp` path errors without it). Loaded from a repo-root **`.env`** by [src/gemma/run_agent.py](src/gemma/run_agent.py) via `python-dotenv`. `.env` is git-ignored; commit [.env.example](.env.example) instead.
-- **Requires Node / `npx` on PATH** (the server is a Node package). `mcp` and `python-dotenv` are project deps.
+- **[src/tools.py](src/tools.py)** — `setup_tools(offline=False)` constructs a `firecrawl.Firecrawl(api_key=...)` client and calls `build_firecrawl_tools`, which returns two **plain Python functions** bound to that client: `web_search(query)` (→ `client.search`) and `scrape_url(url)` (→ `client.scrape`). They're ordinary callables with typed signatures + docstrings, so `apply_chat_template(tools=...)` and the Claude runner's `to_anthropic_tools` consume them exactly like the stub — no schema dicts, no fake-function synthesis. The two `client.*` calls are the **single network seam**; the arg policy is baked into the functions — `web_search` pins `limit=SEARCH_RESULT_LIMIT`, `scrape_url` forces `formats=["markdown"]` with `only_main_content=False` and never the `json`/`jsonOptions` extraction path — to bound context growth regardless of what the model emits. `MAX_TOOL_CHARS` caps each result (with a non-silent truncation warning). **Caching is not implemented yet**; when added it wraps those two `client.*` calls (disk cache keyed on normalized args, gitignored) and nothing else changes.
+- **`FIRECRAWL_API_KEY`** is required for the live (default) path — `setup_tools` raises a `SystemExit` pointing at `--offline` if it's missing. Loaded from a repo-root **`.env`** by [src/gemma/run_agent.py](src/gemma/run_agent.py) via `python-dotenv`. `.env` is git-ignored; commit [.env.example](.env.example) instead.
+- **No Node/`npx` dependency** anymore (the SDK is pure Python). `firecrawl-py` and `python-dotenv` are project deps; the old `mcp` dep and `src/mcp_client.py` were removed.
 
 ## Claude baseline (Anthropic API)
 
 A second runner drives **Claude Sonnet** (`claude-sonnet-4-6`, in [src/claude/claude_agent.py](src/claude/claude_agent.py)) through the same task, so we can compare a frontier model against Gemma on identical inputs. The point is parity: it reuses the *same* tool source, system prompt, and JSON contract — only the model and the transport differ.
 
-- **Shared everything.** [src/claude/run_claude.py](src/claude/run_claude.py) calls the same `setup_tools(--mcp)` from [src/tools.py](src/tools.py) (stub `web_search` or Firecrawl MCP) and the same `SYSTEM_PROMPT`/`MCP_SYSTEM_PROMPT`, and validates with the same `schema.extract_json`. The tool *registry* (`name -> callable -> str`) is used as-is; only the tool *declaration* format is translated.
-- **Tool translation.** Gemma's chat template takes Python callables (stub) or OpenAI-style `{"type":"function","function":{...}}` dicts (MCP); the Anthropic API wants `{"name","description","input_schema"}`. `to_anthropic_tools` in [src/claude/claude_agent.py](src/claude/claude_agent.py) converts **both** shapes, so the same `setup_tools` result drives Claude unchanged. `uv run python src/claude/claude_agent.py` prints the converted declarations (no key/network needed).
+- **Shared everything.** [src/claude/run_claude.py](src/claude/run_claude.py) calls the same `setup_tools(offline=...)` from [src/tools.py](src/tools.py) (live Firecrawl or stub `web_search`) and the same `SYSTEM_PROMPT`/`LIVE_SYSTEM_PROMPT`, and validates with the same `schema.extract_json`. The tool *registry* (`name -> callable -> str`) is used as-is; only the tool *declaration* format is translated.
+- **Tool translation.** Both tool sources are now plain Python callables (typed signature + docstring); the Anthropic API wants `{"name","description","input_schema"}`. `to_anthropic_tools` in [src/claude/claude_agent.py](src/claude/claude_agent.py) derives that from each callable's signature/docstring (the old OpenAI-style function-dict branch is gone with MCP), so the same `setup_tools` result drives Claude unchanged. `uv run python src/claude/claude_agent.py` prints the converted declarations (no key/network needed).
 - **The loop** is a standard manual agentic loop over `client.messages.create` (no transformers, no GPU): call → run `tool_use` blocks via the registry → feed `tool_result`s back → repeat. Adaptive thinking is on (`thinking={"type":"adaptive"}`); the full assistant turn (thinking + tool_use blocks) is appended verbatim each round, as the API requires. Same budget as the Gemma loop (`MAX_TOOL_CALLS=4`, `MAX_TOKENS=4096`) — but on budget-exhaustion it makes one **tool-free** call to force a JSON answer (Gemma's loop returns `""` instead).
-- **Keys & deps.** Requires `ANTHROPIC_API_KEY` (repo-root `.env`, loaded by `python-dotenv`; the runner errors before any network call if it's missing). `--mcp` additionally needs `FIRECRAWL_API_KEY` + Node/npx, exactly like the Gemma path. The `anthropic` SDK is a project dep. Run: `uv run python src/claude/run_claude.py` (stub) or `--mcp` (Firecrawl).
+- **Keys & deps.** Requires `ANTHROPIC_API_KEY` (repo-root `.env`, loaded by `python-dotenv`; the runner errors before any network call if it's missing). The live (default) tool path additionally needs `FIRECRAWL_API_KEY`, exactly like the Gemma path. The `anthropic` SDK is a project dep. Run: `uv run python src/claude/run_claude.py` (live Firecrawl) or `--offline` (stub).
 
 ## Model access
 
