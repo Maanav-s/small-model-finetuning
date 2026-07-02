@@ -27,8 +27,15 @@ from __future__ import annotations
 
 from bs4 import BeautifulSoup
 from markdownify import markdownify
+from playwright.sync_api import Error as PlaywrightError
 from playwright.sync_api import TimeoutError as PlaywrightTimeout
 from playwright.sync_api import sync_playwright
+
+# Chromium launch flags. --disable-http2 avoids net::ERR_HTTP2_PROTOCOL_ERROR
+# from servers/CDNs whose HTTP/2 negotiation Chromium can't complete (seen on
+# e.g. mcdonalds.com); Chromium falls back to HTTP/1.1, which those hosts serve
+# fine. --no-sandbox keeps it launchable in minimal/rootless containers.
+LAUNCH_ARGS = ["--disable-http2", "--no-sandbox"]
 
 # Navigation + settle timeouts (ms). NAV covers the initial load; NETWORKIDLE is
 # how long we wait for XHR/fetch traffic to stop before scrolling (SPAs may never
@@ -102,7 +109,7 @@ def build_scrape_playwright():
 
     def scrape(url: str, mode: str = "direct") -> str:
         with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
+            browser = p.chromium.launch(headless=True, args=LAUNCH_ARGS)
             context = browser.new_context(user_agent=USER_AGENT, viewport=VIEWPORT)
             page = context.new_page()
             try:
@@ -118,6 +125,15 @@ def build_scrape_playwright():
                         pass
                     _auto_scroll(page)
                 html = page.content()
+            except PlaywrightError as e:
+                # A navigation/render failure (broken HTTP/2 or TLS, DNS, a nav
+                # timeout, a site that drops the connection) must NOT crash the
+                # episode -- the agent loops call this tool without a try/except.
+                # Return a readable message so the model recovers (try another URL
+                # or the other mode), exactly as it would on an empty page. Take
+                # only the first line: Playwright appends a multi-line call log.
+                detail = str(e).splitlines()[0] if str(e) else type(e).__name__
+                return f"(scrape failed for {url} in {mode!r} mode: {detail})"
             finally:
                 browser.close()
         return _html_to_markdown(html) or "(page returned no content)"
