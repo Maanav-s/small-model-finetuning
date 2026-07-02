@@ -110,7 +110,7 @@ def main():
     print(f"\n=== Episode ({args.model}): {restaurant} ===")
     print(f"Prompt variant: {args.prompt_variant}")
     print(f"Dietary restrictions: {', '.join(diet) if diet else '(none)'}")
-    answer = run_episode(
+    answer, _messages = run_episode(
         client, restaurant, tools, tool_registry, system_prompt, model=args.model
     )
 

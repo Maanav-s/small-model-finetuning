@@ -41,11 +41,13 @@ CANNED = {
 }
 
 # Query params dropped during URL normalization (tracking noise that would
-# otherwise fragment the scrape cache across identical pages).
+# otherwise fragment the scrape cache across identical pages). Bare "ref" is
+# deliberately NOT here: on some sites it selects content (e.g. GitHub branch
+# refs), and a fragmented cache (extra fetch) beats serving the wrong page.
 _TRACKING_PARAMS = frozenset({
     "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content",
     "fbclid", "gclid", "gclsrc", "dclid", "msclkid", "mc_cid", "mc_eid",
-    "ref", "ref_src", "igshid",
+    "ref_src", "igshid",
 })
 
 
@@ -68,9 +70,53 @@ def norm_url(url: str) -> str:
     scheme = parts.scheme.lower()
     netloc = parts.netloc.lower()
     path = parts.path.rstrip("/") or "/"
-    kept = [(k, v) for k, v in parse_qsl(parts.query) if k.lower() not in _TRACKING_PARAMS]
+    # keep_blank_values: ?a=&b=1 must not silently collapse to ?b=1.
+    kept = [
+        (k, v)
+        for k, v in parse_qsl(parts.query, keep_blank_values=True)
+        if k.lower() not in _TRACKING_PARAMS
+    ]
     query = urlencode(sorted(kept))
     return urlunsplit((scheme, netloc, path, query, ""))  # fragment dropped
+
+
+def norm_scrape(url: str, mode: str = "direct") -> str:
+    """Cache key for a scrape call: canonical URL + mode.
+
+    The local backend's "direct" and "browser" modes return genuinely different
+    content (browser waits for network-idle and auto-scrolls; direct's escalation
+    is a no-scroll render), and the model's chosen mode is baked into the recorded
+    trajectory -- so they MUST be distinct cache entries. Key on the *requested*
+    mode; the stored value is whatever that mode ultimately returned (incl. a
+    direct->browser escalation)."""
+    return f"{norm_url(url)}\x00{mode}"
+
+
+# ---------------------------------------------------------------------------
+# Response -> status classification (negative caching).
+# ---------------------------------------------------------------------------
+def _default_status(response: str) -> str:
+    return "ok" if (response or "").strip() else "empty"
+
+
+# The local scrape backend never raises -- it returns these readable sentinels so
+# one bad URL can't kill an episode. They're transient/failure signals, not menu
+# content, so the cache marks them 'error': under miss_policy="live" an 'error'
+# row is RE-FETCHED on the next populate pass (self-healing) instead of freezing a
+# one-off timeout / rate-limit into the frozen corpus. Under "canned" the recorded
+# string is still served verbatim (deterministic replay of what the agent saw).
+_SCRAPE_FAILURE_MARKERS = ("(scrape failed", "(page returned no content)", "(page not available)")
+
+
+def scrape_status(response: str) -> str:
+    """Status for a scrape response: 'error' for the backend's failure sentinels,
+    else 'empty'/'ok'. Pass as `status_fn=scrape_status` when wrapping scrape."""
+    r = (response or "").strip()
+    if not r:
+        return "empty"
+    if r.startswith(_SCRAPE_FAILURE_MARKERS):
+        return "error"
+    return "ok"
 
 
 # ---------------------------------------------------------------------------
@@ -145,36 +191,45 @@ class Cache:
             self._conn.commit()
 
     # -- public API ---------------------------------------------------------
-    def wrap(self, namespace: str, fn, key_fn, *, provider: str | None = None):
+    def wrap(self, namespace: str, fn, key_fn, *, provider: str | None = None, status_fn=None):
         """Return a drop-in replacement for `fn` that reads/writes the cache.
 
-        `fn` is a backend closure like backends.build_search()'s search(query)
-        or build_scrape()'s scrape(url); `key_fn` turns its args into the
-        normalized cache key (norm_query / norm_url). The wrapper stores the RAW,
-        UNCAPPED response -- MAX_TOOL_CHARS stays in tools.py at read time.
+        `fn` is a backend closure like backends.build_search()'s search(query) or
+        build_scrape()'s scrape(url, mode="direct"); `key_fn` turns its args into
+        the normalized cache key. Scrape is 2-arg, so use:
+            search: key_fn=norm_query
+            scrape: key_fn=norm_scrape, status_fn=scrape_status   # mode is in the key
+        The wrapper stores the RAW, UNCAPPED response -- MAX_TOOL_CHARS stays in
+        tools.py at read time. `status_fn` classifies the response for negative
+        caching (defaults to ok/empty; scrape_status also flags failure sentinels
+        as 'error').
         """
         if namespace not in CANNED:
             raise ValueError(f"unknown namespace {namespace!r}; add a CANNED constant for it")
+        classify = status_fn or _default_status
 
         def wrapped(*args, **kwargs):
             key = key_fn(*args, **kwargs)
             row = self._get(namespace, key)
-            if row is not None and row["status"] in ("ok", "empty"):
-                self._hits += 1
-                return row["response"]
+            if row is not None:
+                # "canned" (frozen) serves ANY recorded row verbatim -- including a
+                # recorded failure -- so replay is deterministic. "live"/"error"
+                # serve only good rows and treat a stored 'error' as a miss, so a
+                # transient failure gets re-fetched on the next populate pass.
+                if self.miss_policy == "canned" or row["status"] in ("ok", "empty"):
+                    self._hits += 1
+                    return row["response"]
 
-            # miss (no row, or a stored 'error' row we re-fetch under 'live')
+            # miss: absent key, or a stored 'error' under live/error policy.
             self._misses += 1
             if self.miss_policy == "canned":
                 return CANNED[namespace]
             if self.miss_policy == "error":
                 raise CacheMiss(f"{namespace} miss for key={key!r} (policy=error)")
 
-            # live: call through, store, return.
-            # TODO(WS-A): error-row caching -- on fn() raising, decide whether to
-            # store status='error' (contract: 'live' re-fetches error rows).
+            # live: call through, classify, store, return.
             response = fn(*args, **kwargs)
-            status = "empty" if not (response or "").strip() else "ok"
+            status = classify(response)
             self._set(namespace, key, {"args": args, "kwargs": kwargs}, response, provider, status)
             self._writes += 1
             return response

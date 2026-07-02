@@ -33,13 +33,13 @@ in the repo-root `.env` (git-ignored) and mirror the names into
 |---|------|-----------|-------|
 | 0.1 | **AWS S3 bucket**, private, *Block Public Access = ON* | source of truth (WS-D) | e.g. `s3://<you>-menu-corpus`. Confirms the privacy requirement: private bucket = not redistributing scraped menus. |
 | 0.2 | **AWS credentials** for the training node | S3 sync | Prefer an **EC2 instance profile / IAM role** on the training box (no static keys, free same-region egress). Otherwise an IAM user with `s3:GetObject/PutObject/ListBucket` on that bucket, keys in `.env` as `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`. Add `S3_BUCKET` + `S3_PREFIX` to `.env`. |
-| 0.3 | **Brave Search API key** | live search | Already wired as `BRAVE_API_KEY`. Confirm the plan's rate/quota tier is enough for the corpus build (a few searches × a few thousand restaurants). |
+| 0.3 | **Brave Search API key** | live search | Already wired as `BRAVE_API_KEY`. **Confirmed: paid tier** — quota covers the corpus build (a few searches × a few thousand restaurants); still throttle politely in WS-C. |
 | 0.4 | **Local scrape (headless Chromium)** — *no key* | live scrape | scrape_url runs a local pooled Chromium (`playwright install chromium` + system libs); no API key. This is still the slow call — it's rate-limited by your own box (CPU + the single egress IP), so size corpus-build parallelism against that (and watch for per-site rate-limits on the shared IP). |
 | 0.5 | **Anthropic key** | teacher SFT traces + Opus findability | Already `ANTHROPIC_API_KEY`. Budget note: findability (WS-F) uses **Opus** with a generous tool budget — estimate cost before running at full scale. |
 | 0.6 | **Google Places (New) API key** — *optional* | metadata enrichment (WS-B) | Only if you want price tier / chain signals beyond OSM. Requires a **GCP project with billing enabled**; create + **restrict** the key; add `GOOGLE_PLACES_API_KEY`. Skippable — OSM alone is enough to start. |
 | 0.7 | **OSM / Overpass** | bulk restaurant list | **No account, no key.** Just be polite with rate limits (or point at a specific Overpass mirror). |
 | 0.8 | **Add Python deps** | several | `uv add boto3` (S3), `uv add jsonschema` (validate against `MENU_SCHEMA`). Overpass/Places use the existing `requests`. |
-| 0.9 | **Decide scope knobs** | WS-B / WS-C | English-only? Which countries/cities? Target restaurant count (recommend ~3k train + ~500 eval to start). These become CLI args, but pick defaults now. |
+| 0.9 | **Scope knobs — DECIDED** | WS-B / WS-C | **English-only**; default regions = English-speaking metros (US/CA/UK/AU — WS-B ships the concrete bbox list as its CLI default); target **~3k train + ~500 eval**. Corpus episodes are **restriction-free** (no dietary restrictions this phase; the trace schema still records the field so later restriction-conditioned passes slot in). These stay CLI args. |
 
 You do **not** need a HuggingFace account for this phase (S3 is the artifact
 store). HF login is still only required to pull the gated Gemma weights (Phase 1).
@@ -69,6 +69,7 @@ scripts/cache_sync.py           # WS-D
 scripts/analyze_queries.py      # WS-E
 scripts/label_findability.py    # WS-F
 scripts/eval_menu.py            # WS-G
+scripts/warm_eval_cache.py      # WS-H
 ```
 
 `data/` is git-ignored; its **source of truth is S3** (WS-D syncs it).
@@ -94,12 +95,20 @@ class Cache:
     def stats(self) -> dict:  # {hits, misses, writes, by_namespace...}
 ```
 
-- **Key normalization** (`key_fn`): search → `query.strip().lower()` with
-  collapsed whitespace; scrape → canonical URL (drop fragment + tracking params,
-  normalize trailing slash, lowercase host).
-- **Negative caching:** store `status ∈ {ok, empty, error}`. `live` re-fetches
-  `error` rows but serves `ok`/`empty`. `canned` serves any stored row and only
-  returns the canned constant for a genuine absence.
+- **Key normalization** (`key_fn`): search → `norm_query` (`query.strip().lower()`,
+  collapsed whitespace); scrape → **`norm_scrape` = canonical URL + `mode`**. The
+  local backend's `scrape(url, mode="direct")` is **two-arg**, and `"direct"` vs
+  `"browser"` return genuinely different content (browser auto-scrolls; direct's
+  escalation is no-scroll) — the model's chosen mode is baked into the trajectory,
+  so the two modes are **distinct cache entries**. Key on the *requested* mode;
+  store whatever that mode returned (incl. a direct→browser escalation).
+- **Negative caching:** store `status ∈ {ok, empty, error}` (scrape uses
+  `status_fn=scrape_status`, which flags the backend's failure sentinels —
+  `"(scrape failed …)"`, `"(page returned no content)"` — as `error` so a
+  transient local-Chromium timeout / rate-limit isn't frozen into the corpus).
+  `live`/`error` re-fetch (or raise on) `error` rows and serve only `ok`/`empty`;
+  `canned` (frozen) serves **any** recorded row verbatim for deterministic replay
+  and returns the canned constant only for a genuinely absent key.
 - **Canned constants** (deterministic, per namespace): search →
   `"(no results)"`, scrape → `"(page not available)"`. Keep them stable — they
   become part of the frozen training distribution.
@@ -116,10 +125,10 @@ CREATE TABLE IF NOT EXISTS cache (
   key           TEXT NOT NULL,      -- normalized query or canonical url
   args_json     TEXT NOT NULL,      -- original args, for debugging
   response      TEXT,               -- RAW uncapped provider response
-  provider      TEXT,               -- 'brave' | 'jina' | ...
+  provider      TEXT,               -- 'brave' | 'local' | ...
   status        TEXT NOT NULL,      -- 'ok' | 'empty' | 'error'
   cache_version INTEGER NOT NULL,
-  captured_at   TEXT NOT NULL       -- ISO date (passed in; wall-clock at call site)
+  captured_at   TEXT NOT NULL       -- ISO timestamp (stamped inside Cache._set)
 );
 CREATE INDEX IF NOT EXISTS idx_ns ON cache(namespace);
 ```
@@ -140,12 +149,23 @@ CREATE INDEX IF NOT EXISTS idx_ns ON cache(namespace);
 `labels.jsonl` keyed by `restaurant_id` (kept separate so labeling can re-run
 without touching the source list).
 
+- **`restaurant_id` stability:** format lat/lng at fixed 5-decimal precision
+  (`f"{lat:.5f}"`) before hashing, so the id survives re-harvests and float
+  round-trips across sources.
+- **`is_chain` without Places:** use OSM's `brand`/`brand:wikidata` tag when
+  present; else a name-frequency heuristic across the harvest (same normalized
+  name at ≥3 distinct locations → chain). Otherwise the stratification axis we
+  care most about is undefined on the default (no-Places) path.
+
 ### 1.5 SFT trace (`traces/<restaurant_id>.json`)
 
 ```json
 {
   "restaurant_id": "...", "restaurant_name": "...",
   "model": "claude-sonnet-4-6",
+  "prompt_variant": "teacher",
+  "dietary_restrictions": null,
+  "cache_version": 1,
   "messages": [ /* full message list as sent/received */ ],
   "queries": ["search query strings, in order"],
   "urls": ["scraped urls, in order"],
@@ -155,6 +175,10 @@ without touching the source list).
 }
 ```
 `queries`/`urls` are the extracted tool-call args — the input WS-E mines.
+`prompt_variant`/`dietary_restrictions`/`cache_version` record what the teacher
+actually ran with: context distillation re-renders these traces under the
+**student** prompt later, which is only sound if we know the teacher-side config
+(episodes are restriction-free this phase, so `dietary_restrictions` is null).
 
 ---
 
@@ -174,18 +198,25 @@ is the acceptance check.
   ```python
   search_fn, scrape_fn = build_search(), build_scrape()
   if cache:
-      search_fn = cache.wrap("search", search_fn, key_fn=norm_query)
-      scrape_fn = cache.wrap("scrape", scrape_fn, key_fn=norm_url)
+      search_fn = cache.wrap("search", search_fn, key_fn=norm_query, provider="brave")
+      scrape_fn = cache.wrap("scrape", scrape_fn, key_fn=norm_scrape,
+                             status_fn=scrape_status, provider="local")
   tools, registry = build_model_tools(search_fn, scrape_fn)
+  # NB: scrape is 2-arg (url, mode); norm_scrape keys on BOTH so direct/browser
+  # renders are distinct entries. scrape_status marks failure sentinels 'error'.
   ```
 - Add a `--cache-policy {live,canned,error,off}` flag to
   [src/gemma/run_agent.py](src/gemma/run_agent.py) and
   [src/claude/run_claude.py](src/claude/run_claude.py); build the `Cache` and
   pass it in. `off` = today's behavior (no cache).
-- **Done when:** running the same restaurant twice with `--cache-policy live`
-  makes zero network calls on the second run (assert via `cache.stats()`), and
+- **Done when:** unit tests with a counting fake `fn` (no network) prove
+  hit/miss/write behavior under all three policies, including the error-row
+  re-fetch and canned-verbatim-replay rules. As a smoke check, running the same
+  restaurant twice with `--cache-policy live` shows **≈0 misses** on the second
+  run via `cache.stats()` (not exactly 0 — model sampling isn't deterministic,
+  so the second trajectory can issue slightly different queries), and
   `--cache-policy canned` on an empty DB returns canned constants with a logged
-  miss count. Unit test with a fake `fn` (no network).
+  miss count.
 
 ### WS-B · Restaurant sourcing `scripts/harvest_restaurants.py`
 **Deps:** contracts (1.4). **Fully independent (no cache, no model).**
@@ -207,17 +238,24 @@ is the acceptance check.
 
 ### WS-C · Corpus build / SFT trace capture `scripts/build_corpus.py`
 **Deps:** WS-A (Cache API + `setup_tools(cache=)`), WS-B (`restaurants.jsonl`).
-Reuses the existing Claude loop as-is.
+Reuses the existing Claude loop; `run_episode` returns `(final_text, messages)`
+for trace capture (landed with Wave 0 — assistant turns hold SDK content blocks,
+so serialize via `block.model_dump()` when writing trace JSON).
 
 - For each **train** restaurant: run `claude_agent.run_episode` with a
   `Cache(miss_policy="live")` — this **populates the cache as a side effect**
   (the SFT run *is* the cache-population pass) and records the trace (1.5).
+  Episodes run **restriction-free** (no dietary restrictions this phase).
 - Extract `queries`/`urls` from the message list; validate `final_json` against
   `MENU_SCHEMA` (jsonschema) and set `schema_valid`.
-- Parallelize with a worker pool (the local browser scrape is the bottleneck —
-  CPU + the single egress IP) — respect the per-site + Brave rate limits from
-  Part 0. Idempotent: skip restaurants whose trace already exists (resumable
-  across interrupted runs).
+- Parallelize with a **thread** pool, not processes: the pooled Chromium is
+  thread-local (one ~200–300 MB browser per worker), so on the 15 GB no-swap box
+  cap at **~3–4 workers**; threads also share one `Cache` connection. Two
+  workers missing the same key both fetch and both write — benign
+  (`INSERT OR REPLACE`, last-write-wins); don't "fix" it with a lock around the
+  network call. Respect the per-site + Brave rate limits from Part 0.
+  Idempotent: skip restaurants whose trace already exists (resumable across
+  interrupted runs).
 - **Done when:** every train restaurant has a trace, the cache is populated
   (`cache.stats()` writes ≈ unique queries+urls), and a summary prints
   schema-valid rate + mean tool calls per episode.
@@ -229,6 +267,11 @@ Reuses the existing Claude loop as-is.
   `traces/`, `labels.jsonl` to/from `s3://$S3_BUCKET/$S3_PREFIX/...` via boto3.
 - Use instance-profile creds if present, else `.env` keys. Content-hash or
   size+mtime guard to avoid needless re-uploads. `--dry-run`.
+- **`cache.sqlite` is in WAL mode** — live state spans the db + `-wal`/`-shm`
+  sidecars, so never upload the bare file mid-run (stale or torn snapshot).
+  `push` snapshots first: `VACUUM INTO` a temp file (or
+  `PRAGMA wal_checkpoint(TRUNCATE)` while no writers are active) and uploads
+  the snapshot.
 - **Done when:** `push` then a fresh `pull` into an empty `data/` reproduces the
   files byte-for-byte; works with an instance profile and with static keys.
 
@@ -241,8 +284,8 @@ Reuses the existing Claude loop as-is.
   frequencies and per-restaurant query counts.
 - Report the **URL funnel**: which domains the teacher converges on (own-site vs
   DoorDash/Yelp/etc.) — this tells WS-F/GRPO which URLs are worth pre-fetching.
-- Output a short markdown report + a `query_templates.json` we can use to warm
-  the cache deterministically for eval/held-out restaurants.
+- Output a short markdown report + a `query_templates.json` used to warm the
+  cache deterministically for eval/held-out restaurants (consumed by WS-H).
 - **Done when:** the report exists and query templates cover the bulk of
   observed teacher searches; note explicitly what fraction is *not* covered.
 
@@ -262,6 +305,9 @@ Reuses the existing Claude loop as-is.
 
 ### WS-G · Eval / validation harness `scripts/eval_menu.py`
 **Deps:** contracts + WS-B splits. Uses `jsonschema` + `schema.extract_json`.
+*Buildable* early, but frozen runs need **WS-H's warmed cache** — against an
+unwarmed cache every tool call returns the canned constants and the metrics
+measure nothing but abstention.
 
 - Given a runner (Gemma or Claude) and the **eval split**, run episodes with
   `--cache-policy canned` (frozen) and score: schema-validity, item/section
@@ -270,7 +316,28 @@ Reuses the existing Claude loop as-is.
 - This is the scaffold the **GRPO reward** will reuse in Phase 3 — keep the
   scoring functions importable, not buried in `__main__`.
 - **Done when:** it prints a metrics table for the Claude baseline on the eval
-  split, and abstention scoring reads `labels.jsonl`.
+  split (against the WS-H-warmed cache), and abstention scoring reads
+  `labels.jsonl`.
+
+### WS-H · Eval-split cache warm `scripts/warm_eval_cache.py`
+**Deps:** WS-A/WS-B (cache + splits), WS-E (`query_templates.json`),
+WS-F (`labels.jsonl` URLs).
+
+WS-C populates the cache from **train** episodes only, so without this pass a
+frozen (`canned`) eval run sees an empty cache and WS-G scores garbage. This is
+the explicit warm pass (decided over live-policy eval, which wouldn't be
+reproducible across days).
+
+- For each **eval** restaurant, with `miss_policy="live"`: run the WS-E query
+  templates through the cached search, then scrape the WS-F-discovered menu
+  URLs plus the top search-result URLs in **both** `direct` and `browser`
+  modes — the mode is part of the cache key, and the eval-time model may pick
+  either.
+- Re-runnable: `live` policy makes it a no-op on already-warm keys (and
+  self-heals stored `error` rows).
+- **Done when:** a `--cache-policy canned` Claude-baseline run over the eval
+  split reports a low tool-call miss rate (print it; investigate above ~10%),
+  and WS-G runs against the warmed cache.
 
 ---
 
@@ -278,15 +345,18 @@ Reuses the existing Claude loop as-is.
 
 ```
 Wave 0 (you, 1 commit):  Part 1 contracts + `data/` in .gitignore + Part 0 deps/keys
+                         + the run_episode (final_text, messages) trace-return change
 Wave 1 (parallel):       WS-A (cache)      WS-B (sourcing)      WS-D (s3 sync)
 Wave 2 (parallel):       WS-C (corpus/traces)   WS-F (findability)   WS-G (eval harness)
 Wave 3:                  WS-E (query analysis — needs WS-C traces)
+Wave 4:                  WS-H (eval cache warm — needs WS-E templates + WS-F urls),
+                         then WS-G's frozen eval RUN (the harness itself is Wave 2)
 ```
 
 - WS-A, WS-B, WS-D depend only on the frozen contracts → launch together.
 - WS-C and WS-F both need WS-A's `Cache` + WS-B's list → next wave.
-- WS-G needs only contracts + splits; can go in Wave 1 or 2.
-- WS-E strictly needs WS-C output → last.
+- WS-G needs only contracts + splits to *build*; its frozen *run* waits on WS-H.
+- WS-E strictly needs WS-C output; WS-H needs WS-E + WS-F → last.
 
 To avoid file collisions when fanning out agents: each workstream owns **its own
 new file(s)**; the only shared edits are WS-A touching
@@ -307,12 +377,20 @@ early so Wave 2 agents import a stable signature.
   **product = live** — selected by a flag.
 - Findability is a **build-time label**, not a runtime judgment; Opus judges with
   a generous budget; hand-spot-check the negatives.
+- **English-only** sourcing (US/CA/UK/AU metros to start); corpus episodes are
+  **restriction-free** — dietary-restriction conditioning is deferred, but the
+  trace schema records the field so conditioned passes slot in later.
+- Frozen (`canned`) eval over the eval split requires the **explicit WS-H warm
+  pass**; live-policy eval is off the table (not reproducible across days).
 
 **Deferred to Phase 3 (GRPO) — not built now, but design leaves room:**
 - **Student-explores-differently miss rate:** the frozen cache is populated from
-  the *teacher's* URLs; the student may request others → canned miss. WS-C should
-  optionally pre-fetch the "obvious URL set" per restaurant (WS-E's funnel) to
-  shrink this; measure the miss rate before RL and expand the snapshot if high.
+  the *teacher's* URLs **and modes**; the student may request another URL — or the
+  same URL in the other scrape `mode` — → canned miss. The mode dimension roughly
+  doubles the miss surface. Mitigation is now cheap (local scrape costs CPU, not
+  API credits): WS-C should pre-fetch the "obvious URL set" per restaurant (WS-E's
+  funnel) in **both** `direct` and `browser` modes. Measure the per-mode miss rate
+  before RL and expand the snapshot if high.
 - **Reward correctness ground truth:** schema-validity + heuristics get us far,
   but true menu correctness needs the hand-labeled gold eval subset (start it in
   WS-G). This caps how well distillation can be distinguished from hallucination.

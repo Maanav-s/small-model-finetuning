@@ -111,8 +111,13 @@ def run_episode(
     system_prompt: str,
     model: str = MODEL_ID,
     max_tool_calls: int = MAX_TOOL_CALLS,
-) -> str:
-    """Run the tool-call loop for one restaurant; return the final answer text.
+) -> tuple[str, list[dict]]:
+    """Run the tool-call loop for one restaurant; return (final_text, messages).
+
+    `messages` is the full conversation including the final assistant turn --
+    Phase 2's trace capture (phase2_plan.md, 1.5) records it verbatim. Assistant
+    turns hold SDK content blocks, not plain dicts; serialize each block with
+    `block.model_dump()` when writing trace JSON.
 
     Standard manual agentic loop: call the model, execute any tool_use blocks via
     the shared registry, feed the results back, repeat until Claude answers (or
@@ -144,12 +149,14 @@ def run_episode(
         )
 
         if response.stop_reason != "tool_use":
-            return _final_text(response)  # final answer
+            messages.append({"role": "assistant", "content": response.content})
+            return _final_text(response), messages  # final answer
 
         if out_of_budget:
             # Shouldn't happen (no tools offered), but don't loop forever.
             print(f"  [warn] hit MAX_TOOL_CALLS={max_tool_calls} without a final answer")
-            return _final_text(response)
+            messages.append({"role": "assistant", "content": response.content})
+            return _final_text(response), messages
 
         # Preserve the assistant turn verbatim (incl. thinking + tool_use blocks).
         messages.append({"role": "assistant", "content": response.content})
@@ -179,7 +186,7 @@ def run_episode(
 
         messages.append({"role": "user", "content": tool_results})
 
-    return ""
+    return "", messages
 
 
 if __name__ == "__main__":
