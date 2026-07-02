@@ -70,13 +70,14 @@ def parse_args():
     )
     parser.add_argument(
         "--scrape-backend",
-        choices=["jina", "playwright", "hybrid"],
+        choices=["jina", "playwright", "hybrid", "local"],
         default="jina",
         help="Which backend backs scrape_url. 'jina' (default) is the finalized "
-        "production tool; 'playwright'/'hybrid' are the local-Chromium prototype "
+        "production tool; the rest are the local-Chromium prototype "
         "(src/scrape_playwright.py) whose 'browser' mode auto-scrolls lazy-loaded "
-        "menu SPAs. 'hybrid' = Jina direct + Playwright browser (needs "
-        "`playwright install chromium`).",
+        "menu SPAs. 'hybrid' = Jina direct + Playwright browser; 'local' = fully "
+        "Jina-free (requests fast-path + pooled Playwright browser). The Playwright "
+        "backends need `playwright install chromium`.",
     )
     return parser.parse_args()
 

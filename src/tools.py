@@ -125,22 +125,29 @@ def build_model_tools(search_fn, scrape_fn):
 # ---------------------------------------------------------------------------
 # Selection
 # ---------------------------------------------------------------------------
-_SCRAPE_BACKENDS = ("jina", "playwright", "hybrid")
+_SCRAPE_BACKENDS = ("jina", "playwright", "hybrid", "local")
 
 
 def _build_scrape_backend(scrape_backend: str):
     """Build the scrape closure for the requested backend (see setup_tools)."""
     if scrape_backend == "jina":
         return build_scrape(), "Jina"
-    # Playwright is a prototype alternative (src/scrape_playwright.py) with an
-    # auto-scrolling "browser" mode for lazy-loaded menu SPAs. Imported lazily so
-    # the default (jina) path needn't have playwright installed.
-    from scrape_playwright import build_scrape_hybrid, build_scrape_playwright
+    # The Playwright backends are prototype alternatives (src/scrape_playwright.py)
+    # with an auto-scrolling "browser" mode for lazy-loaded menu SPAs. Imported
+    # lazily so the default (jina) path needn't have playwright installed.
+    from scrape_playwright import (
+        build_scrape_hybrid,
+        build_scrape_local,
+        build_scrape_playwright,
+    )
 
     if scrape_backend == "playwright":
-        return build_scrape_playwright(), "Playwright"
-    # hybrid: Jina for direct, Playwright (auto-scroll) for browser -- the config
-    # the A/B favors (see scripts/scrape_ab.py).
+        return build_scrape_playwright(), "Playwright (per-call)"
+    if scrape_backend == "local":
+        # Fully Jina-free: requests fast-path for direct, POOLED Playwright browser
+        # for scroll. The Jina-free config to A/B against hybrid.
+        return build_scrape_local(), "requests(direct)+Playwright pool(browser)"
+    # hybrid: Jina for direct, Playwright (auto-scroll) for browser.
     return build_scrape_hybrid(build_scrape()), "Jina(direct)+Playwright(browser)"
 
 
@@ -161,10 +168,12 @@ def setup_tools(
     so the model filters the menu to complying items; empty means no filtering.
     variant ("teacher" | "student"): system-prompt variant (see prompts.py) --
     "teacher" (default) carries the source-selection guidance, "student" omits it.
-    scrape_backend ("jina" | "playwright" | "hybrid"): which scrape backend backs
-    `scrape_url`. "jina" (default) is the finalized production tool; "playwright"
-    and "hybrid" are the local-Chromium prototype (src/scrape_playwright.py) --
-    "hybrid" (Jina direct + Playwright auto-scroll browser) is the one to compare.
+    scrape_backend ("jina" | "playwright" | "hybrid" | "local"): which scrape
+    backend backs `scrape_url`. "jina" (default) is the finalized production tool;
+    the rest are the local-Chromium prototype (src/scrape_playwright.py). "hybrid"
+    (Jina direct + Playwright auto-scroll browser) and "local" (fully Jina-free:
+    requests fast-path for direct + a pooled Playwright browser for scroll) are the
+    two to A/B against each other.
     """
     if scrape_backend not in _SCRAPE_BACKENDS:
         raise ValueError(
