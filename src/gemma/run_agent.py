@@ -72,6 +72,16 @@ def parse_args():
         "delivery apps); 'student' omits it. The plan is to distill teacher "
         "behavior into the student via context distillation (see CLAUDE.md).",
     )
+    parser.add_argument(
+        "--scrape-backend",
+        choices=["jina", "playwright", "hybrid"],
+        default="jina",
+        help="Which backend backs scrape_url. 'jina' (default) is the finalized "
+        "production tool; 'playwright'/'hybrid' are the local-Chromium prototype "
+        "(src/scrape_playwright.py) whose 'browser' mode auto-scrolls lazy-loaded "
+        "menu SPAs. 'hybrid' = Jina direct + Playwright browser (needs "
+        "`playwright install chromium`).",
+    )
     return parser.parse_args()
 
 
@@ -102,6 +112,7 @@ def main():
         offline=args.offline,
         dietary_restrictions=args.dietary,
         variant=args.prompt_variant,
+        scrape_backend=args.scrape_backend,
     )
     restaurant = TEST_RESTAURANT
     diet = normalize_dietary_restrictions(args.dietary)

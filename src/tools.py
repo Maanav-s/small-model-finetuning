@@ -125,7 +125,31 @@ def build_model_tools(search_fn, scrape_fn):
 # ---------------------------------------------------------------------------
 # Selection
 # ---------------------------------------------------------------------------
-def setup_tools(offline: bool = False, dietary_restrictions=None, variant: str = "teacher"):
+_SCRAPE_BACKENDS = ("jina", "playwright", "hybrid")
+
+
+def _build_scrape_backend(scrape_backend: str):
+    """Build the scrape closure for the requested backend (see setup_tools)."""
+    if scrape_backend == "jina":
+        return build_scrape(), "Jina"
+    # Playwright is a prototype alternative (src/scrape_playwright.py) with an
+    # auto-scrolling "browser" mode for lazy-loaded menu SPAs. Imported lazily so
+    # the default (jina) path needn't have playwright installed.
+    from scrape_playwright import build_scrape_hybrid, build_scrape_playwright
+
+    if scrape_backend == "playwright":
+        return build_scrape_playwright(), "Playwright"
+    # hybrid: Jina for direct, Playwright (auto-scroll) for browser -- the config
+    # the A/B favors (see scripts/scrape_ab.py).
+    return build_scrape_hybrid(build_scrape()), "Jina(direct)+Playwright(browser)"
+
+
+def setup_tools(
+    offline: bool = False,
+    dietary_restrictions=None,
+    variant: str = "teacher",
+    scrape_backend: str = "jina",
+):
     """Pick the tool source and return (tools, tool_registry, system_prompt).
 
     offline=False (default): live `web_search` (Brave) + `scrape_url` (Jina) --
@@ -137,11 +161,20 @@ def setup_tools(offline: bool = False, dietary_restrictions=None, variant: str =
     so the model filters the menu to complying items; empty means no filtering.
     variant ("teacher" | "student"): system-prompt variant (see prompts.py) --
     "teacher" (default) carries the source-selection guidance, "student" omits it.
+    scrape_backend ("jina" | "playwright" | "hybrid"): which scrape backend backs
+    `scrape_url`. "jina" (default) is the finalized production tool; "playwright"
+    and "hybrid" are the local-Chromium prototype (src/scrape_playwright.py) --
+    "hybrid" (Jina direct + Playwright auto-scroll browser) is the one to compare.
     """
+    if scrape_backend not in _SCRAPE_BACKENDS:
+        raise ValueError(
+            f"scrape_backend must be one of {_SCRAPE_BACKENDS}, got {scrape_backend!r}"
+        )
     if offline:
         prompt = build_system_prompt(dietary_restrictions, live=False, variant=variant)
         return STUB_TOOLS, STUB_REGISTRY, prompt
 
-    tools, registry = build_model_tools(build_search(), build_scrape())
-    print("Live tools: web_search via Brave, scrape_url via Jina")
+    scrape_fn, scrape_label = _build_scrape_backend(scrape_backend)
+    tools, registry = build_model_tools(build_search(), scrape_fn)
+    print(f"Live tools: web_search via Brave, scrape_url via {scrape_label}")
     return tools, registry, build_system_prompt(dietary_restrictions, live=True, variant=variant)
