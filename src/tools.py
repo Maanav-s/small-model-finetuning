@@ -1,8 +1,8 @@
 """Tool sources for the agent loop.
 
 Two sources, selected by setup_tools():
-  - live web tools (`web_search` + `scrape_url`), backed by Brave (search) and
-    Jina (scrape) -- see backends.py. This is the default, and
+  - live web tools (`web_search` + `scrape_url`), backed by Brave (search) and a
+    local headless Chromium (scrape) -- see backends.py. This is the default, and
   - an offline `web_search` stub (deterministic, returns sample_menu.md) for
     developing the loop without a network/key (setup_tools(offline=True)).
 
@@ -65,7 +65,7 @@ def web_search(query: str) -> str:
     """
     # TEMP STUB: ignores the query and returns a fixed sample menu, so the
     # agentic loop can be developed offline. setup_tools(offline=False) replaces
-    # this with the live web_search/scrape_url tools below (Brave + Jina).
+    # this with the live web_search/scrape_url tools below (Brave + local scrape).
     return _SAMPLE_MENU.read_text(encoding="utf-8")
 
 
@@ -125,65 +125,23 @@ def build_model_tools(search_fn, scrape_fn):
 # ---------------------------------------------------------------------------
 # Selection
 # ---------------------------------------------------------------------------
-_SCRAPE_BACKENDS = ("jina", "playwright", "hybrid", "local")
-
-
-def _build_scrape_backend(scrape_backend: str):
-    """Build the scrape closure for the requested backend (see setup_tools)."""
-    if scrape_backend == "jina":
-        return build_scrape(), "Jina"
-    # The Playwright backends are prototype alternatives (src/scrape_playwright.py)
-    # with an auto-scrolling "browser" mode for lazy-loaded menu SPAs. Imported
-    # lazily so the default (jina) path needn't have playwright installed.
-    from scrape_playwright import (
-        build_scrape_hybrid,
-        build_scrape_local,
-        build_scrape_playwright,
-    )
-
-    if scrape_backend == "playwright":
-        return build_scrape_playwright(), "Playwright (per-call)"
-    if scrape_backend == "local":
-        # Fully Jina-free: requests fast-path for direct, POOLED Playwright browser
-        # for scroll. The Jina-free config to A/B against hybrid.
-        return build_scrape_local(), "requests(direct)+Playwright pool(browser)"
-    # hybrid: Jina for direct, Playwright (auto-scroll) for browser.
-    return build_scrape_hybrid(build_scrape()), "Jina(direct)+Playwright(browser)"
-
-
-def setup_tools(
-    offline: bool = False,
-    dietary_restrictions=None,
-    variant: str = "teacher",
-    scrape_backend: str = "jina",
-):
+def setup_tools(offline: bool = False, dietary_restrictions=None, variant: str = "teacher"):
     """Pick the tool source and return (tools, tool_registry, system_prompt).
 
-    offline=False (default): live `web_search` (Brave) + `scrape_url` (Jina) --
-    see backends.py; reads BRAVE_API_KEY and JINA_API_KEY.
-    offline=True: the deterministic `web_search` stub that returns sample_menu.md,
-    for developing the loop without a key or network.
+    offline=False (default): the live `web_search` (Brave) + `scrape_url` (local
+    headless Chromium) tools -- see backends.py; reads BRAVE_API_KEY (scrape needs
+    no key). offline=True: the deterministic `web_search` stub that returns
+    sample_menu.md, for developing the loop without a key or network.
 
     dietary_restrictions (None / str / list[str]): slotted into the system prompt
     so the model filters the menu to complying items; empty means no filtering.
     variant ("teacher" | "student"): system-prompt variant (see prompts.py) --
     "teacher" (default) carries the source-selection guidance, "student" omits it.
-    scrape_backend ("jina" | "playwright" | "hybrid" | "local"): which scrape
-    backend backs `scrape_url`. "jina" (default) is the finalized production tool;
-    the rest are the local-Chromium prototype (src/scrape_playwright.py). "hybrid"
-    (Jina direct + Playwright auto-scroll browser) and "local" (fully Jina-free:
-    requests fast-path for direct + a pooled Playwright browser for scroll) are the
-    two to A/B against each other.
     """
-    if scrape_backend not in _SCRAPE_BACKENDS:
-        raise ValueError(
-            f"scrape_backend must be one of {_SCRAPE_BACKENDS}, got {scrape_backend!r}"
-        )
     if offline:
         prompt = build_system_prompt(dietary_restrictions, live=False, variant=variant)
         return STUB_TOOLS, STUB_REGISTRY, prompt
 
-    scrape_fn, scrape_label = _build_scrape_backend(scrape_backend)
-    tools, registry = build_model_tools(build_search(), scrape_fn)
-    print(f"Live tools: web_search via Brave, scrape_url via {scrape_label}")
+    tools, registry = build_model_tools(build_search(), build_scrape())
+    print("Live tools: web_search via Brave, scrape_url via local Chromium")
     return tools, registry, build_system_prompt(dietary_restrictions, live=True, variant=variant)

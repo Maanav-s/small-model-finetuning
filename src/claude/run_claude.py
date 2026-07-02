@@ -6,11 +6,11 @@ reports/validates the result against the **same** JSON contract (schema.py). No
 model weights are loaded — this talks to the Anthropic API — so it runs without
 a GPU and is fast to iterate on.
 
-  uv run python src/claude/run_claude.py             # live web tools (Brave + Jina)
+  uv run python src/claude/run_claude.py             # live web tools (Brave + local scrape)
   uv run python src/claude/run_claude.py --offline   # offline web_search stub
 
 Requires ANTHROPIC_API_KEY in the env (or repo-root .env); the live (default)
-tool path additionally requires BRAVE_API_KEY and JINA_API_KEY.
+tool path additionally requires BRAVE_API_KEY.
 """
 
 import argparse
@@ -30,9 +30,9 @@ from prompts import TEST_RESTAURANT, normalize_dietary_restrictions  # noqa: E40
 from schema import extract_json  # noqa: E402
 from tools import setup_tools  # noqa: E402
 
-# Load ANTHROPIC_API_KEY / BRAVE_API_KEY / JINA_API_KEY from the repo-root .env
-# regardless of cwd (this file lives in src/claude/). The search/scrape keys are
-# needed for the default live tool path; --offline needs only ANTHROPIC_API_KEY.
+# Load ANTHROPIC_API_KEY / BRAVE_API_KEY from the repo-root .env regardless of cwd
+# (this file lives in src/claude/). BRAVE_API_KEY is needed for the default live
+# tool path (scrape runs locally, no key); --offline needs only ANTHROPIC_API_KEY.
 load_dotenv(Path(__file__).resolve().parents[2] / ".env")
 
 
@@ -43,7 +43,7 @@ def parse_args():
         action="store_true",
         help="Use the deterministic local web_search stub (returns sample_menu.md) "
         "instead of the live web tools. Default is live, which requires "
-        "BRAVE_API_KEY and JINA_API_KEY in the env.",
+        "BRAVE_API_KEY in the env.",
     )
     parser.add_argument(
         "--model",
@@ -67,17 +67,6 @@ def parse_args():
         "source-selection guidance (prefer the restaurant's own site, avoid "
         "delivery apps); 'student' omits it. The plan is to distill teacher "
         "behavior into the student via context distillation (see CLAUDE.md).",
-    )
-    parser.add_argument(
-        "--scrape-backend",
-        choices=["jina", "playwright", "hybrid", "local"],
-        default="jina",
-        help="Which backend backs scrape_url. 'jina' (default) is the finalized "
-        "production tool; the rest are the local-Chromium prototype "
-        "(src/scrape_playwright.py) whose 'browser' mode auto-scrolls lazy-loaded "
-        "menu SPAs. 'hybrid' = Jina direct + Playwright browser; 'local' = fully "
-        "Jina-free (requests fast-path + pooled Playwright browser). The Playwright "
-        "backends need `playwright install chromium`.",
     )
     return parser.parse_args()
 
@@ -115,7 +104,6 @@ def main():
         offline=args.offline,
         dietary_restrictions=args.dietary,
         variant=args.prompt_variant,
-        scrape_backend=args.scrape_backend,
     )
     restaurant = TEST_RESTAURANT
     diet = normalize_dietary_restrictions(args.dietary)

@@ -110,12 +110,6 @@
         <option value="teacher">Teacher prompt</option>
         <option value="student">Student prompt</option>
       </select>
-      <select id="scrapeBackend" title="Which backend backs scrape_url: Jina (production) or the local Playwright prototype whose browser mode auto-scrolls lazy-loaded menu pages">
-        <option value="jina">Jina scrape</option>
-        <option value="hybrid">Hybrid (Jina + Playwright)</option>
-        <option value="local">Local (requests + Playwright pool)</option>
-        <option value="playwright">Playwright scrape</option>
-      </select>
     </div>
     <input id="dietary" autocomplete="off"
            title="Comma-separated dietary restrictions to filter the menu by; leave blank for the full menu"
@@ -131,7 +125,6 @@
   const dietaryEl = document.getElementById("dietary");
   const agentSel = document.getElementById("agent");
   const variantSel = document.getElementById("promptVariant");
-  const scrapeSel = document.getElementById("scrapeBackend");
   const btn = document.getElementById("go");
   const statusEl = document.getElementById("status");
   const out = document.getElementById("out");
@@ -175,8 +168,7 @@
     const agent = meta && meta.agent;
     if (!agent) return "";
     const variant = meta.prompt_variant ? ` · ${esc(meta.prompt_variant)} prompt` : "";
-    const scrape = meta.scrape_backend ? ` · ${esc(meta.scrape_backend)} scrape` : "";
-    return `<div class="by">extracted by ${esc(AGENT_LABEL[agent] || agent)}${variant}${scrape}</div>`;
+    return `<div class="by">extracted by ${esc(AGENT_LABEL[agent] || agent)}${variant}</div>`;
   }
 
   // The model reports it couldn't find the menu at all (schema: found=false).
@@ -234,17 +226,16 @@
     const agent = agentSel.value;
     const dietary = dietaryEl.value.trim();
     const prompt_variant = variantSel.value;
-    const scrape_backend = scrapeSel.value;
     btn.disabled = true;
     out.innerHTML = "";
     const dietNote = dietary ? ` (filtering for: ${dietary})` : "";
-    statusEl.textContent = `Running ${AGENT_LABEL[agent] || agent} (${prompt_variant} prompt, ${scrape_backend} scrape): ` +
+    statusEl.textContent = `Running ${AGENT_LABEL[agent] || agent} (${prompt_variant} prompt): ` +
       `searching the web and extracting the menu${dietNote}… (this can take a minute)`;
     try {
       const res = await fetch("/api/extract", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ query, agent, dietary, prompt_variant, scrape_backend }),
+        body: JSON.stringify({ query, agent, dietary, prompt_variant }),
       });
       const data = await res.json();
       statusEl.textContent = "";

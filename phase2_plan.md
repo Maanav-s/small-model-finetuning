@@ -3,7 +3,7 @@
 Phase 1 gave us a working agentic loop (`restaurant name -> menu JSON`) for both
 Gemma ([src/gemma/agent.py](src/gemma/agent.py)) and the Claude baseline
 ([src/claude/claude_agent.py](src/claude/claude_agent.py)), backed by live
-Brave (search) + Jina (scrape) tools ([src/backends.py](src/backends.py)).
+Brave (search) + local headless Chromium (scrape) tools ([src/backends.py](src/backends.py)).
 
 Phase 2 turns that into something we can *train* on:
 
@@ -34,7 +34,7 @@ in the repo-root `.env` (git-ignored) and mirror the names into
 | 0.1 | **AWS S3 bucket**, private, *Block Public Access = ON* | source of truth (WS-D) | e.g. `s3://<you>-menu-corpus`. Confirms the privacy requirement: private bucket = not redistributing scraped menus. |
 | 0.2 | **AWS credentials** for the training node | S3 sync | Prefer an **EC2 instance profile / IAM role** on the training box (no static keys, free same-region egress). Otherwise an IAM user with `s3:GetObject/PutObject/ListBucket` on that bucket, keys in `.env` as `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`. Add `S3_BUCKET` + `S3_PREFIX` to `.env`. |
 | 0.3 | **Brave Search API key** | live search | Already wired as `BRAVE_API_KEY`. Confirm the plan's rate/quota tier is enough for the corpus build (a few searches × a few thousand restaurants). |
-| 0.4 | **Jina key** (recommended, technically optional) | live scrape | `r.jina.ai` works keyless at low rate; a key (`JINA_API_KEY`) raises limits and matters for a parallel corpus build. This is the slow/expensive call — size your rate limit here. |
+| 0.4 | **Local scrape (headless Chromium)** — *no key* | live scrape | scrape_url runs a local pooled Chromium (`playwright install chromium` + system libs); no API key. This is still the slow call — it's rate-limited by your own box (CPU + the single egress IP), so size corpus-build parallelism against that (and watch for per-site rate-limits on the shared IP). |
 | 0.5 | **Anthropic key** | teacher SFT traces + Opus findability | Already `ANTHROPIC_API_KEY`. Budget note: findability (WS-F) uses **Opus** with a generous tool budget — estimate cost before running at full scale. |
 | 0.6 | **Google Places (New) API key** — *optional* | metadata enrichment (WS-B) | Only if you want price tier / chain signals beyond OSM. Requires a **GCP project with billing enabled**; create + **restrict** the key; add `GOOGLE_PLACES_API_KEY`. Skippable — OSM alone is enough to start. |
 | 0.7 | **OSM / Overpass** | bulk restaurant list | **No account, no key.** Just be polite with rate limits (or point at a specific Overpass mirror). |
@@ -214,9 +214,10 @@ Reuses the existing Claude loop as-is.
   (the SFT run *is* the cache-population pass) and records the trace (1.5).
 - Extract `queries`/`urls` from the message list; validate `final_json` against
   `MENU_SCHEMA` (jsonschema) and set `schema_valid`.
-- Parallelize with a worker pool (IO-bound; Jina is the bottleneck) — respect
-  the Jina/Brave rate limits from Part 0. Idempotent: skip restaurants whose
-  trace already exists (resumable across interrupted runs).
+- Parallelize with a worker pool (the local browser scrape is the bottleneck —
+  CPU + the single egress IP) — respect the per-site + Brave rate limits from
+  Part 0. Idempotent: skip restaurants whose trace already exists (resumable
+  across interrupted runs).
 - **Done when:** every train restaurant has a trace, the cache is populated
   (`cache.stats()` writes ≈ unique queries+urls), and a summary prints
   schema-valid rate + mean tool calls per episode.
@@ -320,7 +321,7 @@ early so Wave 2 agents import a stable signature.
 
 ---
 
-*Note: [CLAUDE.md](CLAUDE.md) is current (Brave + Jina, and its caching note now
-points at this plan + [src/cache.py](src/cache.py)). The only stale-tooling
-reference left is in `project_plan.md` (still mentions Tavily) — out of scope for
+*Note: [CLAUDE.md](CLAUDE.md) is current (Brave + local Chromium scrape, and its
+caching note now points at this plan + [src/cache.py](src/cache.py)). The only
+stale-tooling reference left is in `project_plan.md` (still mentions Tavily) — out of scope for
 this build.*

@@ -3,17 +3,18 @@
 A single FastAPI process that:
   - loads the Gemma model + an Anthropic client ONCE at startup (in-process),
   - serves the static page (static/index.html) at "/", and
-  - exposes POST /api/extract {"query", "agent", "dietary", "prompt_variant",
-    "scrape_backend"} -> menu JSON.
+  - exposes POST /api/extract {"query", "agent", "dietary", "prompt_variant"}
+    -> menu JSON.
 
 Either agent runs the SAME tools / system prompt / JSON contract (only the loop
 differs): the local Gemma model (gemma/agent.py) or Claude via the Anthropic API
 (claude/claude_agent.py). The default is gemma.
 
-Search is Brave; scrape is selectable per request (scrape_backend): "jina"
-(default, production) or the local Playwright prototype "playwright"/"hybrid"
-(auto-scrolling browser render for lazy-loaded menu SPAs -- see
-src/scrape_playwright.py). Tools are built lazily and cached per backend.
+Search is Brave; scrape is a local headless Chromium (requests fast-path +
+auto-scrolling pooled browser -- see src/backends.py). The scrape's sync
+Playwright browser is safe here because /api/extract is a sync def: FastAPI runs
+it in a threadpool worker with no event loop. Do NOT make it `async def` without
+moving the scrape onto its own thread. Tools are built lazily and cached once.
 
 Episodes are serialized behind one lock: one runs at a time no matter how many
 browser tabs hit it. For Gemma this is essential (concurrent generate() calls on
@@ -23,9 +24,9 @@ so the lock -- not the event loop -- does the gating.
 Run from the repo root:
     uv run uvicorn viz.server:app --host 127.0.0.1 --port 8000
 
-Set BRAVE_API_KEY and JINA_API_KEY in the repo-root .env for the live tools. The
-Claude agent additionally needs ANTHROPIC_API_KEY; without it, only Gemma is
-offered (a Claude request returns an error rather than failing at startup).
+Set BRAVE_API_KEY in the repo-root .env for the live tools (scrape runs locally,
+no key). The Claude agent additionally needs ANTHROPIC_API_KEY; without it, only
+Gemma is offered (a Claude request returns an error rather than failing at startup).
 """
 
 from __future__ import annotations
@@ -50,14 +51,14 @@ _SRC = _REPO / "src"
 for _p in (_SRC, _SRC / "gemma", _SRC / "claude"):
     sys.path.insert(0, str(_p))
 
-load_dotenv(_REPO / ".env")  # BRAVE_API_KEY / JINA_API_KEY (+ ANTHROPIC_API_KEY for Claude)
+load_dotenv(_REPO / ".env")  # BRAVE_API_KEY (+ ANTHROPIC_API_KEY for Claude)
 
 # Imported after sys.path is set. model.py sets PYTORCH_CUDA_ALLOC_CONF before it
 # touches torch, so it must be the first of these to import. The two run_episode
 # loops share a name, so alias them.
 from model import load_model                          # noqa: E402
-from backends import has_scrape_key, has_search_key   # noqa: E402
-from tools import setup_tools, _SCRAPE_BACKENDS        # noqa: E402
+from backends import has_search_key                   # noqa: E402
+from tools import setup_tools                          # noqa: E402
 from prompts import build_system_prompt                # noqa: E402
 from agent import run_episode as run_gemma_episode     # noqa: E402
 from claude_agent import (                              # noqa: E402
@@ -78,35 +79,33 @@ _QUANTIZE = os.environ.get("VIZ_QUANTIZE", "1") != "0"
 _ENGINE: dict = {}                 # model/tokenizer/client, populated at startup
 _EPISODE_LOCK = threading.Lock()   # serialize episodes (single GPU: concurrent generate() would race/OOM)
 
-# The live tools (Brave search + a scrape backend) are built lazily and cached
-# here, keyed by scrape_backend, so the server boots with no web key and the key
-# is only needed the first time an extraction runs. _TOOLS_LOCK guards the cache
-# against concurrent first builds. Only (tools, registry) are cached -- the system
-# prompt varies per request with the caller's dietary restrictions, so it's
-# rebuilt each episode (build_system_prompt).
-_TOOLS_CACHE: dict = {}   # scrape_backend -> (tools, registry)
+# The live tools (Brave search + local Chromium scrape) are built lazily and
+# cached here, so the server boots with no web key and the key is only needed the
+# first time an extraction runs. _TOOLS_LOCK guards the cache against concurrent
+# first builds. Only (tools, registry) are cached -- the system prompt varies per
+# request with the caller's dietary restrictions, so it's rebuilt each episode.
+_TOOLS_CACHE: list = []
 _TOOLS_LOCK = threading.Lock()
 
 
-def _get_tools(scrape_backend: str = "jina") -> tuple:
-    """Return the dietary-independent (tools, registry) for a scrape backend.
+def _get_tools() -> tuple:
+    """Return the dietary-independent (tools, registry), building+caching once.
 
-    Built + cached once per backend. scrape_backend "playwright"/"hybrid" back
-    scrape_url with the local Playwright renderer (src/scrape_playwright.py). That
-    renderer uses the SYNC Playwright API, which is safe here ONLY because the
-    /api/extract endpoint is a sync def -- FastAPI runs it in a threadpool worker
-    (no running event loop in that thread), so the browser launch is effectively
+    scrape_url is backed by a local headless Chromium (src/backends.py) that uses
+    the SYNC Playwright API. That is safe here ONLY because the /api/extract
+    endpoint is a sync def -- FastAPI runs it in a threadpool worker (no running
+    event loop in that thread), so the browser launch is effectively
     thread-offloaded. Do NOT make the endpoint `async def` without moving the
     scrape onto its own thread first, or sync Playwright will raise.
 
-    Raises SystemExit (from setup_tools) if a web key is missing; the caller turns
-    that into a clean API error instead of crashing the server.
+    Raises SystemExit (from setup_tools) if the search key is missing; the caller
+    turns that into a clean API error instead of crashing the server.
     """
     with _TOOLS_LOCK:
-        if scrape_backend not in _TOOLS_CACHE:
-            tools, registry, _ = setup_tools(scrape_backend=scrape_backend)
-            _TOOLS_CACHE[scrape_backend] = (tools, registry)
-        return _TOOLS_CACHE[scrape_backend]
+        if not _TOOLS_CACHE:
+            tools, registry, _ = setup_tools()
+            _TOOLS_CACHE.append((tools, registry))
+        return _TOOLS_CACHE[0]
 
 
 @asynccontextmanager
@@ -123,7 +122,7 @@ async def lifespan(app: FastAPI):
     )
     print(f"Agents available: gemma{' + claude' if anthropic_client else ' (claude disabled: no ANTHROPIC_API_KEY)'}")
     print(f"web_search (Brave): {'key set' if has_search_key() else 'NO KEY — set BRAVE_API_KEY'}")
-    print(f"scrape_url (Jina): {'key set' if has_scrape_key() else 'NO KEY — set JINA_API_KEY'}")
+    print("scrape_url (local Chromium): no key needed")
     print("Visualizer ready -> http://127.0.0.1:8000")
     yield
 
@@ -141,10 +140,6 @@ class ExtractRequest(BaseModel):
     # System-prompt variant (see prompts.py): "teacher" carries the source-selection
     # guidance, "student" omits it (for context distillation).
     prompt_variant: str = "teacher"
-    # Which backend backs scrape_url: "jina" (default, production), or the local
-    # Playwright prototype "playwright" / "hybrid" (Jina direct + Playwright's
-    # auto-scrolling browser mode; see src/scrape_playwright.py).
-    scrape_backend: str = "jina"
 
 
 # Sync def -> FastAPI runs it in a threadpool; _EPISODE_LOCK keeps episodes serial.
@@ -153,9 +148,8 @@ def extract(req: ExtractRequest) -> dict:
     query = req.query.strip()
     agent = (req.agent or "gemma").lower()
     variant = (req.prompt_variant or "teacher").lower()
-    scrape_backend = (req.scrape_backend or "jina").lower()
     # Echoed back on every response so the page can label how it was produced.
-    meta = {"agent": agent, "prompt_variant": variant, "scrape_backend": scrape_backend}
+    meta = {"agent": agent, "prompt_variant": variant}
 
     def fail(error: str, raw: str = ""):
         return {"ok": False, "error": error, "raw": raw, **meta}
@@ -168,13 +162,11 @@ def extract(req: ExtractRequest) -> dict:
         return fail("Claude is unavailable: set ANTHROPIC_API_KEY and restart the server.")
     if variant not in ("teacher", "student"):
         return fail(f"Unknown prompt variant {req.prompt_variant!r}.")
-    if scrape_backend not in _SCRAPE_BACKENDS:
-        return fail(f"Unknown scrape backend {req.scrape_backend!r}.")
 
-    # Resolve (and lazily build/cache) the live tools for this scrape backend. A
-    # missing key surfaces here as SystemExit -> a clean error, not a crash.
+    # Resolve (and lazily build/cache) the live tools. A missing search key
+    # surfaces here as SystemExit -> a clean error instead of a server crash.
     try:
-        tools, registry = _get_tools(scrape_backend)
+        tools, registry = _get_tools()
     except SystemExit as e:
         return fail(str(e))
 
@@ -186,7 +178,7 @@ def extract(req: ExtractRequest) -> dict:
     # stdout is block-buffered through uvicorn's pipe.
     print(
         f"\n=== Episode (agent={agent}, variant={variant}, "
-        f"scrape={scrape_backend}, dietary={req.dietary!r}): {query!r} ===",
+        f"dietary={req.dietary!r}): {query!r} ===",
         flush=True,
     )
 

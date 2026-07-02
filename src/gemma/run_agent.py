@@ -5,7 +5,7 @@ source (tools.py), runs one episode (agent.py), and reports/validates the result
 (schema.py). The reusable pieces live in those modules so the SFT/eval scripts
 and a REPL can call them without going through this CLI.
 
-  uv run python src/gemma/run_agent.py             # bf16, live web tools (Brave + Jina)
+  uv run python src/gemma/run_agent.py             # bf16, live web tools (Brave + local scrape)
   uv run python src/gemma/run_agent.py --offline   # offline web_search stub
   uv run python src/gemma/run_agent.py --quantize  # 4-bit (low-VRAM / fast load)
 """
@@ -26,8 +26,8 @@ from prompts import TEST_RESTAURANT, normalize_dietary_restrictions  # noqa: E40
 from schema import extract_json  # noqa: E402
 from tools import setup_tools  # noqa: E402
 
-# Load BRAVE_API_KEY / JINA_API_KEY (and anything else) from the repo-root .env,
-# regardless of the current working directory (this file lives in src/gemma/).
+# Load BRAVE_API_KEY (and anything else) from the repo-root .env, regardless of
+# the current working directory (this file lives in src/gemma/).
 load_dotenv(Path(__file__).resolve().parents[2] / ".env")
 
 
@@ -52,7 +52,7 @@ def parse_args():
         action="store_true",
         help="Use the deterministic local web_search stub (returns sample_menu.md) "
         "instead of the live web tools. Default is live, which requires "
-        "BRAVE_API_KEY and JINA_API_KEY in the env.",
+        "BRAVE_API_KEY in the env.",
     )
     parser.add_argument(
         "--dietary",
@@ -71,17 +71,6 @@ def parse_args():
         "source-selection guidance (prefer the restaurant's own site, avoid "
         "delivery apps); 'student' omits it. The plan is to distill teacher "
         "behavior into the student via context distillation (see CLAUDE.md).",
-    )
-    parser.add_argument(
-        "--scrape-backend",
-        choices=["jina", "playwright", "hybrid", "local"],
-        default="jina",
-        help="Which backend backs scrape_url. 'jina' (default) is the finalized "
-        "production tool; the rest are the local-Chromium prototype "
-        "(src/scrape_playwright.py) whose 'browser' mode auto-scrolls lazy-loaded "
-        "menu SPAs. 'hybrid' = Jina direct + Playwright browser; 'local' = fully "
-        "Jina-free (requests fast-path + pooled Playwright browser). The Playwright "
-        "backends need `playwright install chromium`.",
     )
     return parser.parse_args()
 
@@ -113,7 +102,6 @@ def main():
         offline=args.offline,
         dietary_restrictions=args.dietary,
         variant=args.prompt_variant,
-        scrape_backend=args.scrape_backend,
     )
     restaurant = TEST_RESTAURANT
     diet = normalize_dietary_restrictions(args.dietary)

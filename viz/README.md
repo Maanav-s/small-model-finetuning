@@ -24,9 +24,9 @@ One Python process does everything — there is no separate frontend server.
 - **Backend ([server.py](server.py))** — FastAPI. On startup it loads the Gemma
   model and an Anthropic client **once** (in-process, via `src/`'s `load_model`
   and `anthropic.Anthropic`) and keeps them resident. The web tools (Brave search
-  + Jina scrape) are built **lazily once and cached** (via `setup_tools`), so the
-  server boots with no web key and only needs the keys the first time you run an
-  extraction. It exposes:
+  + local Chromium scrape) are built **lazily once and cached** (via `setup_tools`),
+  so the server boots with no web key and only needs the Brave key the first time
+  you run an extraction (scrape needs no key). It exposes:
   - `GET /` → serves `static/index.html`
   - `POST /api/extract`
     `{"query": "<restaurant>", "agent": "gemma"|"claude", "dietary": "<optional>",
@@ -80,8 +80,8 @@ Teacher is what we test on and generate SFT data with; switch to Student to
 preview the prompt the distilled model is trained to run under. The rendered menu
 labels which variant produced it.
 
-The web tools are fixed: **Brave** backs `web_search` and **Jina** backs
-`scrape_url` (see [src/backends.py](../src/backends.py)).
+The web tools are fixed: **Brave** backs `web_search` and a **local headless
+Chromium** backs `scrape_url` (see [src/backends.py](../src/backends.py)).
 
 - **Frontend ([static/index.html](static/index.html))** — plain HTML + vanilla
   JS, no framework and no build step. It `fetch()`es `/api/extract`, then renders
@@ -113,9 +113,10 @@ Then open <http://127.0.0.1:8000>.
 
 - Startup loads the model first (tens of seconds to ~1.5 min on this box); the
   page won't serve until you see `Visualizer ready -> ...` in the log.
-- Tool calls use Brave (search) + Jina (scrape). Set `BRAVE_API_KEY` and
-  `JINA_API_KEY` in the repo-root `.env` (see [.env.example](../.env.example));
-  the startup log prints whether each key is set.
+- Tool calls use Brave (search) + a local headless Chromium (scrape). Set
+  `BRAVE_API_KEY` in the repo-root `.env` (see [.env.example](../.env.example));
+  scrape needs no key (but needs `playwright install chromium`). The startup log
+  prints whether the search key is set.
 - To enable the **Claude** agent, add `ANTHROPIC_API_KEY` to the repo-root `.env`
   (same key `run_claude.py` uses). Gemma needs no extra key.
 
@@ -124,7 +125,7 @@ Then open <http://127.0.0.1:8000>.
 - **Quantization:** 4-bit by default (matches this 15 GB-host-RAM box — see the
   repo `CLAUDE.md`). Set `VIZ_QUANTIZE=0` to load full-quality bf16 on a
   bigger-RAM machine.
-- **Latency:** a request runs a full episode — Brave search / Jina scrape plus up
+- **Latency:** a request runs a full episode — Brave search / local scrape plus up
   to several generation turns — so it can take a couple of minutes, especially in
   4-bit. The page shows a loading state; expect minutes, not milliseconds. If you
   script against the API with `curl`, set a generous `--max-time`.

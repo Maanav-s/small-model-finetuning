@@ -199,8 +199,8 @@ def build_system_prompt(
 
     dietary_restrictions: None / "" / [] -> no filtering (whole menu); a string or
     list of restriction phrases -> filter the menu to complying items only.
-    live=True adds the scrape-tool rules (the live Brave+Jina path); live=False is
-    the offline stub path.
+    live=True adds the scrape-tool rules (the live Brave + local-scrape path);
+    live=False is the offline stub path.
     variant: "teacher" (default) includes the source-selection guidance
     (_SOURCE_GUIDANCE); "student" omits it. Differs only on the live path -- the
     offline stub has no sources to choose between. See the module docstring for the
