@@ -55,6 +55,7 @@ load_dotenv(_REPO / ".env")  # BRAVE_API_KEY / JINA_API_KEY (+ ANTHROPIC_API_KEY
 from model import load_model                          # noqa: E402
 from backends import has_scrape_key, has_search_key   # noqa: E402
 from tools import setup_tools                          # noqa: E402
+from prompts import build_system_prompt                # noqa: E402
 from agent import run_episode as run_gemma_episode     # noqa: E402
 from claude_agent import (                              # noqa: E402
     HAIKU_MODEL_ID,
@@ -77,19 +78,22 @@ _EPISODE_LOCK = threading.Lock()   # serialize episodes (single GPU: concurrent 
 # The live tools (Brave + Jina) are built lazily once and cached here, so the
 # server boots with no web key and the key is only needed the first time an
 # extraction runs. _TOOLS_LOCK guards the cache against concurrent first builds.
+# Only (tools, registry) are cached -- the system prompt varies per request with
+# the caller's dietary restrictions, so it's rebuilt each episode (build_system_prompt).
 _TOOLS_CACHE: list = []
 _TOOLS_LOCK = threading.Lock()
 
 
 def _get_tools() -> tuple:
-    """Return (tools, registry, system_prompt), building+caching once.
+    """Return the dietary-independent (tools, registry), building+caching once.
 
     Raises SystemExit (from setup_tools) if a web key is missing; the caller turns
     that into a clean API error instead of crashing the server.
     """
     with _TOOLS_LOCK:
         if not _TOOLS_CACHE:
-            _TOOLS_CACHE.append(setup_tools())
+            tools, registry, _ = setup_tools()
+            _TOOLS_CACHE.append((tools, registry))
         return _TOOLS_CACHE[0]
 
 
@@ -119,6 +123,12 @@ _STATIC = Path(__file__).resolve().parent / "static"
 class ExtractRequest(BaseModel):
     query: str
     agent: str = "gemma"  # "gemma" (local model) or "claude" (Anthropic API)
+    # Comma-separated dietary restrictions (e.g. "vegetarian, no nuts"); "" means
+    # no filtering (the full menu). Slotted into the system prompt per request.
+    dietary: str = ""
+    # System-prompt variant (see prompts.py): "teacher" carries the source-selection
+    # guidance, "student" omits it (for context distillation).
+    prompt_variant: str = "teacher"
 
 
 # Sync def -> FastAPI runs it in a threadpool; _EPISODE_LOCK keeps episodes serial.
@@ -126,8 +136,9 @@ class ExtractRequest(BaseModel):
 def extract(req: ExtractRequest) -> dict:
     query = req.query.strip()
     agent = (req.agent or "gemma").lower()
-    # Echoed back on every response so the page can label which agent produced it.
-    meta = {"agent": agent}
+    variant = (req.prompt_variant or "teacher").lower()
+    # Echoed back on every response so the page can label how it was produced.
+    meta = {"agent": agent, "prompt_variant": variant}
 
     def fail(error: str, raw: str = ""):
         return {"ok": False, "error": error, "raw": raw, **meta}
@@ -138,18 +149,27 @@ def extract(req: ExtractRequest) -> dict:
         return fail(f"Unknown agent {req.agent!r}.")
     if agent in CLAUDE_AGENTS and _ENGINE.get("anthropic_client") is None:
         return fail("Claude is unavailable: set ANTHROPIC_API_KEY and restart the server.")
+    if variant not in ("teacher", "student"):
+        return fail(f"Unknown prompt variant {req.prompt_variant!r}.")
 
     # Resolve (and lazily build/cache) the live tools. A missing key surfaces
     # here as SystemExit -> a clean error instead of a server crash.
     try:
-        tools, registry, system_prompt = _get_tools()
+        tools, registry = _get_tools()
     except SystemExit as e:
         return fail(str(e))
+
+    # Build the prompt with this request's dietary restrictions + variant (live path).
+    system_prompt = build_system_prompt(req.dietary, live=True, variant=variant)
 
     # Mark the start of the episode so the buffered tool-call prints below can be
     # attributed to a query/agent. flush=True so it shows immediately even though
     # stdout is block-buffered through uvicorn's pipe.
-    print(f"\n=== Episode (agent={agent}): {query!r} ===", flush=True)
+    print(
+        f"\n=== Episode (agent={agent}, variant={variant}, "
+        f"dietary={req.dietary!r}): {query!r} ===",
+        flush=True,
+    )
 
     with _EPISODE_LOCK:
         if agent == "gemma":

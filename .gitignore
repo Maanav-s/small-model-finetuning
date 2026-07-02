@@ -127,6 +127,11 @@ celerybeat.pid
 # SageMath parsed files
 *.sage.py
 
+# Phase 2 data artifacts — cache (data/cache.sqlite), corpus, traces, labels.
+# Source of truth is S3 (synced by scripts/cache_sync.py), never committed.
+# See phase2_plan.md.
+data/
+
 # Environments
 .env
 .venv

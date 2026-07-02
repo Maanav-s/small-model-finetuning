@@ -26,7 +26,7 @@ import anthropic  # noqa: E402
 from dotenv import load_dotenv  # noqa: E402
 
 from claude_agent import MODEL_ID, run_episode  # noqa: E402
-from prompts import TEST_RESTAURANT  # noqa: E402
+from prompts import TEST_RESTAURANT, normalize_dietary_restrictions  # noqa: E402
 from schema import extract_json  # noqa: E402
 from tools import setup_tools  # noqa: E402
 
@@ -50,6 +50,24 @@ def parse_args():
         default=MODEL_ID,
         help=f"Claude model id (default: {MODEL_ID}).",
     )
+    parser.add_argument(
+        "--dietary",
+        nargs="*",
+        default=None,
+        metavar="RESTRICTION",
+        help="Dietary restrictions to filter the menu by, e.g. "
+        '--dietary vegetarian "no nuts" (or a single comma-separated string). '
+        "Omit for no filtering (the full menu).",
+    )
+    parser.add_argument(
+        "--prompt-variant",
+        choices=["teacher", "student"],
+        default="teacher",
+        help="System-prompt variant. 'teacher' (default) includes the "
+        "source-selection guidance (prefer the restaurant's own site, avoid "
+        "delivery apps); 'student' omits it. The plan is to distill teacher "
+        "behavior into the student via context distillation (see CLAUDE.md).",
+    )
     return parser.parse_args()
 
 
@@ -62,6 +80,9 @@ def report(answer: str) -> None:
     print("\n=== SCHEMA CHECK ===")
     if parsed is None:
         print(f"INVALID JSON: {err}")
+    elif parsed.get("found") is False:
+        print(f"Valid JSON. MENU NOT FOUND for "
+              f"{parsed.get('restaurant_name')!r}: {parsed.get('notes')!r}")
     else:
         sections = parsed.get("menu", [])
         n_items = sum(len(s.get("items", [])) for s in sections)
@@ -79,9 +100,16 @@ def main():
         )
 
     client = anthropic.Anthropic()
-    tools, tool_registry, system_prompt = setup_tools(offline=args.offline)
+    tools, tool_registry, system_prompt = setup_tools(
+        offline=args.offline,
+        dietary_restrictions=args.dietary,
+        variant=args.prompt_variant,
+    )
     restaurant = TEST_RESTAURANT
+    diet = normalize_dietary_restrictions(args.dietary)
     print(f"\n=== Episode ({args.model}): {restaurant} ===")
+    print(f"Prompt variant: {args.prompt_variant}")
+    print(f"Dietary restrictions: {', '.join(diet) if diet else '(none)'}")
     answer = run_episode(
         client, restaurant, tools, tool_registry, system_prompt, model=args.model
     )

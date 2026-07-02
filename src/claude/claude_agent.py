@@ -31,9 +31,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import anthropic  # noqa: E402
 
+from prompts import BUDGET_FINALIZE_INSTRUCTION  # noqa: E402
+
 MODEL_ID = "claude-sonnet-4-6"        # default Claude baseline (Sonnet)
 HAIKU_MODEL_ID = "claude-haiku-4-5"   # cheaper/faster comparison point (non-dated alias)
-MAX_TOOL_CALLS = 4              # tool-call budget per episode (matches agent.py)
+MAX_TOOL_CALLS = 8              # tool-call budget per episode (matches agent.py)
 MAX_TOKENS = 16384            # the full menu JSON can be long (was 8192; output was truncating)
 
 # Thinking config is model-dependent. Sonnet 4.6 supports adaptive thinking; Haiku
@@ -114,15 +116,24 @@ def run_episode(
 
     Standard manual agentic loop: call the model, execute any tool_use blocks via
     the shared registry, feed the results back, repeat until Claude answers (or
-    the tool-call budget is spent, after which one tool-free call forces a JSON
-    answer rather than returning empty as agent.py does).
+    the tool-call budget is spent, after which one tool-free call -- with an
+    explicit "answer now from what you have" instruction -- forces a JSON answer
+    rather than returning empty).
     """
     anthropic_tools = to_anthropic_tools(tools)
     messages: list[dict] = [{"role": "user", "content": restaurant_name}]
 
     for step in range(max_tool_calls + 1):
-        # Budget spent: drop tools so the model must answer from what it gathered.
+        # Budget spent: drop the tools AND tell the model to answer from what it
+        # gathered. Without the instruction the model, still mid-search, tends to
+        # emit an empty turn (it "wanted" another tool call); the nudge makes it
+        # commit. Appended to the last tool_results turn -- a fresh user turn would
+        # break the API's user/assistant alternation.
         out_of_budget = step == max_tool_calls
+        if out_of_budget:
+            messages[-1]["content"].append(
+                {"type": "text", "text": BUDGET_FINALIZE_INSTRUCTION}
+            )
         response = client.messages.create(
             model=model,
             max_tokens=MAX_TOKENS,

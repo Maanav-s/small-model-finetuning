@@ -29,11 +29,35 @@ One Python process does everything — there is no separate frontend server.
   extraction. It exposes:
   - `GET /` → serves `static/index.html`
   - `POST /api/extract`
-    `{"query": "<restaurant>", "agent": "gemma"|"claude"}` → runs one extraction
-    episode and returns `{"ok": true, "menu": {...}, "raw": "...", "agent": "..."}`,
+    `{"query": "<restaurant>", "agent": "gemma"|"claude", "dietary": "<optional>",
+    "prompt_variant": "teacher"|"student"}`
+    → runs one extraction episode and returns
+    `{"ok": true, "menu": {...}, "raw": "...", "agent": "...", "prompt_variant": "..."}`,
     or `{"ok": false, "error": "...", ...}` on a missing key / non-JSON output.
-    `agent` defaults to `gemma`. Validation reuses `schema.extract_json`, so the
-    page and the eval/reward share one contract.
+    `agent` defaults to `gemma`. `dietary` is an optional comma-separated list of
+    dietary restrictions (e.g. `"vegetarian, no nuts"`); it's slotted into the
+    system prompt per request so the model filters the menu to complying items,
+    and an empty string means no filtering (the full menu). `prompt_variant`
+    defaults to `teacher` (see "Choosing the prompt variant"). Validation reuses
+    `schema.extract_json`, so the page and the eval/reward share one contract.
+
+### Dietary restrictions & failure handling
+
+- **Scope** — the prompt always returns just the **food dishes**
+  (appetizers, mains, shared plates, sides, desserts) and drops menu bulk that
+  isn't a dish — drinks/beverages, add-ons, modifiers, upsells, merch — so a long
+  menu's drink list and extras don't crowd out what the diner can actually eat.
+- **Dietary filter** — a second input on the page takes comma-separated
+  restrictions. They're built into the system prompt (`build_system_prompt`), so
+  the model returns only complying dishes; blank = every food dish (still no
+  drinks/bulk). If the filter leaves nothing, the page shows a *"No matching menu
+  items"* notice (distinct from a not-found menu).
+- **Menu not found** — when the model can't find a menu at all it returns the
+  `found: false` shape (`schema.NOT_FOUND_SNIPPET`) with a short `notes`; the page
+  renders a dedicated "No menu found" card instead of an empty menu.
+- **Missing prices** — an item with no discoverable price has `price: null`
+  (`schema.PRICE_UNKNOWN`; the model is told never to guess one), which the page
+  renders as a muted *"no price"* marker rather than a blank that reads as free.
 
 ### Choosing the agent
 
@@ -45,6 +69,16 @@ comparable. The rendered menu shows which agent produced it.
 Claude is optional: it's wired up only if `ANTHROPIC_API_KEY` is present at
 startup. Without the key the server still boots Gemma-only, and a Claude request
 returns an error explaining the key is missing (rather than failing at startup).
+
+### Choosing the prompt variant
+
+A third dropdown picks the system-prompt variant: **Teacher** (default) or
+**Student**. They differ only by a block of source-selection guidance (prefer the
+restaurant's own site, avoid delivery apps) that the teacher includes and the
+student omits — the setup for context distillation (see the repo `CLAUDE.md`).
+Teacher is what we test on and generate SFT data with; switch to Student to
+preview the prompt the distilled model is trained to run under. The rendered menu
+labels which variant produced it.
 
 The web tools are fixed: **Brave** backs `web_search` and **Jina** backs
 `scrape_url` (see [src/backends.py](../src/backends.py)).

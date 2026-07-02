@@ -18,11 +18,13 @@
   .wrap { max-width: 760px; margin: 0 auto; padding: 32px 20px 80px; }
   h1 { font-size: 20px; letter-spacing: .12em; text-transform: uppercase;
        color: var(--muted); font-weight: normal; text-align: center; }
-  form { display: flex; gap: 8px; margin: 20px 0 8px; }
+  form { display: flex; flex-direction: column; gap: 8px; margin: 20px 0 8px; }
+  .row { display: flex; gap: 8px; }
   input {
-    flex: 1; padding: 12px 14px; font-size: 16px; font-family: inherit;
+    flex: 1; width: 100%; padding: 12px 14px; font-size: 16px; font-family: inherit;
     border: 1px solid var(--line); border-radius: 6px; background: #fff;
   }
+  #dietary { font-size: 15px; }
   select {
     padding: 12px 10px; font-size: 15px; font-family: inherit;
     border: 1px solid var(--line); border-radius: 6px; background: #fff;
@@ -57,12 +59,25 @@
   .item .name { font-weight: bold; white-space: nowrap; }
   .item .dots { flex: 1; border-bottom: 1px dotted var(--line); transform: translateY(-4px); }
   .item .price { white-space: nowrap; color: var(--ink); }
+  .item .price.unknown { color: var(--muted); font-style: italic; font-size: 13px; }
   .item .desc { display: block; color: var(--muted); font-size: 14px;
                 font-style: italic; margin: 2px 0 0 2px; }
   .item-block { margin: 12px 0; }
 
   .source { text-align: center; margin-top: 28px; font-size: 13px; }
   .source a { color: var(--muted); }
+
+  .notice { text-align: center; color: var(--muted); font-style: italic;
+            padding: 24px 8px; }
+  .notice strong { display: block; font-style: normal; color: var(--ink);
+                   font-size: 16px; margin-bottom: 6px; }
+  .notfound {
+    background: var(--card); border: 1px solid var(--line); border-radius: 10px;
+    padding: 36px 40px; margin-top: 20px; text-align: center;
+    box-shadow: 0 1px 3px rgba(0,0,0,.05);
+  }
+  .notfound h2 { margin: 0 0 10px; font-size: 24px; }
+  .notfound .notes { color: var(--muted); font-style: italic; }
 
   .error {
     background: #fff3f0; border: 1px solid #e0b4a8; border-radius: 8px;
@@ -77,14 +92,23 @@
 <div class="wrap">
   <h1>Menu Visualizer</h1>
   <form id="form">
-    <input id="query" placeholder="Restaurant name, e.g. Pagliacci Pizza, Seattle"
-           autocomplete="off" autofocus />
-    <select id="agent" title="Which model runs the extraction">
-      <option value="gemma">Gemma (local)</option>
-      <option value="claude">Claude Sonnet (API)</option>
-      <option value="claude-haiku">Claude Haiku (API)</option>
-    </select>
-    <button id="go" type="submit">Find Menu</button>
+    <div class="row">
+      <input id="query" placeholder="Restaurant name, e.g. Pagliacci Pizza, Seattle"
+             autocomplete="off" autofocus />
+      <select id="agent" title="Which model runs the extraction">
+        <option value="gemma">Gemma (local)</option>
+        <option value="claude">Claude Sonnet (API)</option>
+        <option value="claude-haiku">Claude Haiku (API)</option>
+      </select>
+      <select id="promptVariant" title="System-prompt variant: teacher includes source-selection guidance; student omits it (context distillation)">
+        <option value="teacher">Teacher prompt</option>
+        <option value="student">Student prompt</option>
+      </select>
+      <button id="go" type="submit">Find Menu</button>
+    </div>
+    <input id="dietary" autocomplete="off"
+           title="Comma-separated dietary restrictions to filter the menu by; leave blank for the full menu"
+           placeholder="Dietary restrictions (optional), e.g. vegetarian, no nuts, gluten-free" />
   </form>
   <div class="status" id="status"></div>
   <div id="out"></div>
@@ -93,7 +117,9 @@
 <script>
   const form = document.getElementById("form");
   const input = document.getElementById("query");
+  const dietaryEl = document.getElementById("dietary");
   const agentSel = document.getElementById("agent");
+  const variantSel = document.getElementById("promptVariant");
   const btn = document.getElementById("go");
   const statusEl = document.getElementById("status");
   const out = document.getElementById("out");
@@ -107,24 +133,53 @@
   const esc = (s) => String(s ?? "").replace(/[&<>"]/g, c =>
     ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 
-  function fmtPrice(p) {
-    if (p === null || p === undefined || p === "") return "";
-    return typeof p === "number" ? "$" + p.toFixed(2) : esc(p);
+  // null / missing price == the model couldn't find one (see schema.PRICE_UNKNOWN).
+  // Render it as a visible, muted marker rather than a blank that reads as "free".
+  function renderPrice(p) {
+    if (typeof p === "number") return `<span class="price">$${p.toFixed(2)}</span>`;
+    if (p === null || p === undefined || p === "")
+      return `<span class="price unknown" title="No price listed">no price</span>`;
+    return `<span class="price">${esc(p)}</span>`;
   }
 
   function renderItem(it) {
-    const price = fmtPrice(it.price);
     const desc = it.description ? `<span class="desc">${esc(it.description)}</span>` : "";
     return `<div class="item-block">
       <div class="item">
         <span class="name">${esc(it.name)}</span>
         <span class="dots"></span>
-        <span class="price">${price}</span>
+        ${renderPrice(it.price)}
       </div>${desc}
     </div>`;
   }
 
+  // Total items across all sections, so we can tell "menu found but empty (e.g.
+  // filtered out by dietary restrictions)" apart from a normal menu.
+  function itemCount(sections) {
+    return sections.reduce((n, s) => n + ((s.items || []).length), 0);
+  }
+
+  function byLine(meta) {
+    const agent = meta && meta.agent;
+    if (!agent) return "";
+    const variant = meta.prompt_variant ? ` · ${esc(meta.prompt_variant)} prompt` : "";
+    return `<div class="by">extracted by ${esc(AGENT_LABEL[agent] || agent)}${variant}</div>`;
+  }
+
+  // The model reports it couldn't find the menu at all (schema: found=false).
+  function renderNotFound(m, meta) {
+    const notes = m.notes ? `<div class="notes">${esc(m.notes)}</div>` : "";
+    return `<div class="notfound">
+      <h2>No menu found</h2>
+      <p>Couldn't find a menu for <strong>${esc(m.restaurant_name || "that restaurant")}</strong>.</p>
+      ${notes}
+      ${byLine(meta)}
+    </div>`;
+  }
+
   function renderMenu(m, meta) {
+    if (m && m.found === false) return renderNotFound(m, meta);
+
     const sections = Array.isArray(m.menu) ? m.menu : [];
     const body = sections.map(s => `
       <div class="section">
@@ -134,17 +189,20 @@
     const source = m.source_url
       ? `<div class="source">source: <a href="${esc(m.source_url)}" target="_blank" rel="noopener">${esc(m.source_url)}</a></div>`
       : "";
-    const agent = meta && meta.agent;
-    const by = agent
-      ? `<div class="by">extracted by ${esc(AGENT_LABEL[agent] || agent)}</div>`
+    // Menu found but nothing to show: most often everything was filtered out by
+    // the dietary restrictions. Say so, instead of a bare "no sections".
+    const empty = itemCount(sections) === 0
+      ? `<div class="notice"><strong>No matching menu items.</strong>
+         No items were returned${dietaryEl.value.trim() ? " for the dietary restrictions you entered" : ""}.</div>`
       : "";
     return `<div class="menu">
       <div class="menu-head">
         <h2>${esc(m.restaurant_name || "Menu")}</h2>
         ${m.cuisine ? `<div class="cuisine">${esc(m.cuisine)}</div>` : ""}
-        ${by}
+        ${byLine(meta)}
       </div>
-      ${body || '<div class="status">No menu sections returned.</div>'}
+      ${body}
+      ${empty}
       ${source}
     </div>`;
   }
@@ -161,15 +219,18 @@
     const query = input.value.trim();
     if (!query) return;
     const agent = agentSel.value;
+    const dietary = dietaryEl.value.trim();
+    const prompt_variant = variantSel.value;
     btn.disabled = true;
     out.innerHTML = "";
-    statusEl.textContent = `Running ${AGENT_LABEL[agent] || agent}: ` +
-      `searching the web and extracting the menu… (this can take a minute)`;
+    const dietNote = dietary ? ` (filtering for: ${dietary})` : "";
+    statusEl.textContent = `Running ${AGENT_LABEL[agent] || agent} (${prompt_variant} prompt): ` +
+      `searching the web and extracting the menu${dietNote}… (this can take a minute)`;
     try {
       const res = await fetch("/api/extract", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ query, agent }),
+        body: JSON.stringify({ query, agent, dietary, prompt_variant }),
       });
       const data = await res.json();
       statusEl.textContent = "";

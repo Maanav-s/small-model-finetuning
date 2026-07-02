@@ -24,9 +24,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import torch  # noqa: E402
 
-from prompts import SYSTEM_PROMPT  # noqa: E402
+from prompts import BUDGET_FINALIZE_INSTRUCTION, SYSTEM_PROMPT  # noqa: E402
 
-MAX_TOOL_CALLS = 4          # tool-call budget per episode (plan: 2-3 expected)
+MAX_TOOL_CALLS = 8          # tool-call budget per episode (matches claude_agent.py)
 MAX_NEW_TOKENS = 4096       # the full menu JSON can be long
 
 
@@ -85,6 +85,23 @@ def run_episode(
     messages = build_messages(restaurant_name, system_prompt=system_prompt)
 
     for step in range(MAX_TOOL_CALLS + 1):
+        out_of_budget = step == MAX_TOOL_CALLS
+        if out_of_budget:
+            # Budget spent: tell the model to answer from what it has instead of
+            # looping to "" on exhaustion. Delivered as a synthesized tool response
+            # (NOT a user turn) so the template stays prefix-preserving for GRPO --
+            # the same carrier the parse-failure recovery below uses (and for the
+            # same reason). Tools stay declared, so we can't hard-block another
+            # call, but the instruction reliably makes the model commit.
+            name = next(iter(tool_registry), "web_search")
+            messages.append({
+                "role": "assistant",
+                "tool_calls": [
+                    {"type": "function", "function": {"name": name, "arguments": {}}}
+                ],
+                "tool_responses": [{"name": name, "response": BUDGET_FINALIZE_INSTRUCTION}],
+            })
+
         text = generate_turn(model, tokenizer, messages, tools)
         try:
             parsed = tokenizer.parse_response(text)  # {role, [thinking], content?, tool_calls?}
@@ -125,6 +142,13 @@ def run_episode(
         if not tool_calls:
             return (parsed.get("content") or "").strip()  # final answer
 
+        if out_of_budget:
+            # Model tried to call a tool with no budget left (despite the finalize
+            # instruction); take whatever text it produced rather than running the
+            # call and falling through to "".
+            print(f"  [warn] hit MAX_TOOL_CALLS={MAX_TOOL_CALLS} without a final answer")
+            return (parsed.get("content") or "").strip()
+
         # Execute every call the model made this turn, collecting responses.
         tool_responses = []
         for tc in tool_calls:
@@ -143,7 +167,8 @@ def run_episode(
         # in one message as Gemma 4 expects.
         messages.append({**parsed, "tool_responses": tool_responses})
 
-    print(f"  [warn] hit MAX_TOOL_CALLS={MAX_TOOL_CALLS} without a final answer")
+    # Only reached if the final (out-of-budget) turn failed to parse; the normal
+    # exhaustion path returns the model's best-effort text above.
     return ""
 
 

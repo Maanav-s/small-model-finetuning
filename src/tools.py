@@ -22,7 +22,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from backends import build_scrape, build_search
-from prompts import LIVE_SYSTEM_PROMPT, SYSTEM_PROMPT
+from prompts import build_system_prompt
 
 # ---------------------------------------------------------------------------
 # Shared output bound
@@ -98,7 +98,7 @@ def build_model_tools(search_fn, scrape_fn):
         """
         return _cap(search_fn(query), "web_search")
 
-    def scrape_url(url: str) -> str:
+    def scrape_url(url: str, mode: str = "direct") -> str:
         """Fetch the full contents of a web page as markdown.
 
         Use this on a promising URL returned by web_search to read the full menu
@@ -106,8 +106,16 @@ def build_model_tools(search_fn, scrape_fn):
 
         Args:
             url: The page URL to fetch (e.g. a result URL from web_search).
+            mode: How the page is fetched. "direct" (the default) does a plain,
+                quick fetch of the page's HTML and works for most pages -- ALWAYS
+                TRY "direct" FIRST. "browser" loads the page in a real browser that
+                runs its JavaScript, which some pages need before their menu
+                appears; it is slower, and some sites block automated browsers and
+                return little. Neither mode is always better, so use "browser" only
+                as a fallback when a "direct" fetch came back empty or clearly
+                missing the menu, and keep whichever result actually has the menu.
         """
-        return _cap(scrape_fn(url), "scrape_url")
+        return _cap(scrape_fn(url, mode), "scrape_url")
 
     tools = [web_search, scrape_url]
     registry = {fn.__name__: fn for fn in tools}
@@ -117,17 +125,23 @@ def build_model_tools(search_fn, scrape_fn):
 # ---------------------------------------------------------------------------
 # Selection
 # ---------------------------------------------------------------------------
-def setup_tools(offline: bool = False):
+def setup_tools(offline: bool = False, dietary_restrictions=None, variant: str = "teacher"):
     """Pick the tool source and return (tools, tool_registry, system_prompt).
 
     offline=False (default): live `web_search` (Brave) + `scrape_url` (Jina) --
     see backends.py; reads BRAVE_API_KEY and JINA_API_KEY.
     offline=True: the deterministic `web_search` stub that returns sample_menu.md,
     for developing the loop without a key or network.
+
+    dietary_restrictions (None / str / list[str]): slotted into the system prompt
+    so the model filters the menu to complying items; empty means no filtering.
+    variant ("teacher" | "student"): system-prompt variant (see prompts.py) --
+    "teacher" (default) carries the source-selection guidance, "student" omits it.
     """
     if offline:
-        return STUB_TOOLS, STUB_REGISTRY, SYSTEM_PROMPT
+        prompt = build_system_prompt(dietary_restrictions, live=False, variant=variant)
+        return STUB_TOOLS, STUB_REGISTRY, prompt
 
     tools, registry = build_model_tools(build_search(), build_scrape())
     print("Live tools: web_search via Brave, scrape_url via Jina")
-    return tools, registry, LIVE_SYSTEM_PROMPT
+    return tools, registry, build_system_prompt(dietary_restrictions, live=True, variant=variant)

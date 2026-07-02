@@ -11,8 +11,8 @@ data the tool calls get baked into later.
   brave      search   REST (/res/v1/web/search)     BRAVE_API_KEY
   jina       scrape   REST (r.jina.ai)              JINA_API_KEY
 
-  build_search() -> search(query: str) -> str   formatted result list (see _format_results)
-  build_scrape() -> scrape(url: str)   -> str   page contents as markdown
+  build_search() -> search(query: str)              -> str   formatted result list (see _format_results)
+  build_scrape() -> scrape(url: str, mode="direct") -> str   page markdown; mode "browser" runs the page's JS
 
 The model-facing wrappers in tools.py apply the MAX_TOOL_CHARS cap, so the
 functions here return un-capped strings.
@@ -31,6 +31,10 @@ SEARCH_RESULT_LIMIT = 3
 # Network timeout for the REST calls (seconds). Jina reader scrapes can be slow,
 # so keep this generous.
 HTTP_TIMEOUT = 60
+
+# Max seconds Jina waits for a browser-rendered ("browser" mode) page to settle
+# before returning. Kept under HTTP_TIMEOUT so Jina responds before our client gives up.
+RENDER_TIMEOUT = 30
 
 # Which env var holds each provider's API key.
 SEARCH_ENV = "BRAVE_API_KEY"
@@ -105,17 +109,28 @@ def build_search():
 # Jina -- scrape (r.jina.ai; Bearer auth)
 # ---------------------------------------------------------------------------
 def build_scrape():
-    """Build the Jina-backed scrape_url function."""
+    """Build the Jina-backed scrape_url function (fast fetch or browser render)."""
     api_key = _require_key(SCRAPE_ENV, "jina")
+    # URL-prefix form: append the target URL verbatim. X-Return-Format forces
+    # clean markdown; the body is markdown text (no JSON envelope here).
+    base_headers = {"Authorization": f"Bearer {api_key}", "X-Return-Format": "markdown"}
 
-    def scrape(url: str) -> str:
-        # URL-prefix form: append the target URL verbatim. X-Return-Format forces
-        # clean markdown; the body is markdown text (no JSON envelope here).
-        resp = requests.get(
-            f"https://r.jina.ai/{url}",
-            headers={"Authorization": f"Bearer {api_key}", "X-Return-Format": "markdown"},
-            timeout=HTTP_TIMEOUT,
-        )
+    def scrape(url: str, mode: str = "direct") -> str:
+        headers = dict(base_headers)
+        if mode == "browser":
+            # Render in a headless browser and pull in what a plain fetch misses:
+            # JS-populated menus, embedded ordering iframes, shadow-DOM widgets.
+            # Much slower (seconds), and some sites block automated browsers, so
+            # the model opts in per call and picks the richer result (see scrape_url).
+            headers.update(
+                {
+                    "X-Engine": "browser",
+                    "X-Timeout": str(RENDER_TIMEOUT),
+                    "X-Include-Iframe": "true",
+                    "X-Include-Shadow-Dom": "true",
+                }
+            )
+        resp = requests.get(f"https://r.jina.ai/{url}", headers=headers, timeout=HTTP_TIMEOUT)
         resp.raise_for_status()
         return resp.text or "(page returned no content)"
 

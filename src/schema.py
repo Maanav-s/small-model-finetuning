@@ -11,9 +11,17 @@ from __future__ import annotations
 import json
 import re
 
-# Human-readable schema embedded in the system prompt (see prompts.py).
+# Sentinel for an item whose price could not be found. `price` is a number when
+# known and PRICE_UNKNOWN (null) when the menu lists no price / none was found --
+# the model is told never to guess a price, so null is unambiguous "unknown".
+PRICE_UNKNOWN = None
+
+# Human-readable schema embedded in the system prompt (see prompts.py). `found`
+# is true for a normal result; the NOT_FOUND_SNIPPET below is the shape to return
+# when no menu could be found at all.
 SCHEMA_SNIPPET = """\
 {
+  "found": true,
   "restaurant_name": "string",
   "cuisine": "string",
   "menu": [
@@ -27,12 +35,28 @@ SCHEMA_SNIPPET = """\
   "source_url": "string or null"
 }"""
 
-# Machine-checkable mirror of SCHEMA_SNIPPET (for validation / reward).
+# The shape to return when the restaurant's menu cannot be found at all (no search
+# result / page has it). `found` is false, `menu` is empty, and `notes` says why.
+# This is a distinct, machine-detectable outcome from "found a menu but nothing
+# survived the dietary filter" (that stays found=true with an empty menu).
+NOT_FOUND_SNIPPET = """\
+{
+  "found": false,
+  "restaurant_name": "string",
+  "cuisine": "string or null",
+  "menu": [],
+  "source_url": "string or null",
+  "notes": "short string explaining why the menu could not be found"
+}"""
+
+# Machine-checkable mirror of SCHEMA_SNIPPET (for validation / reward). Covers
+# both the normal (found=true) and not-found (found=false) shapes.
 MENU_SCHEMA = {
     "type": "object",
     "properties": {
+        "found": {"type": "boolean"},
         "restaurant_name": {"type": "string"},
-        "cuisine": {"type": "string"},
+        "cuisine": {"type": ["string", "null"]},
         "menu": {
             "type": "array",
             "items": {
@@ -46,6 +70,7 @@ MENU_SCHEMA = {
                             "properties": {
                                 "name": {"type": "string"},
                                 "description": {"type": "string"},
+                                # null == price could not be found (PRICE_UNKNOWN).
                                 "price": {"type": ["number", "null"]},
                             },
                             "required": ["name"],
@@ -56,8 +81,9 @@ MENU_SCHEMA = {
             },
         },
         "source_url": {"type": ["string", "null"]},
+        "notes": {"type": ["string", "null"]},
     },
-    "required": ["restaurant_name", "menu"],
+    "required": ["found", "restaurant_name", "menu"],
 }
 
 
