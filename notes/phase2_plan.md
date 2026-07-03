@@ -415,6 +415,4 @@ early so Wave 2 agents import a stable signature.
 ---
 
 *Note: [CLAUDE.md](../CLAUDE.md) is current (Brave + local Chromium scrape, and its
-caching note now points at this plan + [src/cache.py](../src/cache.py)). The only
-stale-tooling reference left is in `project_plan.md` (still mentions Tavily) — out of scope for
-this build.*
+caching note now points at this plan + [src/cache.py](../src/cache.py)).*

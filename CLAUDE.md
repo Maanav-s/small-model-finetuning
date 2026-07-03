@@ -4,9 +4,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-Fine-tune a small open-weight LLM (`google/gemma-4-E4B-it`) to take a restaurant name as input and return its menu as structured JSON, using **web search + scraping** as inference-time tools. The full multi-phase plan — agentic tool-call loop → SFT distillation → GRPO RL → eval — lives in [notes/project_plan.md](notes/project_plan.md). Read it before working on any phase; it defines the target JSON schema and reward design. Planning/spec markdowns live in [notes/](notes/) (incl. [notes/phase2_plan.md](notes/phase2_plan.md), the Phase-2 caching/corpus plan, and [notes/S3_setup.md](notes/S3_setup.md), the bucket/IAM details).
+Fine-tune a small open-weight LLM (`google/gemma-4-E4B-it`) to take a restaurant name as input and return its menu as structured JSON, using **web search + scraping** as inference-time tools. The phases: **agentic tool-call loop (done) → tool-call caching + training corpus (current, [notes/phase2_plan.md](notes/phase2_plan.md)) → SFT distillation → GRPO RL → eval**. The target JSON schema lives in [src/schema.py](src/schema.py) (the single contract everything imports). Planning/spec markdowns live in [notes/](notes/) (incl. [notes/S3_setup.md](notes/S3_setup.md), the bucket/IAM details).
 
-> **Tooling note:** the two live web tools are **finalized to Brave (search, REST) + a local headless Chromium (scrape, no key)** (the earlier Tavily/Firecrawl/MCP-server and Jina wiring has been removed) — see "Web tools" below. [notes/project_plan.md](notes/project_plan.md) still says Tavily in places (pending a docs pass). The old offline `web_search` stub (`sample_menu.md`, `--offline`) has been **removed**; the live tools are the only source.
+> **Tooling note:** the two live web tools are **finalized to Brave (search, REST) + a local headless Chromium (scrape, no key)** (the earlier Tavily/Firecrawl/MCP-server and Jina wiring has been removed) — see "Web tools" below. The old offline `web_search` stub (`sample_menu.md`, `--offline`) has been **removed**; the live tools are the only source.
 
 **Status:** early scaffold (Phase 1). Code lives in [src/](src/), split into **shared resources** (directly in `src/`) and two **per-model agent folders** ([src/gemma/](src/gemma/), [src/claude/](src/claude/)).
 
