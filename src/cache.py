@@ -1,13 +1,13 @@
 """Content-addressed SQLite cache for the tool-call network seam (Phase 2).
 
-This is the WAVE-0 CONTRACT for Phase 2 (see phase2_plan.md). It fixes the public
+This is the WAVE-0 CONTRACT for Phase 2 (see notes/phase2_plan.md). It fixes the public
 API — `Cache`, `norm_query`, `norm_url`, `CANNED`, `CacheMiss`, `MISS_POLICIES` —
 so the parallel workstreams can build against stable signatures. WS-A owns
 hardening (error-row caching, concurrency stress, unit tests) and wiring it into
 `setup_tools`; the skeleton here is deliberately minimal but functional so
 dependent workstreams can import and exercise it.
 
-Design (locked in phase2_plan.md):
+Design (locked in notes/phase2_plan.md):
   - Wraps the RAW backend closures (build_search/build_scrape in backends.py)
     BEFORE tools.py applies MAX_TOOL_CHARS -- so the stored response is uncapped
     and the cap stays retunable without re-scraping.
@@ -237,7 +237,7 @@ class Cache:
 
             # live: call through, classify, store, return. The network call runs
             # OUTSIDE the lock (two workers missing the same key both fetch and
-            # both write -- benign, INSERT OR REPLACE; see phase2_plan.md WS-C).
+            # both write -- benign, INSERT OR REPLACE; see notes/phase2_plan.md WS-C).
             response = fn(*args, **kwargs)
             status = classify(response)
             self._set(namespace, key, {"args": args, "kwargs": kwargs}, response, provider, status)

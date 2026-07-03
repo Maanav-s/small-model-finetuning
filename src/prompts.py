@@ -7,8 +7,9 @@ apart.
 The prompt is built per-episode by build_system_prompt() so a caller can slot in
 the user's dietary restrictions (CLI --dietary, or the viz form). With no
 restrictions the prompt asks for the full, unfiltered menu; with restrictions it
-asks the model to keep only complying items. SYSTEM_PROMPT / LIVE_SYSTEM_PROMPT
-are the no-restriction defaults, kept for the render-only demos and back-compat.
+asks the model to keep only complying items. SYSTEM_PROMPT is the no-restriction
+default, kept for the render-only demos and back-compat (LIVE_SYSTEM_PROMPT is a
+legacy alias from when an offline stub prompt variant existed).
 
 Teacher vs student variant (context distillation). build_system_prompt(variant=)
 selects between two live prompts that differ ONLY by a block of *source-selection
@@ -99,9 +100,9 @@ def _dietary_block(restrictions: list[str]) -> str:
     )
 
 
-# Base template. {search_clause} differs offline vs live; {dietary} is the only
-# user-driven part; {schema}/{not_found} come from schema.py. Literal JSON braces
-# in the prose are doubled for str.format().
+# Base template. {dietary} is the only user-driven part; {schema}/{not_found}
+# come from schema.py. Literal JSON braces in the prose are doubled for
+# str.format().
 _BASE_PROMPT = """\
 You are a restaurant menu extraction assistant.
 
@@ -135,7 +136,7 @@ shape, with `found` set to false and a short `notes` explaining why:
 {not_found}
 """
 
-# Appended (live path only) so the model knows how to use the scrape tool.
+# Appended so the model knows how to use the scrape tool.
 _LIVE_RULES = """\
 
 Tool-use rules:
@@ -158,8 +159,7 @@ Tool-use rules:
 # Teacher-only source-selection guidance -- the block that "teacher" includes and
 # "student" omits (see the module docstring on context distillation). It is a
 # behavioral nudge about WHICH source to read, not what the menu is, so the student
-# can learn it from teacher trajectories instead of being told. Live path only
-# (there are no real sources to choose from on the offline stub).
+# can learn it from teacher trajectories instead of being told.
 _SOURCE_GUIDANCE = """\
 
 Source-selection guidance:
@@ -183,8 +183,7 @@ BUDGET_FINALIZE_INSTRUCTION = (
     "Reply with the raw JSON object and nothing else."
 )
 
-_SEARCH_CLAUSE_OFFLINE = "You MUST call the `web_search` tool at least once"
-_SEARCH_CLAUSE_LIVE = (
+_SEARCH_CLAUSE = (
     "You MUST call the `web_search` tool at least once (and may then call "
     "`scrape_url` on a promising result URL to read the full menu page)"
 )
@@ -192,39 +191,34 @@ _SEARCH_CLAUSE_LIVE = (
 _VARIANTS = ("teacher", "student")
 
 
-def build_system_prompt(
-    dietary_restrictions=None, *, live: bool = False, variant: str = "teacher"
-) -> str:
+def build_system_prompt(dietary_restrictions=None, *, variant: str = "teacher") -> str:
     """Build the system prompt, slotting in the user's dietary restrictions.
 
     dietary_restrictions: None / "" / [] -> no filtering (whole menu); a string or
     list of restriction phrases -> filter the menu to complying items only.
-    live=True adds the scrape-tool rules (the live Brave + local-scrape path);
-    live=False is the offline stub path.
     variant: "teacher" (default) includes the source-selection guidance
-    (_SOURCE_GUIDANCE); "student" omits it. Differs only on the live path -- the
-    offline stub has no sources to choose between. See the module docstring for the
+    (_SOURCE_GUIDANCE); "student" omits it. See the module docstring for the
     context-distillation intent.
     """
     if variant not in _VARIANTS:
         raise ValueError(f"variant must be one of {_VARIANTS}, got {variant!r}")
     restrictions = normalize_dietary_restrictions(dietary_restrictions)
     prompt = _BASE_PROMPT.format(
-        search_clause=_SEARCH_CLAUSE_LIVE if live else _SEARCH_CLAUSE_OFFLINE,
+        search_clause=_SEARCH_CLAUSE,
         schema=SCHEMA_SNIPPET,
         scope=_SCOPE_RULE,
         dietary=_dietary_block(restrictions),
         not_found=NOT_FOUND_SNIPPET,
     )
-    if live:
-        prompt += _LIVE_RULES
-        if variant == "teacher":
-            prompt += _SOURCE_GUIDANCE
+    prompt += _LIVE_RULES
+    if variant == "teacher":
+        prompt += _SOURCE_GUIDANCE
     return prompt
 
 
-# No-restriction defaults, kept so agent.py's build_messages default and the
-# render-only demos keep working without threading restrictions through. Both use
-# the teacher variant (the default we test and generate SFT data with).
+# No-restriction default (teacher variant -- what we test and generate SFT data
+# with), kept so agent.py's build_messages default and the render-only demos work
+# without threading restrictions through. LIVE_SYSTEM_PROMPT is a back-compat
+# alias from when an offline stub prompt variant existed alongside it.
 SYSTEM_PROMPT = build_system_prompt()
-LIVE_SYSTEM_PROMPT = build_system_prompt(live=True)
+LIVE_SYSTEM_PROMPT = SYSTEM_PROMPT

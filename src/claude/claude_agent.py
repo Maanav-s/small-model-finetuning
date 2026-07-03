@@ -6,11 +6,11 @@ the Anthropic Messages API, so the two models' outputs are directly comparable.
 
 The tool source is shared: setup_tools() in tools.py returns the same
 `(tools, tool_registry, system_prompt)` whether you're driving Gemma or Claude.
-Both the offline stub and the live web tools are plain Python callables, so
-the only translation needed is the tool *declaration* format — Gemma's template
-reads the callables directly, while the Anthropic API wants
-`{"name", "description", "input_schema"}`. to_anthropic_tools does that; the
-registry (name -> callable returning str) is used as-is.
+The tools are plain Python callables, so the only translation needed is the
+tool *declaration* format — Gemma's template reads the callables directly,
+while the Anthropic API wants `{"name", "description", "input_schema"}`.
+to_anthropic_tools does that; the registry (name -> callable returning str) is
+used as-is.
 
 Like agent.py this module is the reusable engine — no CLI or key loading. Drive
 it from run_claude.py or a REPL. Adaptive thinking is on (the recommended
@@ -57,7 +57,7 @@ def thinking_config(model: str) -> dict:
         return {"type": "enabled", "budget_tokens": THINK_BUDGET}
     return {"type": "adaptive"}
 
-# Python annotation -> JSON Schema type, for converting the local web_search stub.
+# Python annotation -> JSON Schema type, for converting the tool callables.
 _JSON_TYPES = {str: "string", int: "integer", float: "number", bool: "boolean"}
 
 
@@ -87,8 +87,8 @@ def _callable_to_anthropic(fn) -> dict:
 def to_anthropic_tools(tools: list) -> list[dict]:
     """Translate the tool list from setup_tools() into Anthropic tool decls.
 
-    Both tool sources (the offline stub and the live web tools) are plain
-    Python callables, so the same setup_tools() result drives Claude unchanged.
+    The tools are plain Python callables, so the same setup_tools() result
+    drives Claude unchanged.
     """
     converted = []
     for tool in tools:
@@ -115,7 +115,7 @@ def run_episode(
     """Run the tool-call loop for one restaurant; return (final_text, messages).
 
     `messages` is the full conversation including the final assistant turn --
-    Phase 2's trace capture (phase2_plan.md, 1.5) records it verbatim. Assistant
+    Phase 2's trace capture (notes/phase2_plan.md, 1.5) records it verbatim. Assistant
     turns hold SDK content blocks, not plain dicts; serialize each block with
     `block.model_dump()` when writing trace JSON.
 
@@ -190,10 +190,11 @@ def run_episode(
 
 
 if __name__ == "__main__":
-    # Render-only demo: show the Anthropic tool declarations built from the stub
-    # tool source. No API key / network needed.
+    # Render-only demo: show the Anthropic tool declarations built from the real
+    # model-facing tools (over dummy backends). No API key / network needed.
     import json
 
-    from tools import STUB_TOOLS
+    from tools import build_model_tools
 
-    print(json.dumps(to_anthropic_tools(STUB_TOOLS), indent=2))
+    tools, _ = build_model_tools(lambda query: "", lambda url, mode="direct": "")
+    print(json.dumps(to_anthropic_tools(tools), indent=2))

@@ -6,7 +6,7 @@ boxes (US/CA/UK/AU), dedups them, optionally enriches with Google Places
 (price tier), stratified-samples down to a target size (oversampling
 independents), and writes:
 
-  data/restaurants.jsonl   one contract-1.4 row per line (see phase2_plan.md)
+  data/restaurants.jsonl   one contract-1.4 row per line (see notes/phase2_plan.md)
   data/splits.json         {restaurant_id: "train" | "eval"}, stratified + disjoint
 
 Usage:

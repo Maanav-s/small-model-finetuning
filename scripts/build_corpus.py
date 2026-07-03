@@ -3,7 +3,7 @@
 Each episode drives claude_agent.run_episode over the shared live tools wrapped
 in the content-addressed cache (miss_policy="live"), so the run populates
 data/cache.sqlite as a side effect and records one trace per restaurant to
-data/traces/<restaurant_id>.json (contract 1.5 in phase2_plan.md).
+data/traces/<restaurant_id>.json (contract 1.5 in notes/phase2_plan.md).
 
 Staged per the restructured WS-C: the same script serves the ~100-episode pilot
 (WS-C1) and the later sized bulk run (WS-C3) — selection order is seeded and
@@ -183,7 +183,7 @@ def main():
 
     cache = Cache(args.cache_path, miss_policy=args.cache_policy)
     tools, registry, system_prompt = setup_tools(
-        offline=False, dietary_restrictions=None, variant=PROMPT_VARIANT, cache=cache
+        dietary_restrictions=None, variant=PROMPT_VARIANT, cache=cache
     )
     client = anthropic.Anthropic()
 

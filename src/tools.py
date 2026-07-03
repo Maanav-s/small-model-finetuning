@@ -1,15 +1,14 @@
-"""Tool sources for the agent loop.
+"""The model-facing web tools for the agent loop.
 
-Two sources, selected by setup_tools():
-  - live web tools (`web_search` + `scrape_url`), backed by Brave (search) and a
-    local headless Chromium (scrape) -- see backends.py. This is the default, and
-  - an offline `web_search` stub (deterministic, returns sample_menu.md) for
-    developing the loop without a network/key (setup_tools(offline=True)).
+setup_tools() returns the live tools: `web_search` backed by Brave (search) and
+`scrape_url` backed by a local headless Chromium (scrape) -- see backends.py.
+(The old offline sample_menu.md stub and its --offline flag were removed once
+the live backend was finalized.)
 
-Both sources expose tools as plain Python functions (typed signature + Google-
-style docstring). apply_chat_template(tools=...) converts those to Gemma's
-schema, and the Claude runner's to_anthropic_tools converts the same callables
-to Anthropic decls -- so the agent loops are identical across sources.
+Tools are plain Python functions (typed signature + Google-style docstring).
+apply_chat_template(tools=...) converts those to Gemma's schema, and the Claude
+runner's to_anthropic_tools converts the same callables to Anthropic decls --
+so the agent loops are identical across models.
 
 The model only ever sees ONE search and ONE scrape tool, both named generically
 (web_search / scrape_url) with fixed docstrings (build_model_tools), so the
@@ -23,8 +22,6 @@ cap stays retunable without re-scraping. cache=None (default) = uncached.
 """
 
 from __future__ import annotations
-
-from pathlib import Path
 
 from backends import build_scrape, build_search
 from cache import norm_query, norm_scrape, scrape_status
@@ -54,33 +51,7 @@ def _cap(text: str, label: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Offline stub tool
-#
-# Defined as a plain Python function: apply_chat_template reads the signature +
-# Google-style docstring and converts it to the schema Gemma wants.
-# ---------------------------------------------------------------------------
-_SAMPLE_MENU = Path(__file__).with_name("sample_menu.md")
-
-
-def web_search(query: str) -> str:
-    """Search the web for a restaurant's menu information.
-
-    Args:
-        query: Search query, e.g. the restaurant name plus its city and the
-            word "menu".
-    """
-    # TEMP STUB: ignores the query and returns a fixed sample menu, so the
-    # agentic loop can be developed offline. setup_tools(offline=False) replaces
-    # this with the live web_search/scrape_url tools below (Brave + local scrape).
-    return _SAMPLE_MENU.read_text(encoding="utf-8")
-
-
-STUB_TOOLS = [web_search]
-STUB_REGISTRY = {fn.__name__: fn for fn in STUB_TOOLS}
-
-
-# ---------------------------------------------------------------------------
-# Live tools -- the model-facing wrappers
+# The model-facing wrappers
 # ---------------------------------------------------------------------------
 # The model is handed exactly two tools, named generically with fixed docstrings,
 # so it never sees which provider backs them. The backend's search_fn/scrape_fn
@@ -89,9 +60,9 @@ STUB_REGISTRY = {fn.__name__: fn for fn in STUB_TOOLS}
 def build_model_tools(search_fn, scrape_fn):
     """Wrap the backend's (search_fn, scrape_fn) as the model-facing tools.
 
-    Returns (tools, registry) matching the stub's shape: `tools` is a list of
-    plain functions (for apply_chat_template / to_anthropic_tools) and `registry`
-    maps name -> callable(**kwargs) -> str. The docstrings here are what the model
+    Returns (tools, registry): `tools` is a list of plain functions (for
+    apply_chat_template / to_anthropic_tools) and `registry` maps
+    name -> callable(**kwargs) -> str. The docstrings here are what the model
     reads, so they stay vendor-neutral.
     """
 
@@ -129,40 +100,23 @@ def build_model_tools(search_fn, scrape_fn):
 
 
 # ---------------------------------------------------------------------------
-# Selection
+# Setup
 # ---------------------------------------------------------------------------
-def setup_tools(
-    offline: bool = False,
-    dietary_restrictions=None,
-    variant: str = "teacher",
-    cache=None,
-):
-    """Pick the tool source and return (tools, tool_registry, system_prompt).
+def setup_tools(dietary_restrictions=None, variant: str = "teacher", cache=None):
+    """Build the live tools and return (tools, tool_registry, system_prompt).
 
-    offline=False (default): the live `web_search` (Brave) + `scrape_url` (local
-    headless Chromium) tools -- see backends.py; reads BRAVE_API_KEY (scrape needs
-    no key). offline=True: the deterministic `web_search` stub that returns
-    sample_menu.md, for developing the loop without a key or network.
+    The tools are `web_search` (Brave; reads BRAVE_API_KEY) + `scrape_url` (local
+    headless Chromium, no key) -- see backends.py.
 
     dietary_restrictions (None / str / list[str]): slotted into the system prompt
     so the model filters the menu to complying items; empty means no filtering.
     variant ("teacher" | "student"): system-prompt variant (see prompts.py) --
     "teacher" (default) carries the source-selection guidance, "student" omits it.
-    cache (cache.Cache | None): when given (and not offline), it wraps the BACKEND
-    closures -- BEFORE the MAX_TOOL_CHARS cap above -- so the RAW uncapped response
-    is stored and the cap stays retunable without re-scraping. The cache's
-    miss_policy (live/canned/error) decides what a miss does; see src/cache.py.
-    Ignored for the offline stub (already deterministic, no network to cache).
+    cache (cache.Cache | None): when given, it wraps the BACKEND closures --
+    BEFORE the MAX_TOOL_CHARS cap above -- so the RAW uncapped response is stored
+    and the cap stays retunable without re-scraping. The cache's miss_policy
+    (live/canned/error) decides what a miss does; see src/cache.py.
     """
-    if offline:
-        if cache is not None:
-            print(
-                "Note: cache is ignored for the offline stub (already deterministic); "
-                "running uncached."
-            )
-        prompt = build_system_prompt(dietary_restrictions, live=False, variant=variant)
-        return STUB_TOOLS, STUB_REGISTRY, prompt
-
     search_fn, scrape_fn = build_search(), build_scrape()
     if cache is not None:
         # scrape is 2-arg (url, mode); norm_scrape keys on BOTH so direct/browser
@@ -175,4 +129,4 @@ def setup_tools(
     tools, registry = build_model_tools(search_fn, scrape_fn)
     cached = f", cached ({cache.miss_policy}) at {cache.path}" if cache is not None else ""
     print(f"Live tools: web_search via Brave, scrape_url via local Chromium{cached}")
-    return tools, registry, build_system_prompt(dietary_restrictions, live=True, variant=variant)
+    return tools, registry, build_system_prompt(dietary_restrictions, variant=variant)

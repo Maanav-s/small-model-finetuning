@@ -84,7 +84,7 @@ def _require_key(env_var: str, provider: str) -> str:
     if not key:
         raise SystemExit(
             f"The {provider} backend requires {env_var} in the environment (or the "
-            f"repo-root .env). Pass --offline for the local stub."
+            f"repo-root .env)."
         )
     return key
 

@@ -1,12 +1,11 @@
 """CLI entry point for the Phase 1 agent loop (restaurant name -> menu JSON).
 
-This is a thin driver: it parses args, loads the model (model.py), picks a tool
-source (tools.py), runs one episode (agent.py), and reports/validates the result
-(schema.py). The reusable pieces live in those modules so the SFT/eval scripts
-and a REPL can call them without going through this CLI.
+This is a thin driver: it parses args, loads the model (model.py), builds the
+live tools (tools.py), runs one episode (agent.py), and reports/validates the
+result (schema.py). The reusable pieces live in those modules so the SFT/eval
+scripts and a REPL can call them without going through this CLI.
 
   uv run python src/gemma/run_agent.py             # bf16, live web tools (Brave + local scrape)
-  uv run python src/gemma/run_agent.py --offline   # offline web_search stub
   uv run python src/gemma/run_agent.py --quantize  # 4-bit (low-VRAM / fast load)
 """
 
@@ -47,13 +46,6 @@ def parse_args():
         "flash_attention_2 is NOT an option: Gemma 4 E4B's global-attention layers "
         "use head_dim=512, above FlashAttention-2's hard cap of 256 (FA3/FA4 would "
         "fit but need Hopper GPUs this box lacks). 'eager' is the slow reference path.",
-    )
-    parser.add_argument(
-        "--offline",
-        action="store_true",
-        help="Use the deterministic local web_search stub (returns sample_menu.md) "
-        "instead of the live web tools. Default is live, which requires "
-        "BRAVE_API_KEY in the env.",
     )
     parser.add_argument(
         "--dietary",
@@ -125,7 +117,6 @@ def main():
     cache = build_cache(args)
     model, tokenizer = load_model(quantize=args.quantize, attn=args.attn)
     tools, tool_registry, system_prompt = setup_tools(
-        offline=args.offline,
         dietary_restrictions=args.dietary,
         variant=args.prompt_variant,
         cache=cache,

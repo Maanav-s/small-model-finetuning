@@ -1,4 +1,4 @@
-"""Sync the Phase-2 `data/` artifacts with S3 (WS-D, phase2_plan.md).
+"""Sync the Phase-2 `data/` artifacts with S3 (WS-D, notes/phase2_plan.md).
 
 `data/` is git-ignored; its source of truth is `s3://$S3_BUCKET/$S3_PREFIX/`.
 This script mirrors the artifact set defined by contract 1.1:

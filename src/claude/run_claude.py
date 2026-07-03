@@ -7,10 +7,9 @@ model weights are loaded — this talks to the Anthropic API — so it runs with
 a GPU and is fast to iterate on.
 
   uv run python src/claude/run_claude.py             # live web tools (Brave + local scrape)
-  uv run python src/claude/run_claude.py --offline   # offline web_search stub
 
-Requires ANTHROPIC_API_KEY in the env (or repo-root .env); the live (default)
-tool path additionally requires BRAVE_API_KEY.
+Requires ANTHROPIC_API_KEY and BRAVE_API_KEY in the env (or repo-root .env);
+the scrape tool runs locally and needs no key.
 """
 
 import argparse
@@ -32,20 +31,12 @@ from schema import extract_json  # noqa: E402
 from tools import setup_tools  # noqa: E402
 
 # Load ANTHROPIC_API_KEY / BRAVE_API_KEY from the repo-root .env regardless of cwd
-# (this file lives in src/claude/). BRAVE_API_KEY is needed for the default live
-# tool path (scrape runs locally, no key); --offline needs only ANTHROPIC_API_KEY.
+# (this file lives in src/claude/). Scrape runs locally, no key.
 load_dotenv(Path(__file__).resolve().parents[2] / ".env")
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--offline",
-        action="store_true",
-        help="Use the deterministic local web_search stub (returns sample_menu.md) "
-        "instead of the live web tools. Default is live, which requires "
-        "BRAVE_API_KEY in the env.",
-    )
     parser.add_argument(
         "--model",
         default=MODEL_ID,
@@ -127,7 +118,6 @@ def main():
     client = anthropic.Anthropic()
     cache = build_cache(args)
     tools, tool_registry, system_prompt = setup_tools(
-        offline=args.offline,
         dietary_restrictions=args.dietary,
         variant=args.prompt_variant,
         cache=cache,

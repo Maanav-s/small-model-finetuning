@@ -174,16 +174,18 @@ def run_episode(
 
 if __name__ == "__main__":
     # Render-only demo: confirms the system prompt and tool schema coexist in the
-    # prompt the model receives. Tokenizer-only, so no GPU / weights needed.
+    # prompt the model receives. Tokenizer-only, so no GPU / weights needed -- the
+    # tools are the real model-facing declarations over dummy backends (no key).
     from transformers import AutoTokenizer
 
     from model import MODEL_ID
-    from tools import STUB_TOOLS
+    from tools import build_model_tools
 
+    tools, _ = build_model_tools(lambda query: "", lambda url, mode="direct": "")
     tok = AutoTokenizer.from_pretrained(MODEL_ID)
     rendered = tok.apply_chat_template(
         build_messages("Joe's Pizza, New York"),
-        tools=STUB_TOOLS,
+        tools=tools,
         add_generation_prompt=True,
         tokenize=False,
     )

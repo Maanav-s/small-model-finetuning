@@ -1,9 +1,9 @@
 # Phase 2 — Tool-call caching & training-corpus construction
 
 Phase 1 gave us a working agentic loop (`restaurant name -> menu JSON`) for both
-Gemma ([src/gemma/agent.py](src/gemma/agent.py)) and the Claude baseline
-([src/claude/claude_agent.py](src/claude/claude_agent.py)), backed by live
-Brave (search) + local headless Chromium (scrape) tools ([src/backends.py](src/backends.py)).
+Gemma ([src/gemma/agent.py](../src/gemma/agent.py)) and the Claude baseline
+([src/claude/claude_agent.py](../src/claude/claude_agent.py)), backed by live
+Brave (search) + local headless Chromium (scrape) tools ([src/backends.py](../src/backends.py)).
 
 Phase 2 turns that into something we can *train* on:
 
@@ -27,7 +27,7 @@ artifact, deterministic misses for RL).
 
 Do these first; the workstreams assume the keys/resources exist. Put all secrets
 in the repo-root `.env` (git-ignored) and mirror the names into
-[.env.example](.env.example).
+[.env.example](../.env.example).
 
 | # | What | Needed for | Notes |
 |---|------|-----------|-------|
@@ -191,9 +191,9 @@ is the acceptance check.
 **Deps:** contracts (1.2–1.3). **Independent otherwise.**
 
 - Implement `Cache` per 1.2/1.3.
-- Wire into [src/tools.py](src/tools.py) `setup_tools(offline, cache=None)`:
+- Wire into [src/tools.py](../src/tools.py) `setup_tools(offline, cache=None)`:
   cache **wraps the backend closures** (`build_search()`/`build_scrape()` from
-  [src/backends.py](src/backends.py)) *before* `build_model_tools` applies the
+  [src/backends.py](../src/backends.py)) *before* `build_model_tools` applies the
   `MAX_TOOL_CHARS` cap — so the raw response is stored and the cap stays tunable.
   ```python
   search_fn, scrape_fn = build_search(), build_scrape()
@@ -206,8 +206,8 @@ is the acceptance check.
   # renders are distinct entries. scrape_status marks failure sentinels 'error'.
   ```
 - Add a `--cache-policy {live,canned,error,off}` flag to
-  [src/gemma/run_agent.py](src/gemma/run_agent.py) and
-  [src/claude/run_claude.py](src/claude/run_claude.py); build the `Cache` and
+  [src/gemma/run_agent.py](../src/gemma/run_agent.py) and
+  [src/claude/run_claude.py](../src/claude/run_claude.py); build the `Cache` and
   pass it in. `off` = today's behavior (no cache).
 - **Done when:** unit tests with a counting fake `fn` (no network) prove
   hit/miss/write behavior under all three policies, including the error-row
@@ -373,7 +373,7 @@ then:              WS-G frozen eval RUN; WS-E re-run over the full corpus
 
 To avoid file collisions when fanning out agents: each workstream owns **its own
 new file(s)**; the only shared edits are WS-A touching
-[src/tools.py](src/tools.py) + the two `run_*.py` CLIs, and Wave 0 touching
+[src/tools.py](../src/tools.py) + the two `run_*.py` CLIs, and Wave 0 touching
 `.gitignore` + `.env.example`. Land Wave 0 first and WS-A's `setup_tools` change
 early so Wave 2 agents import a stable signature.
 
@@ -414,7 +414,7 @@ early so Wave 2 agents import a stable signature.
 
 ---
 
-*Note: [CLAUDE.md](CLAUDE.md) is current (Brave + local Chromium scrape, and its
-caching note now points at this plan + [src/cache.py](src/cache.py)). The only
+*Note: [CLAUDE.md](../CLAUDE.md) is current (Brave + local Chromium scrape, and its
+caching note now points at this plan + [src/cache.py](../src/cache.py)). The only
 stale-tooling reference left is in `project_plan.md` (still mentions Tavily) — out of scope for
 this build.*
