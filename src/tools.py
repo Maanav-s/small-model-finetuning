@@ -23,6 +23,8 @@ cap stays retunable without re-scraping. cache=None (default) = uncached.
 
 from __future__ import annotations
 
+import re
+
 from backends import build_scrape, build_search
 from cache import norm_query, norm_scrape, scrape_status
 from prompts import build_system_prompt
@@ -36,6 +38,34 @@ from prompts import build_system_prompt
 # comfortably; a blind char cap can still clip the tail of a very long menu, so a
 # hit is warned about (below) -- never silent.
 MAX_TOOL_CHARS = 75000
+
+
+# ---------------------------------------------------------------------------
+# Scrape-result slimming (token cost) -- applied at READ time, after the cache,
+# so the stored row keeps the full markdown and this stays retunable.
+# ---------------------------------------------------------------------------
+# What gets dropped is deliberately CONSERVATIVE: images, text-less links, and
+# dead-end hrefs (tel:/mailto:/js/#fragments/image files) -- measured 10.0%
+# smaller on the pilot's 401 cached pages. Navigable hrefs are KEPT: 17.7% of
+# the teacher's scrape calls used a URL found only via in-page links (homepage
+# -> menu page, own site -> ordering platform), so stripping all link targets
+# (a further ~13%) would break real trajectories. Applied to scrape results
+# only -- search results are WHERE the model gets URLs from.
+_MD_IMAGE_RE = re.compile(r"!\[[^\]]*\]\([^)]*\)")
+_MD_EMPTY_LINK_RE = re.compile(r"\[\s*\]\(\s*[^)]*\)")
+_MD_DEAD_HREF_RE = re.compile(
+    r"\[([^\]]+)\]\(\s*(?:tel:|mailto:|javascript:|#)[^)]*\)"
+    r"|\[([^\]]+)\]\(\s*[^)]*\.(?:png|jpe?g|gif|webp|svg|ico)(?:\?[^)]*)?\s*\)",
+    re.IGNORECASE,
+)
+
+
+def _slim_scrape(md: str) -> str:
+    """Drop non-navigable markdown bulk from a scraped page (see block comment)."""
+    md = _MD_IMAGE_RE.sub("", md)
+    md = _MD_EMPTY_LINK_RE.sub("", md)
+    md = _MD_DEAD_HREF_RE.sub(lambda m: m.group(1) or m.group(2), md)
+    return re.sub(r"\n{4,}", "\n\n\n", md)
 
 
 def _cap(text: str, label: str) -> str:
@@ -92,7 +122,7 @@ def build_model_tools(search_fn, scrape_fn):
                 as a fallback when a "direct" fetch came back empty or clearly
                 missing the menu, and keep whichever result actually has the menu.
         """
-        return _cap(scrape_fn(url, mode), "scrape_url")
+        return _cap(_slim_scrape(scrape_fn(url, mode)), "scrape_url")
 
     tools = [web_search, scrape_url]
     registry = {fn.__name__: fn for fn in tools}

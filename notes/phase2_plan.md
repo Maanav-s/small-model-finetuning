@@ -162,7 +162,7 @@ without touching the source list).
 ```json
 {
   "restaurant_id": "...", "restaurant_name": "...",
-  "model": "claude-sonnet-4-6",
+  "model": "claude-sonnet-5",
   "prompt_variant": "teacher",
   "dietary_restrictions": null,
   "cache_version": 1,

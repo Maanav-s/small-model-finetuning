@@ -33,7 +33,7 @@ import anthropic  # noqa: E402
 
 from prompts import BUDGET_FINALIZE_INSTRUCTION  # noqa: E402
 
-MODEL_ID = "claude-sonnet-4-6"        # default Claude baseline (Sonnet)
+MODEL_ID = "claude-sonnet-5"          # teacher/baseline (intro pricing thru 2026-08-31)
 HAIKU_MODEL_ID = "claude-haiku-4-5"   # cheaper/faster comparison point (non-dated alias)
 MAX_TOOL_CALLS = 8              # tool-call budget per episode (matches agent.py)
 MAX_TOKENS = 16384            # the full menu JSON can be long (was 8192; output was truncating)
@@ -103,6 +103,42 @@ def _final_text(response) -> str:
     return "".join(b.text for b in response.content if b.type == "text").strip()
 
 
+def _move_cache_marker(messages: list[dict], set_last: bool = True) -> None:
+    """Move the incremental prompt-cache breakpoint to the newest turn.
+
+    Each round re-sends the whole growing conversation; without caching that
+    prefix re-bills at full input price every round (measured: the dominant
+    episode cost). The marker makes the API cache the prefix up to the newest
+    turn, so the next round reads it at ~0.1x. Only USER-turn blocks are ever
+    marked (assistant turns hold SDK objects); the previous marker is stripped
+    first so the request stays at 2 breakpoints total (system + this) -- the
+    API caps breakpoints at 4, and stale markers would accumulate past it.
+    set_last=False just strips (used before returning, so traces stay clean).
+    """
+    for m in messages:
+        if m["role"] == "user" and isinstance(m["content"], list):
+            for b in m["content"]:
+                if isinstance(b, dict):
+                    b.pop("cache_control", None)
+    if not set_last:
+        return
+    last = messages[-1]
+    if last["role"] == "user" and isinstance(last["content"], list) and last["content"]:
+        block = last["content"][-1]
+        if isinstance(block, dict):
+            block["cache_control"] = {"type": "ephemeral"}
+
+
+def _finish(response, messages: list[dict], usage: dict) -> tuple[str, list[dict]]:
+    """Common episode exit: clean cache markers out of the trace, report usage."""
+    _move_cache_marker(messages, set_last=False)
+    print(
+        f"  [usage] input={usage['input']} cache_read={usage['cache_read']} "
+        f"cache_write={usage['cache_write']} output={usage['output']}"
+    )
+    return _final_text(response), messages
+
+
 def run_episode(
     client: anthropic.Anthropic,
     restaurant_name: str,
@@ -126,7 +162,16 @@ def run_episode(
     rather than returning empty).
     """
     anthropic_tools = to_anthropic_tools(tools)
-    messages: list[dict] = [{"role": "user", "content": restaurant_name}]
+    # Block-list content (not a bare string) so cache markers can attach to it.
+    messages: list[dict] = [
+        {"role": "user", "content": [{"type": "text", "text": restaurant_name}]}
+    ]
+    # System prompt + tools are byte-stable across the episode (tools render
+    # before system, so this one breakpoint caches both).
+    system_blocks = [
+        {"type": "text", "text": system_prompt, "cache_control": {"type": "ephemeral"}}
+    ]
+    usage = {"input": 0, "cache_read": 0, "cache_write": 0, "output": 0}
 
     for step in range(max_tool_calls + 1):
         # Budget spent: drop the tools AND tell the model to answer from what it
@@ -139,24 +184,30 @@ def run_episode(
             messages[-1]["content"].append(
                 {"type": "text", "text": BUDGET_FINALIZE_INSTRUCTION}
             )
+        _move_cache_marker(messages)
         response = client.messages.create(
             model=model,
             max_tokens=MAX_TOKENS,
-            system=system_prompt,
+            system=system_blocks,
             tools=[] if out_of_budget else anthropic_tools,
             thinking=thinking_config(model),
             messages=messages,
         )
+        u = response.usage
+        usage["input"] += u.input_tokens
+        usage["cache_read"] += u.cache_read_input_tokens or 0
+        usage["cache_write"] += u.cache_creation_input_tokens or 0
+        usage["output"] += u.output_tokens
 
         if response.stop_reason != "tool_use":
             messages.append({"role": "assistant", "content": response.content})
-            return _final_text(response), messages  # final answer
+            return _finish(response, messages, usage)  # final answer
 
         if out_of_budget:
             # Shouldn't happen (no tools offered), but don't loop forever.
             print(f"  [warn] hit MAX_TOOL_CALLS={max_tool_calls} without a final answer")
             messages.append({"role": "assistant", "content": response.content})
-            return _final_text(response), messages
+            return _finish(response, messages, usage)
 
         # Preserve the assistant turn verbatim (incl. thinking + tool_use blocks).
         messages.append({"role": "assistant", "content": response.content})

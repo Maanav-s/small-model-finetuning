@@ -97,7 +97,7 @@ The agent sources two live tools — **`web_search` backed by Brave (REST), `scr
 
 ## Claude baseline (Anthropic API)
 
-A second runner drives **Claude Sonnet** (`claude-sonnet-4-6`, in [src/claude/claude_agent.py](src/claude/claude_agent.py)) through the same task, so we can compare a frontier model against Gemma on identical inputs. The point is parity: it reuses the *same* tool source, system prompt, and JSON contract — only the model and the transport differ.
+A second runner drives **Claude Sonnet** (`claude-sonnet-5`, in [src/claude/claude_agent.py](src/claude/claude_agent.py)) through the same task, so we can compare a frontier model against Gemma on identical inputs. The point is parity: it reuses the *same* tool source, system prompt, and JSON contract — only the model and the transport differ.
 
 - **Shared everything.** [src/claude/run_claude.py](src/claude/run_claude.py) calls the same `setup_tools()` from [src/tools.py](src/tools.py) (live Brave search + local scrape) and the same `SYSTEM_PROMPT`, and validates with the same `schema.extract_json`. The tool *registry* (`name -> callable -> str`) is used as-is; only the tool *declaration* format is translated.
 - **Tool translation.** The tools are plain Python callables (typed signature + docstring); the Anthropic API wants `{"name","description","input_schema"}`. `to_anthropic_tools` in [src/claude/claude_agent.py](src/claude/claude_agent.py) derives that from each callable's signature/docstring (the old OpenAI-style function-dict branch is gone with MCP), so the same `setup_tools` result drives Claude unchanged. `uv run python src/claude/claude_agent.py` prints the converted declarations (no key/network needed).
