@@ -322,7 +322,11 @@ def build_scrape():
             # ... escalate a thin/failed fetch to a no-scroll browser render.
             html = _render_pooled(url, wait=True, scroll=False)
             return _html_to_markdown(html) or md or "(page returned no content)"
-        except PlaywrightError as e:
+        # RecursionError: BeautifulSoup/markdownify recurse over the DOM, and a
+        # pathologically nested page blows the interpreter limit -- observed
+        # killing 10/99 pilot episodes. Same contract as Playwright failures:
+        # return the sentinel so the model can try another URL/mode.
+        except (PlaywrightError, RecursionError) as e:
             return _scrape_error(url, mode, e)
 
     return scrape
