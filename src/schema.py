@@ -28,7 +28,7 @@ SCHEMA_SNIPPET = """\
     {
       "section": "string",
       "items": [
-        {"name": "string", "description": "string", "price": number or null}
+        {"name": "string", "description": "string or null", "price": number or null}
       ]
     }
   ],
@@ -69,7 +69,10 @@ MENU_SCHEMA = {
                             "type": "object",
                             "properties": {
                                 "name": {"type": "string"},
-                                "description": {"type": "string"},
+                                # null == no description on the menu (the system
+                                # prompt says "use null for fields you cannot
+                                # determine", so the validator must accept it).
+                                "description": {"type": ["string", "null"]},
                                 # null == price could not be found (PRICE_UNKNOWN).
                                 "price": {"type": ["number", "null"]},
                             },

@@ -31,8 +31,8 @@ in the repo-root `.env` (git-ignored) and mirror the names into
 
 | # | What | Needed for | Notes |
 |---|------|-----------|-------|
-| 0.1 | **AWS S3 bucket**, private, *Block Public Access = ON* | source of truth (WS-D) | e.g. `s3://<you>-menu-corpus`. Confirms the privacy requirement: private bucket = not redistributing scraped menus. |
-| 0.2 | **AWS credentials** for the training node | S3 sync | Prefer an **EC2 instance profile / IAM role** on the training box (no static keys, free same-region egress). Otherwise an IAM user with `s3:GetObject/PutObject/ListBucket` on that bucket, keys in `.env` as `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`. Add `S3_BUCKET` + `S3_PREFIX` to `.env`. |
+| 0.1 | **AWS S3 bucket** — **DONE** (see [S3_setup.md](S3_setup.md)) | source of truth (WS-D) | `s3://restaurant-menu-corpus` (us-west-2, private, SSE-S3, BucketOwnerEnforced). Private bucket = not redistributing scraped menus. |
+| 0.2 | **AWS credentials** — **DONE** (instance profile) | S3 sync | Devbox role `menu-corpus-devbox-role` grants ListBucket + Get/PutObject on the bucket; boto3 default chain resolves it. **No static keys in `.env`** — only `S3_BUCKET=restaurant-menu-corpus`, `S3_PREFIX=v1`, `AWS_DEFAULT_REGION=us-west-2` (bucket region; avoids cross-region redirects). |
 | 0.3 | **Brave Search API key** | live search | Already wired as `BRAVE_API_KEY`. **Confirmed: paid tier** — quota covers the corpus build (a few searches × a few thousand restaurants); still throttle politely in WS-C. |
 | 0.4 | **Local scrape (headless Chromium)** — *no key* | live scrape | scrape_url runs a local pooled Chromium (`playwright install chromium` + system libs); no API key. This is still the slow call — it's rate-limited by your own box (CPU + the single egress IP), so size corpus-build parallelism against that (and watch for per-site rate-limits on the shared IP). |
 | 0.5 | **Anthropic key** | teacher SFT traces + Opus findability | Already `ANTHROPIC_API_KEY`. Budget note: findability (WS-F) uses **Opus** with a generous tool budget — estimate cost before running at full scale. |
@@ -64,12 +64,12 @@ data/                      # NEW, git-ignored (add `data/` to .gitignore)
   labels.jsonl             # findability + menu_source_type labels (WS-F)
 src/cache.py               # NEW cache module (WS-A)
 scripts/harvest_restaurants.py  # WS-B
-scripts/build_corpus.py         # WS-C
+scripts/build_corpus.py         # WS-C1/C3 (pilot + sized teacher run)
 scripts/cache_sync.py           # WS-D
 scripts/analyze_queries.py      # WS-E
 scripts/label_findability.py    # WS-F
 scripts/eval_menu.py            # WS-G
-scripts/warm_eval_cache.py      # WS-H
+scripts/warm_cache.py           # WS-C2 (bulk warm, all restaurants; subsumes old WS-H)
 ```
 
 `data/` is git-ignored; its **source of truth is S3** (WS-D syncs it).
@@ -236,16 +236,38 @@ is the acceptance check.
 - **Done when:** `restaurants.jsonl` has ~target rows, `splits.json` is disjoint,
   and the distribution report shows no axis is degenerate (e.g. not 95% chains).
 
-### WS-C · Corpus build / SFT trace capture `scripts/build_corpus.py`
+### WS-C · Corpus build / SFT trace capture — **three stages** (restructured 2026-07-03)
 **Deps:** WS-A (Cache API + `setup_tools(cache=)`), WS-B (`restaurants.jsonl`).
 Reuses the existing Claude loop; `run_episode` returns `(final_text, messages)`
 for trace capture (landed with Wave 0 — assistant turns hold SDK content blocks,
 so serialize via `block.model_dump()` when writing trace JSON).
 
-- For each **train** restaurant: run `claude_agent.run_episode` with a
-  `Cache(miss_policy="live")` — this **populates the cache as a side effect**
-  (the SFT run *is* the cache-population pass) and records the trace (1.5).
-  Episodes run **restriction-free** (no dietary restrictions this phase).
+Restructured so the Sonnet spend is **sized after a pilot** instead of committed
+up front: the Anthropic cost scales with the number of *traces* (a warm cache
+doesn't make an episode cheaper), but warming decouples all the slow/fragile
+scrape work from the paid calls and defers the bulk-spend decision.
+
+**WS-C1 · Pilot** (`scripts/build_corpus.py --limit ~100`) — **~100 stratified
+train restaurants**, `Cache(miss_policy="live")`, episode input `"{name},
+{city}"` (matches `TEST_RESTAURANT`'s shape). Records traces (1.5); episodes are
+**restriction-free**. Output feeds WS-E and the go/no-go on trace quality
+(schema-valid rate, tool-call distribution, source selection) before any bulk
+spend.
+
+**WS-C2 · Bulk programmatic warm** (`scripts/warm_cache.py`, subsumes old WS-H)
+— for **ALL 3500 restaurants (train + eval)**, no Anthropic tokens: run the
+WS-E-mined query templates through the cached search (`live` policy), take the
+top-K result URLs (funnel-domain-weighted), scrape each in `direct` mode and
+promising ones in `browser` mode too (mode is part of the cache key). Cheap
+(paid Brave + local CPU); re-runnable (`live` = no-op on warm keys, self-heals
+`error` rows). This is also what makes the frozen eval + GRPO cache possible.
+
+**WS-C3 · Sized teacher run** (same `build_corpus.py`, higher `--limit`) — trace
+count decided AFTER inspecting the pilot (all 3000? fewer? findability-
+filtered?). Runs fast against the warm cache; misses still fetch live so
+trajectories aren't constrained.
+
+Shared mechanics (all stages):
 - Extract `queries`/`urls` from the message list; validate `final_json` against
   `MENU_SCHEMA` (jsonschema) and set `schema_valid`.
 - Parallelize with a **thread** pool, not processes: the pooled Chromium is
@@ -255,10 +277,13 @@ so serialize via `block.model_dump()` when writing trace JSON).
   (`INSERT OR REPLACE`, last-write-wins); don't "fix" it with a lock around the
   network call. Respect the per-site + Brave rate limits from Part 0.
   Idempotent: skip restaurants whose trace already exists (resumable across
-  interrupted runs).
-- **Done when:** every train restaurant has a trace, the cache is populated
-  (`cache.stats()` writes ≈ unique queries+urls), and a summary prints
-  schema-valid rate + mean tool calls per episode.
+  interrupted runs). Selection order is seeded and prefix-stable, so a smaller
+  `--limit` run is always a subset of a larger one.
+- **Done when (C1):** ~100 pilot traces exist with a printed quality summary.
+  **(C2):** a `canned` replay over eval-split templates+URLs reports a low miss
+  rate (print it; investigate >~10%). **(C3):** every selected restaurant has a
+  trace, cache writes ≈ unique queries+urls, summary prints schema-valid rate +
+  mean tool calls.
 
 ### WS-D · S3 sync `scripts/cache_sync.py`
 **Deps:** contracts (1.1). Interface-only dep on WS-A (just the file path).
@@ -276,7 +301,8 @@ so serialize via `block.model_dump()` when writing trace JSON).
   files byte-for-byte; works with an instance profile and with static keys.
 
 ### WS-E · Query analysis `scripts/analyze_queries.py`
-**Deps:** WS-C (traces exist).
+**Deps:** WS-C1 (pilot traces) — runs on the pilot first (its templates drive
+the WS-C2 warm), then re-runs over the full corpus once WS-C3 lands.
 
 - Aggregate every `(restaurant_id, query)` and `(restaurant_id, url)` across
   `traces/`. Cluster/normalize queries into **templates** (e.g. `"{name} {city}
@@ -305,7 +331,7 @@ so serialize via `block.model_dump()` when writing trace JSON).
 
 ### WS-G · Eval / validation harness `scripts/eval_menu.py`
 **Deps:** contracts + WS-B splits. Uses `jsonschema` + `schema.extract_json`.
-*Buildable* early, but frozen runs need **WS-H's warmed cache** — against an
+*Buildable* early, but frozen runs need **WS-C2's warmed cache** — against an
 unwarmed cache every tool call returns the canned constants and the metrics
 measure nothing but abstention.
 
@@ -316,47 +342,34 @@ measure nothing but abstention.
 - This is the scaffold the **GRPO reward** will reuse in Phase 3 — keep the
   scoring functions importable, not buried in `__main__`.
 - **Done when:** it prints a metrics table for the Claude baseline on the eval
-  split (against the WS-H-warmed cache), and abstention scoring reads
+  split (against the WS-C2-warmed cache), and abstention scoring reads
   `labels.jsonl`.
 
-### WS-H · Eval-split cache warm `scripts/warm_eval_cache.py`
-**Deps:** WS-A/WS-B (cache + splits), WS-E (`query_templates.json`),
-WS-F (`labels.jsonl` URLs).
-
-WS-C populates the cache from **train** episodes only, so without this pass a
-frozen (`canned`) eval run sees an empty cache and WS-G scores garbage. This is
-the explicit warm pass (decided over live-policy eval, which wouldn't be
-reproducible across days).
-
-- For each **eval** restaurant, with `miss_policy="live"`: run the WS-E query
-  templates through the cached search, then scrape the WS-F-discovered menu
-  URLs plus the top search-result URLs in **both** `direct` and `browser`
-  modes — the mode is part of the cache key, and the eval-time model may pick
-  either.
-- Re-runnable: `live` policy makes it a no-op on already-warm keys (and
-  self-heals stored `error` rows).
-- **Done when:** a `--cache-policy canned` Claude-baseline run over the eval
-  split reports a low tool-call miss rate (print it; investigate above ~10%),
-  and WS-G runs against the warmed cache.
+### WS-H · *(folded into WS-C2, 2026-07-03)*
+The eval-split warm pass grew into the **bulk warm over all 3500 restaurants**
+— see WS-C2. Rationale unchanged: a frozen (`canned`) eval against an unwarmed
+cache scores nothing but abstention, and live-policy eval isn't reproducible
+across days. Generalizing it to train+eval also pre-pays the GRPO frozen-cache
+mitigation Part 4 deferred.
 
 ---
 
 ## Part 3 — Dependency graph & suggested waves
 
 ```
-Wave 0 (you, 1 commit):  Part 1 contracts + `data/` in .gitignore + Part 0 deps/keys
-                         + the run_episode (final_text, messages) trace-return change
-Wave 1 (parallel):       WS-A (cache)      WS-B (sourcing)      WS-D (s3 sync)
-Wave 2 (parallel):       WS-C (corpus/traces)   WS-F (findability)   WS-G (eval harness)
-Wave 3:                  WS-E (query analysis — needs WS-C traces)
-Wave 4:                  WS-H (eval cache warm — needs WS-E templates + WS-F urls),
-                         then WS-G's frozen eval RUN (the harness itself is Wave 2)
+Wave 0 (DONE):     contracts + `data/` git-ignore + run_episode trace-return change
+Wave 1 (DONE):     WS-A (cache)      WS-B (sourcing)      WS-D (s3 sync)
+Wave 2 (parallel): WS-C1 (pilot ~100 traces)          WS-G (eval harness, build-only)
+Wave 3:            WS-E on pilot traces (templates + URL funnel)
+Wave 4:            WS-C2 (bulk warm, ALL 3500, both scrape modes)
+Wave 5 (parallel): WS-C3 (sized teacher run)          WS-F (findability, warm cache)
+then:              WS-G frozen eval RUN; WS-E re-run over the full corpus
 ```
 
-- WS-A, WS-B, WS-D depend only on the frozen contracts → launch together.
-- WS-C and WS-F both need WS-A's `Cache` + WS-B's list → next wave.
-- WS-G needs only contracts + splits to *build*; its frozen *run* waits on WS-H.
-- WS-E strictly needs WS-C output; WS-H needs WS-E + WS-F → last.
+- WS-C1 needs only Wave-1 output → start immediately; WS-G build alongside.
+- WS-E's pilot templates drive WS-C2; WS-C2's warm cache makes WS-C3 fast and
+  WS-F cheaper (Opus reads cached pages instead of waiting on scrapes).
+- The WS-C3 trace count is a **decision gate** after the pilot, not a default.
 
 To avoid file collisions when fanning out agents: each workstream owns **its own
 new file(s)**; the only shared edits are WS-A touching
@@ -380,17 +393,19 @@ early so Wave 2 agents import a stable signature.
 - **English-only** sourcing (US/CA/UK/AU metros to start); corpus episodes are
   **restriction-free** — dietary-restriction conditioning is deferred, but the
   trace schema records the field so conditioned passes slot in later.
-- Frozen (`canned`) eval over the eval split requires the **explicit WS-H warm
-  pass**; live-policy eval is off the table (not reproducible across days).
+- Frozen (`canned`) eval over the eval split requires the **explicit warm pass
+  (WS-C2)**; live-policy eval is off the table (not reproducible across days).
+- **WS-C is staged (pilot → warm → sized run)**: cache warming is decoupled from
+  paid trace generation; the bulk Sonnet spend is sized only after the ~100-trace
+  pilot is inspected.
 
 **Deferred to Phase 3 (GRPO) — not built now, but design leaves room:**
 - **Student-explores-differently miss rate:** the frozen cache is populated from
   the *teacher's* URLs **and modes**; the student may request another URL — or the
   same URL in the other scrape `mode` — → canned miss. The mode dimension roughly
-  doubles the miss surface. Mitigation is now cheap (local scrape costs CPU, not
-  API credits): WS-C should pre-fetch the "obvious URL set" per restaurant (WS-E's
-  funnel) in **both** `direct` and `browser` modes. Measure the per-mode miss rate
-  before RL and expand the snapshot if high.
+  doubles the miss surface. Mitigation **pulled into Phase 2 as WS-C2** (bulk
+  warm, both modes, all restaurants); what remains deferred is *measuring* the
+  student's per-mode miss rate before RL and expanding the snapshot if high.
 - **Reward correctness ground truth:** schema-validity + heuristics get us far,
   but true menu correctness needs the hand-labeled gold eval subset (start it in
   WS-G). This caps how well distillation can be distinguished from hallucination.
