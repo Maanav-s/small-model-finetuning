@@ -54,10 +54,24 @@ load_dotenv(REPO_ROOT / ".env")
 from backends import build_scrape, build_search, close_pool, has_search_key  # noqa: E402
 from cache import CANNED, Cache, norm_query, norm_scrape, scrape_status  # noqa: E402
 
-# Both scrape modes are warmed per URL: they return genuinely different content
-# and are distinct cache entries (norm_scrape keys on url+mode), and the frozen
-# GRPO cache must cover whichever the student asks for.
-SCRAPE_MODES = ("direct", "browser")
+# Warm the quick "direct" render for every kept URL; escalate to the auto-scroll
+# "browser" render ONLY when direct comes back failed or too thin to hold a full
+# menu. This mirrors the agent's own rule (try direct first, escalate on
+# empty/missing -- prompts._TEACHER_GUIDANCE), so we warm the mode the agent will
+# actually request: a URL that yields a full menu in "direct" is never re-requested
+# in "browser", so blindly warming both ~doubles the slow renders for paths that
+# never run. The two modes remain distinct cache entries (norm_scrape keys on
+# url+mode). Trade-off: a scroll-lazy menu whose direct render clears the bar but
+# is still partial won't get its browser entry warmed here -- the plan defers
+# measuring the student's per-mode miss rate and back-filling those (WS-C2 / Part 4).
+DIRECT_MODE, BROWSER_MODE = "direct", "browser"
+
+# "direct" already internally escalates a client-rendered shell to a NO-SCROLL
+# browser render (>= backends.DIRECT_MIN_CHARS==600 on success), so a direct result
+# below this larger bar is effectively empty or just page chrome, not a menu --
+# the signal to also warm the auto-scroll "browser" render. Heuristic, tunable;
+# an 'error' sentinel always escalates regardless of length.
+WARM_BROWSER_IF_UNDER = 2000
 
 # Obvious dead ends, not warmed. The bot-walled aggregators bounce off headless
 # Chromium (30s timeout -> an 'error' row that "live" would just re-fetch next
@@ -146,30 +160,47 @@ def extract_urls(search_response: str, top_n: int) -> tuple[list[str], list[str]
     return keep, skipped
 
 
-def warm_one(row: dict, search_fn, scrape_fn, top_n: int, sleep_s: float) -> dict:
-    """Warm one restaurant: 1 cached search + up to top_n*2 cached scrapes.
+def _scrape(scrape_fn, url: str, mode: str, sleep_s: float) -> str:
+    """One cached scrape + a politeness sleep only if it actually hit the network."""
+    t0 = time.monotonic()
+    result = scrape_fn(url, mode)  # cached; each (url, mode) is a distinct key
+    if sleep_s and time.monotonic() - t0 > NETWORK_CALL_MIN_S:
+        time.sleep(sleep_s)
+    return result
 
-    Sleeps only after calls that actually hit the network (elapsed-time tell),
-    so a re-run over warm rows doesn't serialize on politeness sleeps. Returns
-    a summary dict; counters are aggregated by the caller (no shared state).
+
+def warm_one(row: dict, search_fn, scrape_fn, top_n: int, sleep_s: float) -> dict:
+    """Warm one restaurant: 1 cached search + up to top_n direct scrapes, each
+    escalated to a browser render only when the direct result is thin/failed
+    (WARM_BROWSER_IF_UNDER) -- the mode the agent would actually request next.
+
+    Returns a summary dict; counters are aggregated by the caller (no shared state).
     """
     query = build_query(row)
     response = search_fn(query)  # cached: hit is free, miss fetches+stores
     urls, skipped = extract_urls(response, top_n)
 
-    scrape_errors = 0
+    n_direct = n_browser = scrape_errors = 0
     for url in urls:
-        for mode in SCRAPE_MODES:
-            t0 = time.monotonic()
-            result = scrape_fn(url, mode)  # cached, both modes distinct keys
-            if scrape_status(result) == "error":
+        result = _scrape(scrape_fn, url, DIRECT_MODE, sleep_s)
+        n_direct += 1
+        direct_failed = scrape_status(result) == "error"
+        if direct_failed:
+            scrape_errors += 1
+        # Escalate to the auto-scroll render only when direct is failed or too
+        # thin to be a menu -- otherwise the browser entry is one the agent never
+        # asks for (it keeps the good direct result).
+        if direct_failed or len(result) < WARM_BROWSER_IF_UNDER:
+            bresult = _scrape(scrape_fn, url, BROWSER_MODE, sleep_s)
+            n_browser += 1
+            if scrape_status(bresult) == "error":
                 scrape_errors += 1
-            if sleep_s and time.monotonic() - t0 > NETWORK_CALL_MIN_S:
-                time.sleep(sleep_s)
     return {
         "rid": row["restaurant_id"], "name": row["name"], "query": query,
         "urls": len(urls), "urls_skipped": len(skipped),
-        "no_results": not urls and not skipped, "scrape_errors": scrape_errors,
+        "no_results": not urls and not skipped,
+        "scrape_direct": n_direct, "scrape_browser": n_browser,
+        "scrape_errors": scrape_errors,
     }
 
 
@@ -192,7 +223,7 @@ def dry_run(selection: list[dict], cache_path: str, top_n: int) -> None:
             continue
         urls, skipped = extract_urls(response, top_n)
         for url in urls:
-            print(f"  scrape x{len(SCRAPE_MODES)} (direct+browser): {url}")
+            print(f"  scrape: {url} (direct, + browser only if direct is thin)")
         for url in skipped:
             print(f"  skip (dead end): {url}")
     peek.close()
@@ -208,7 +239,7 @@ def main():
     args = parse_args()
     selection = load_selection(args.data_dir, args.offset, args.limit)
     print(f"selection: {len(selection)} restaurants (offset {args.offset}, limit {args.limit}); "
-          f"1 search + <= {args.top_n} urls x {len(SCRAPE_MODES)} scrape modes each")
+          f"1 search + <= {args.top_n} urls (direct, + browser only when direct is thin)")
 
     if args.dry_run:
         dry_run(selection, args.cache_path, args.top_n)
@@ -249,6 +280,7 @@ def main():
             consecutive_failures = 0
             results.append(summary)
             print(f"[{i}/{len(selection)}] {summary['name']!r}: urls={summary['urls']} "
+                  f"(direct={summary['scrape_direct']} browser={summary['scrape_browser']}) "
                   f"skipped={summary['urls_skipped']} scrape_errors={summary['scrape_errors']}"
                   f"{'  (no search results)' if summary['no_results'] else ''}")
 
@@ -259,9 +291,14 @@ def main():
           f"{len(selection) - len(results) - len(failures)} not attempted "
           f"({elapsed:.1f}s, {elapsed / max(1, len(results)):.1f}s/restaurant)")
     if results:
+        n_direct = sum(r["scrape_direct"] for r in results)
+        n_browser = sum(r["scrape_browser"] for r in results)
         print(f"urls planned: {sum(r['urls'] for r in results)}  "
               f"dead ends skipped: {sum(r['urls_skipped'] for r in results)}  "
               f"searches with no results: {sum(r['no_results'] for r in results)}")
+        print(f"scrape calls: {n_direct} direct + {n_browser} browser (escalated on thin/failed "
+              f"direct) = {n_direct + n_browser} total; "
+              f"{100 * n_browser / max(1, n_direct):.0f}% escalation rate")
         print(f"scrape calls returning a failure sentinel: "
               f"{sum(r['scrape_errors'] for r in results)} (stored as 'error'; a re-run re-fetches them)")
     # writes = entries actually warmed this run; hits = already cached (a fully

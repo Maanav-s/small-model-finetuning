@@ -96,10 +96,15 @@ class TestBuildQuery:
 
 
 # ---------------------------------------------------------------------------
-# warm_one: cached search -> both scrape modes per URL, keys match setup_tools'
+# warm_one: cached search -> direct scrape per URL, browser only when direct is
+# thin/failed; keys match setup_tools'
 # ---------------------------------------------------------------------------
+_FULL = "# full menu " + "x" * warm_cache.WARM_BROWSER_IF_UNDER  # clears the bar
+_THIN = "# tiny"                                                 # under the bar
+
+
 class TestWarmOne:
-    def test_scrapes_every_url_in_both_modes_through_the_cache(self):
+    def test_full_direct_result_skips_browser(self):
         cache = Cache(":memory:", miss_policy="live")
         search_calls, scrape_calls = [], []
 
@@ -109,7 +114,7 @@ class TestWarmOne:
 
         def fake_scrape(url, mode="direct"):
             scrape_calls.append((url, mode))
-            return f"# menu from {url} ({mode})"
+            return _FULL
 
         search_fn = cache.wrap("search", fake_search, key_fn=norm_query, provider="brave")
         scrape_fn = cache.wrap("scrape", fake_scrape, key_fn=norm_scrape,
@@ -118,23 +123,39 @@ class TestWarmOne:
         summary = warm_cache.warm_one(row, search_fn, scrape_fn, top_n=3, sleep_s=0)
 
         assert search_calls == ["A B menu"]
-        assert scrape_calls == [
-            ("https://a.com/menu", "direct"), ("https://a.com/menu", "browser"),
-            ("https://b.com", "direct"), ("https://b.com", "browser"),
-        ]
+        # Direct cleared the bar on both URLs -> no browser escalation.
+        assert scrape_calls == [("https://a.com/menu", "direct"), ("https://b.com", "direct")]
+        assert summary["scrape_direct"] == 2 and summary["scrape_browser"] == 0
         assert summary["urls"] == 2 and summary["scrape_errors"] == 0
 
         # Idempotency: a second pass is all cache hits -- zero new backend calls.
         warm_cache.warm_one(row, search_fn, scrape_fn, top_n=3, sleep_s=0)
-        assert len(search_calls) == 1 and len(scrape_calls) == 4
-        assert cache.stats()["hits"] == 5  # 1 search + 4 scrapes replayed
-
+        assert len(search_calls) == 1 and len(scrape_calls) == 2
         # The warmed rows answer the SAME keys the agent's setup_tools wiring
         # would compute for an identical query / url+mode.
         assert cache._get("search", norm_query("a b   MENU")) is not None
+        assert cache._get("scrape", norm_scrape("https://a.com/menu", "direct")) is not None
+
+    def test_thin_direct_result_escalates_to_browser(self):
+        cache = Cache(":memory:", miss_policy="live")
+        scrape_calls = []
+
+        def fake_scrape(url, mode="direct"):
+            scrape_calls.append((url, mode))
+            return _THIN
+
+        search_fn = cache.wrap("search", lambda q: brave_response("https://a.com/menu"),
+                               key_fn=norm_query)
+        scrape_fn = cache.wrap("scrape", fake_scrape, key_fn=norm_scrape, status_fn=scrape_status)
+        row = {"restaurant_id": "abc", "name": "A", "city": "B"}
+        summary = warm_cache.warm_one(row, search_fn, scrape_fn, top_n=1, sleep_s=0)
+
+        # Thin direct -> escalate; both modes warmed as distinct keys.
+        assert scrape_calls == [("https://a.com/menu", "direct"), ("https://a.com/menu", "browser")]
+        assert summary["scrape_direct"] == 1 and summary["scrape_browser"] == 1
         assert cache._get("scrape", norm_scrape("https://a.com/menu", "browser")) is not None
 
-    def test_scrape_failure_sentinels_counted(self):
+    def test_direct_failure_escalates_and_counts_both(self):
         cache = Cache(":memory:", miss_policy="live")
         search_fn = cache.wrap(
             "search", lambda q: brave_response("https://a.com"), key_fn=norm_query
@@ -145,7 +166,9 @@ class TestWarmOne:
         )
         row = {"restaurant_id": "abc", "name": "A", "city": "B"}
         summary = warm_cache.warm_one(row, search_fn, scrape_fn, top_n=1, sleep_s=0)
-        assert summary["scrape_errors"] == 2  # both modes returned the sentinel
+        # Direct errored -> escalate to browser; browser also errored -> both counted.
+        assert summary["scrape_direct"] == 1 and summary["scrape_browser"] == 1
+        assert summary["scrape_errors"] == 2
 
 
 # ---------------------------------------------------------------------------
@@ -195,6 +218,6 @@ class TestDryRun:
         pre.close()
 
         out = self._run(monkeypatch, capsys, data_dir, cache_path)
-        assert "scrape x2 (direct+browser): https://ssamjang.com/menu" in out
+        assert "scrape: https://ssamjang.com/menu (direct, + browser only if direct is thin)" in out
         assert "skip (dead end): https://www.doordash.com/store/ssamjang" in out
         assert out.count("search not cached yet") == 1  # only the un-warmed row
