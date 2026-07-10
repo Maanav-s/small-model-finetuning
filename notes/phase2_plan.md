@@ -70,6 +70,8 @@ scripts/analyze_queries.py      # WS-E
 scripts/label_findability.py    # WS-F
 scripts/eval_menu.py            # WS-G
 scripts/warm_cache.py           # WS-C2 (bulk warm, all restaurants; subsumes old WS-H)
+scripts/build_sft.py            # WS-I (traces/ -> student-rendered SFT dataset)
+data/sft/train.jsonl            # WS-I output: capped, student-prompt SFT examples
 ```
 
 `data/` is git-ignored; its **source of truth is S3** (WS-D syncs it).
@@ -257,10 +259,25 @@ spend.
 **WS-C2 · Bulk programmatic warm** (`scripts/warm_cache.py`, subsumes old WS-H)
 — for **ALL 3500 restaurants (train + eval)**, no Anthropic tokens: run the
 WS-E-mined query templates through the cached search (`live` policy), take the
-top-K result URLs (funnel-domain-weighted), scrape each in `direct` mode and
-promising ones in `browser` mode too (mode is part of the cache key). Cheap
-(paid Brave + local CPU); re-runnable (`live` = no-op on warm keys, self-heals
-`error` rows). This is also what makes the frozen eval + GRPO cache possible.
+top-K result URLs (funnel-domain-weighted), and scrape each.
+
+- **Conditional mode escalation (revised 2026-07-03):** scrape each URL in
+  `direct` mode; escalate the SAME URL to `browser` mode **only when the direct
+  result comes back thin** (empty / clearly missing a menu — the same
+  shell-detection signal the agent uses, and the same rule the teacher prompt's
+  scrape strategy encodes). Do **not** blindly warm both modes for every URL:
+  that ~doubles the slow browser renders (measured ~9.5 s/restaurant → ~9–10 h
+  for 3500 at 2 workers, vs ~5–6 h escalating conditionally) for paths the
+  student rarely takes. Warming the mode the agent *actually* requests is what
+  matters for the frozen-cache hit rate; a URL that scrapes cleanly in `direct`
+  is never requested in `browser`, so its `browser` entry is dead weight.
+  (Rationale: on this 15 GB / no-swap / 4-core box the browser render is the
+  wall-clock bottleneck, not the network — so cutting redundant renders, not
+  adding bandwidth or IPs, is the lever. Keep `--workers` ≤ 3–4.)
+
+Cheap (paid Brave + local CPU); re-runnable (`live` = no-op on warm keys,
+self-heals `error` rows). This is also what makes the frozen eval + GRPO cache
+possible.
 
 **WS-C3 · Sized teacher run** (same `build_corpus.py`, higher `--limit`) — trace
 count decided AFTER inspecting the pilot (all 3000? fewer? findability-
@@ -352,6 +369,44 @@ cache scores nothing but abstention, and live-policy eval isn't reproducible
 across days. Generalizing it to train+eval also pre-pays the GRPO frozen-cache
 mitigation Part 4 deferred.
 
+### WS-I · Trace → SFT dataset `scripts/build_sft.py` (bridge to Phase 3)
+**Deps:** WS-C3 (the traces to transform). The one seam where the teacher/student
+prompt swap happens; also where the SFT recipe decisions (Part 4) are implemented.
+
+The per-file `traces/<id>.json` are the **immutable capture** (raw, model-agnostic,
+the unit manual not-found filtering operates on) — *not* the training format.
+`build_sft.py` is the transform that materializes the trainable dataset, and it
+must do three things the raw traces deliberately don't:
+
+- **Re-render under the *student* prompt + Gemma's chat template.** The stored
+  `messages` are Anthropic content blocks generated under the *teacher* prompt.
+  The SFT target is that same trajectory re-rendered with the **student** system
+  prompt (`build_system_prompt(variant="student")`) through
+  `tokenizer.apply_chat_template`. This is the whole point of context distillation
+  and the only place the swap occurs. Mind the Gemma template's prefix-preservation
+  + reasoning-guard rules (CLAUDE.md): mid-episode `reasoning` fields are stripped
+  at render, so the trained tokens must match how they render at inference —
+  re-render, don't hand-assemble. Also translate Anthropic tool_use/tool_result
+  blocks into the Gemma bundled-turn shape the loop already uses.
+- **Apply the same `MAX_TOOL_CHARS` cap the student sees at inference.** Traces
+  store raw uncapped tool results (median ~79 KB, max ~815 KB of scraped
+  markdown); training on uncapped results the student never sees is a
+  train/inference mismatch. Cap at transform time to match `tools.py`.
+- **Consolidate** the loose per-episode files into a single streamable
+  `data/sft/train.jsonl` (one example/line; TRL `SFTTrainer` / HF `datasets` read
+  it natively). If the repeated markdown makes it unwieldy at 1000+ traces,
+  Parquet is the columnar/compressed fallback — but default to JSONL.
+
+Filtering/labels: drop traces flagged by manual not-found review; honor the SFT
+recipe decisions in Part 4 (found=false inclusion + ratio cap; reasoning
+treatment). Record provenance (`restaurant_id`, `model`, `cache_version`) per
+example so a dataset row traces back to its capture.
+- **Done when:** `train.jsonl` re-renders every kept trace losslessly (round-trip:
+  the rendered assistant turns tokenize back to the same tool calls / final JSON
+  the trace recorded), the **student** prompt appears (teacher guidance absent),
+  tool results are capped, and a printed summary shows found=true/false counts and
+  the found=false ratio.
+
 ---
 
 ## Part 3 — Dependency graph & suggested waves
@@ -359,11 +414,12 @@ mitigation Part 4 deferred.
 ```
 Wave 0 (DONE):     contracts + `data/` git-ignore + run_episode trace-return change
 Wave 1 (DONE):     WS-A (cache)      WS-B (sourcing)      WS-D (s3 sync)
-Wave 2 (parallel): WS-C1 (pilot ~100 traces)          WS-G (eval harness, build-only)
-Wave 3:            WS-E on pilot traces (templates + URL funnel)
-Wave 4:            WS-C2 (bulk warm, ALL 3500, both scrape modes)
-Wave 5 (parallel): WS-C3 (sized teacher run)          WS-F (findability, warm cache)
+Wave 2 (DONE):     WS-C1 (pilot ~100 traces)          WS-G (eval harness, build-only)
+Wave 3 (DONE):     WS-E on pilot traces (templates + URL funnel)
+Wave 4:            WS-C2 (bulk warm, ALL 3500, direct + browser-on-thin)
+Wave 5 (parallel): WS-C3 (sized teacher run, ~1000)    WS-F (findability, warm cache)
 then:              WS-G frozen eval RUN; WS-E re-run over the full corpus
+Wave 6:            WS-I (traces -> student-rendered SFT dataset) — bridge to Phase 3
 ```
 
 - WS-C1 needs only Wave-1 output → start immediately; WS-G build alongside.
@@ -402,15 +458,85 @@ early so Wave 2 agents import a stable signature.
 **Deferred to Phase 3 (GRPO) — not built now, but design leaves room:**
 - **Student-explores-differently miss rate:** the frozen cache is populated from
   the *teacher's* URLs **and modes**; the student may request another URL — or the
-  same URL in the other scrape `mode` — → canned miss. The mode dimension roughly
-  doubles the miss surface. Mitigation **pulled into Phase 2 as WS-C2** (bulk
-  warm, both modes, all restaurants); what remains deferred is *measuring* the
-  student's per-mode miss rate before RL and expanding the snapshot if high.
+  same URL in the other scrape `mode` — → canned miss. Mitigation **pulled into
+  Phase 2 as WS-C2** (bulk warm, all restaurants; `direct` for every kept URL plus
+  a `browser` entry wherever `direct` came back thin — the conditional escalation
+  above, so the warmed modes match the ones the agent requests). What remains
+  deferred is *measuring* the student's per-URL/per-mode miss rate before RL and
+  expanding the snapshot if high — including back-filling `browser` entries for
+  URLs the student requests it on but `direct` had sufficed for the teacher.
 - **Reward correctness ground truth:** schema-validity + heuristics get us far,
   but true menu correctness needs the hand-labeled gold eval subset (start it in
   WS-G). This caps how well distillation can be distinguished from hallucination.
 - **Cache versioning discipline:** bump `cache_version` whenever the stored
   response shape changes; never mutate rows in place.
+
+---
+
+## Part 5 — SFT recipe (WS-I): what goes into `train.jsonl`
+
+The transform is mechanical; the *content* decisions below are what make or break
+distillation. Some are locked, one is deliberately staged.
+
+**Locked:**
+- **Train on the `found=false` traces (kept, not dropped).** They are the
+  anti-hallucination and abstention signal — a small model with no not-found
+  examples learns to always emit *a* menu, the exact failure GRPO would then have
+  to unlearn. They also carry the identity/exhaustion reasoning we most want
+  (see below). *Guard:* keep the found=false **ratio modest and honest** (mirror
+  the WS-F reward-hacking guard) — too many not-founds teaches giving up. The
+  ratio is a printed WS-I summary stat; the manual not-found review removes the
+  *false* negatives (tool-failure, not genuine) so what remains is real
+  abstention. Rough target: hold found=false near its natural rate (~10–15% from
+  the pilot), not inflated.
+- **Student prompt at train time = student prompt at inference.** WS-I renders
+  with `variant="student"`; never leak teacher guidance into the target.
+
+**Open — distill the teacher's reasoning, or train action-only? (decide at WS-I):**
+This is a genuine fork; here is the decision-relevant context.
+
+- **The Gemma-template constraint is decisive.** Its reasoning-guard strips
+  `reasoning`/`reasoning_content` from every assistant turn *before the last user
+  message* (CLAUDE.md, "Prefix-preservation"). In a multi-tool episode the
+  valuable reasoning is the **per-step** decision (is this the right restaurant?
+  own-site vs delivery app? do I have enough to answer?) — all mid-episode, so
+  putting the teacher's thinking into the `reasoning` field is **silently dropped
+  at render**. Naive "carry Sonnet's thinking blocks across" therefore trains on
+  final-turn reasoning only (which is just "format the JSON" — low value).
+- **The teacher's raw CoT may not even be available.** Sonnet runs adaptive
+  thinking; with summarized/omitted display the trace holds a summary or empty
+  thinking, not the verbatim chain — so "distill the CoT" can mean distilling a
+  summary in Sonnet's voice, not the real reasoning.
+- **Three viable recipes, increasing ambition:**
+  1. **Action-only (behavioral cloning).** Student emits tool calls + final JSON,
+     no reasoning. Cheapest, most robust for a 4B model, and it frees the
+     inference token budget (reasoning competes with `MAX_TOKENS` and the tool
+     budget). The policy (source selection, identity check, persistence — now all
+     in `_TEACHER_GUIDANCE`) is distilled as *action patterns*. Risk: less
+     interpretable; hard behaviors like identity verification may need more
+     contrastive examples since there's no verbalized check.
+  2. **Final-turn reasoning only.** Low value (final turn is just formatting);
+     skip.
+  3. **Per-step reasoning as *visible text*, not the reasoning field.** In the
+     agent loop, an assistant turn may carry visible text *before* its tool call;
+     visible content is NOT stripped by the reasoning-guard and stays
+     prefix-preserving. So terse, student-voice rationale ("first result is a
+     DoorDash link — checking the own site instead"; "this page is a different
+     city — not the same restaurant") emitted before each tool call *survives
+     render* and trains the exact decisions we care about. Cost: a transform that
+     condenses teacher thinking into SHORT visible lines (Sonnet's raw thinking is
+     too long for a 4B), more inference tokens, and the output-format rule must
+     stay scoped to the *final* answer only.
+- **Recommendation (staged, matches the project's "add data, don't leak prompt"
+  principle):** start with **recipe 1 (action-only)** for the first SFT run — it
+  is the cheapest baseline and the WS-G eval already measures whether identity /
+  source-selection behavior distilled from actions alone. **If a specific behavior
+  fails to distill, add recipe-3 visible reasoning *surgically for that decision*
+  (and especially on the found=false subset, where the identity/exhaustion
+  rationale is the whole point)** rather than blanket-distilling CoT everywhere.
+  Note this means the *capture* need not change — recipe 3 is reconstructable from
+  the teacher's thinking already in the traces, so the choice stays open at WS-I
+  time and does not gate the WS-C3 corpus run.
 
 ---
 

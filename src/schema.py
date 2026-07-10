@@ -91,12 +91,30 @@ MENU_SCHEMA = {
 
 
 def extract_json(text: str):
-    """Best-effort: strip markdown fences and parse the answer as JSON.
+    """Best-effort: strip markdown fences / surrounding prose and parse as JSON.
 
     Returns (obj, None) on success or (None, error_message) on failure.
+
+    The model is told to reply with the raw JSON object only, but ~5% of teacher
+    episodes still wrap it in a leading narration ("Now I'll compile the JSON...")
+    or trailing commentary while the JSON object itself is complete and valid.
+    Discarding those wastes a paid episode with a good menu inside, so we recover
+    it: on a direct-parse failure, find the first `{` and decode a single JSON
+    value from there (raw_decode stops at the end of the first complete object, so
+    braces inside strings are handled and trailing prose is ignored). This parser
+    is shared by the corpus builder's schema_valid gate, the eval harness, and the
+    future GRPO reward, so robustness here directly affects yield and reward
+    correctness. (For SFT the *raw* preamble still lives in the trace's final turn;
+    WS-I renders from a cleaned final answer -- see notes/phase2_plan.md.)
     """
-    text = re.sub(r"^```(?:json)?|```$", "", text.strip(), flags=re.MULTILINE).strip()
+    stripped = re.sub(r"^```(?:json)?|```$", "", text.strip(), flags=re.MULTILINE).strip()
     try:
-        return json.loads(text), None
-    except json.JSONDecodeError as e:
-        return None, str(e)
+        return json.loads(stripped), None
+    except json.JSONDecodeError as err:
+        start = stripped.find("{")
+        if start != -1:  # decode one object from the first '{' (drops leading
+            try:        # narration and any trailing commentary; None if truncated)
+                return json.JSONDecoder().raw_decode(stripped[start:])[0], None
+            except json.JSONDecodeError:
+                pass
+        return None, str(err)

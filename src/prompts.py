@@ -12,16 +12,19 @@ default, kept for the render-only demos and back-compat (LIVE_SYSTEM_PROMPT is a
 legacy alias from when an offline stub prompt variant existed).
 
 Teacher vs student variant (context distillation). build_system_prompt(variant=)
-selects between two live prompts that differ ONLY by a block of *source-selection
-guidance* (_SOURCE_GUIDANCE: prefer the restaurant's own site, avoid delivery
+selects between two live prompts that differ ONLY by a teacher-only block of
+*working guidance* (_TEACHER_GUIDANCE): the scrape-mode strategy (direct-first,
+browser-fallback), search persistence, identity verification (confirm the page is
+the right restaurant), and source selection (prefer the own site, avoid delivery
 apps). The "teacher" variant (the default -- what we test and generate SFT data
 with) includes it; the "student" variant omits it. The intent is context
 distillation: train the student on teacher-generated trajectories under the
-*student* prompt, so the behavior the guidance elicits is baked into the weights
-rather than carried in the prompt at inference (see CLAUDE.md). The guidance is a
-behavioral nudge that does NOT change what the correct menu is, so it is safe to
-drop from the student; everything that DOES define the task -- schema, tools,
-dietary restrictions -- is identical across variants.
+*student* prompt, so the behaviors that guidance elicits are baked into the
+weights rather than carried in the prompt at inference (see CLAUDE.md). Every item
+in the block is a behavioral nudge about HOW to work that does NOT change what the
+correct menu is, so it is safe to drop from the student; everything that DOES
+define the task -- schema, the food-only scope rule, dietary restrictions, tools,
+and the shared tool-loop orientation -- is identical across variants.
 """
 
 from __future__ import annotations
@@ -136,39 +139,56 @@ shape, with `found` set to false and a short `notes` explaining why:
 {not_found}
 """
 
-# Appended so the model knows how to use the scrape tool.
-_LIVE_RULES = """\
+# Appended for BOTH variants: the bare mechanics of the tool loop (search returns
+# links; scrape reads a page; YOU write the JSON). This is orientation, not
+# strategy -- it biases neither the source nor the scrape mode -- so it is shared.
+# The mode mechanics (direct vs browser) live in the scrape_url docstring, which is
+# identical across variants; HOW to choose a mode is teacher-only guidance below.
+_SHARED_TOOL_ORIENTATION = """\
 
 Tool-use rules:
 - `web_search` returns result titles, URLs, and snippets. To read a full menu,
   call `scrape_url` with one of those URLs; it returns the page as markdown.
-- `scrape_url` takes a `mode`: "direct" (a plain, quick fetch of the page HTML) or
-  "browser" (loads the page in a real browser that runs its JavaScript; slower).
-  ALWAYS try mode="direct" first. If it comes back empty or clearly missing the
-  menu (some pages only reveal their menu after JavaScript runs), retry the SAME
-  URL with mode="browser". Neither mode is always better: some sites block the
-  browser and return little while "direct" returns more, and vice versa. If you try
-  both, KEEP whichever result actually contains the menu (the fuller one) - do NOT
-  assume "browser" is better, and do NOT discard a good "direct" result.
 - Read the returned text yourself and build the menu JSON in YOUR final answer.
   Do NOT expect a tool to return structured menu data - YOU produce the JSON.
-- Only report the menu as not found (found=false) after search AND a scrape of the
-  most promising result(s) still turn up no menu - don't give up after one search.
 """
 
-# Teacher-only source-selection guidance -- the block that "teacher" includes and
-# "student" omits (see the module docstring on context distillation). It is a
-# behavioral nudge about WHICH source to read, not what the menu is, so the student
-# can learn it from teacher trajectories instead of being told.
-_SOURCE_GUIDANCE = """\
+# Teacher-only working guidance -- the block that "teacher" includes and "student"
+# omits (see the module docstring on context distillation). Every item shapes HOW
+# the agent works, not WHAT the correct menu is, so the student learns it from the
+# teacher's trajectories instead of being told. Keep it strictly target-neutral:
+# nothing here may change which items belong in the menu (that would make the
+# student's re-rendered SFT target incoherent) -- the food-only scope rule and the
+# dietary filter live in the shared base for exactly that reason.
+_TEACHER_GUIDANCE = """\
 
-Source-selection guidance:
-- Prefer the restaurant's OWN website or online-ordering page (often hosted on
-  Square, Toast, Clover, or BentoBox). These usually list the complete menu and
-  scrape cleanly with mode="direct".
-- AVOID third-party delivery apps and directories - DoorDash, Uber Eats, Grubhub,
-  Yelp. They are JavaScript-heavy and/or block scraping, so they often yield only
-  a partial menu or nothing. Only fall back to them if no better source turns up.
+Working guidance:
+- Scrape strategy: `scrape_url` takes a `mode` - "direct" (a plain, quick fetch of
+  the page HTML) or "browser" (loads the page in a real browser that runs its
+  JavaScript; slower). ALWAYS try mode="direct" first. If it comes back empty or
+  clearly missing the menu (some pages only reveal their menu after JavaScript
+  runs), retry the SAME URL with mode="browser". Neither mode is always better:
+  some sites block the browser and return little while "direct" returns more, and
+  vice versa. If you try both, KEEP whichever result actually contains the menu
+  (the fuller one) - do NOT assume "browser" is better, and do NOT discard a good
+  "direct" result.
+- Persistence: do NOT give up after a single search. Only report the menu as not
+  found (found=false) after search AND a scrape of the most promising result(s)
+  still turn up no menu.
+- Confirm identity before extracting: make sure the page you are reading is the
+  SAME restaurant you were asked about - the name AND the city/neighborhood or
+  address should match. Restaurant names are often shared by unrelated businesses
+  in different cities, so a similar name in the wrong place is a DIFFERENT
+  restaurant, not the one you want. If the given name looks slightly off (a
+  misspelling or abbreviation), try close variants in your searches. If you cannot
+  confirm a page is the right restaurant, treat the menu as not found rather than
+  extract the wrong restaurant's menu.
+- Source selection: prefer the restaurant's OWN website or online-ordering page
+  (often hosted on Square, Toast, Clover, or BentoBox). These usually list the
+  complete menu and scrape cleanly with mode="direct". AVOID third-party delivery
+  apps and directories - DoorDash, Uber Eats, Grubhub, Yelp. They are
+  JavaScript-heavy and/or block scraping, so they often yield only a partial menu
+  or nothing. Only fall back to them if no better source turns up.
 """
 
 # Injected on the final turn when the tool-call budget is spent (see the agent
@@ -196,8 +216,9 @@ def build_system_prompt(dietary_restrictions=None, *, variant: str = "teacher") 
 
     dietary_restrictions: None / "" / [] -> no filtering (whole menu); a string or
     list of restriction phrases -> filter the menu to complying items only.
-    variant: "teacher" (default) includes the source-selection guidance
-    (_SOURCE_GUIDANCE); "student" omits it. See the module docstring for the
+    variant: "teacher" (default) includes the teacher-only working guidance
+    (_TEACHER_GUIDANCE: scrape strategy, persistence, identity check, source
+    selection); "student" omits it. See the module docstring for the
     context-distillation intent.
     """
     if variant not in _VARIANTS:
@@ -210,9 +231,9 @@ def build_system_prompt(dietary_restrictions=None, *, variant: str = "teacher") 
         dietary=_dietary_block(restrictions),
         not_found=NOT_FOUND_SNIPPET,
     )
-    prompt += _LIVE_RULES
+    prompt += _SHARED_TOOL_ORIENTATION
     if variant == "teacher":
-        prompt += _SOURCE_GUIDANCE
+        prompt += _TEACHER_GUIDANCE
     return prompt
 
 

@@ -47,7 +47,7 @@ from claude_agent import MODEL_ID, run_episode  # noqa: E402
 from schema import MENU_SCHEMA, extract_json  # noqa: E402
 from tools import setup_tools  # noqa: E402
 
-PROMPT_VARIANT = "teacher"  # what generates SFT data; the student re-render comes later
+PROMPT_VARIANT = "teacher"  # default: what generates SFT data (--prompt-variant to override)
 # Abort the run if this many episodes fail in a row -- a broken key/tool should
 # not burn API budget across the whole selection.
 MAX_CONSECUTIVE_FAILURES = 5
@@ -62,6 +62,9 @@ def parse_args():
     parser.add_argument("--workers", type=int, default=3,
                         help="thread-pool size (one pooled Chromium per worker; keep <=4 on the 15GB box)")
     parser.add_argument("--model", default=MODEL_ID, help=f"teacher model id (default {MODEL_ID})")
+    parser.add_argument("--prompt-variant", choices=["teacher", "student"], default=PROMPT_VARIANT,
+                        help=f"system-prompt variant (default {PROMPT_VARIANT}; 'student' is for "
+                             "prompt-sufficiency smoke tests, not SFT-corpus generation)")
     parser.add_argument("--cache-policy", choices=["live", "canned", "error"], default="live",
                         help="cache miss policy (default live: fetch+store, the populate pass)")
     parser.add_argument("--cache-path", default=str(REPO_ROOT / "data" / "cache.sqlite"))
@@ -132,7 +135,7 @@ def run_one(client, row, tools, registry, system_prompt, args, cache, traces_dir
         "restaurant_name": row["name"],
         "episode_input": episode_input,
         "model": args.model,
-        "prompt_variant": PROMPT_VARIANT,
+        "prompt_variant": args.prompt_variant,
         "dietary_restrictions": None,
         "cache_version": cache.cache_version,
         "messages": [
@@ -183,7 +186,7 @@ def main():
 
     cache = Cache(args.cache_path, miss_policy=args.cache_policy)
     tools, registry, system_prompt = setup_tools(
-        dietary_restrictions=None, variant=PROMPT_VARIANT, cache=cache
+        dietary_restrictions=None, variant=args.prompt_variant, cache=cache
     )
     client = anthropic.Anthropic()
 
