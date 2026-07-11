@@ -39,7 +39,7 @@ in the repo-root `.env` (git-ignored) and mirror the names into
 | 0.6 | **Google Places (New) API key** — *optional* | metadata enrichment (WS-B) | Only if you want price tier / chain signals beyond OSM. Requires a **GCP project with billing enabled**; create + **restrict** the key; add `GOOGLE_PLACES_API_KEY`. Skippable — OSM alone is enough to start. |
 | 0.7 | **OSM / Overpass** | bulk restaurant list | **No account, no key.** Just be polite with rate limits (or point at a specific Overpass mirror). |
 | 0.8 | **Add Python deps** | several | `uv add boto3` (S3), `uv add jsonschema` (validate against `MENU_SCHEMA`). Overpass/Places use the existing `requests`. |
-| 0.9 | **Scope knobs — DECIDED** | WS-B / WS-C | **English-only**; default regions = English-speaking metros (US/CA/UK/AU — WS-B ships the concrete bbox list as its CLI default); target **~3k train + ~500 eval**. Corpus episodes are **restriction-free** (no dietary restrictions this phase; the trace schema still records the field so later restriction-conditioned passes slot in). These stay CLI args. |
+| 0.9 | **Scope knobs — DECIDED** | WS-B / WS-C | **English-only**; default regions = English-speaking metros (US/CA/UK/AU — WS-B ships the concrete bbox list as its CLI default); target **~3k train + ~500 eval**. WS-C3 corpus is **mixed**: 60% restriction-free + 40% dietary-conditioned (3:2 via `--conditioned-frac`), one build → one SFT run; the restriction is a visible per-episode input recorded in the trace, not distilled. These stay CLI args. |
 
 You do **not** need a HuggingFace account for this phase (S3 is the artifact
 store). HF login is still only required to pull the gated Gemma weights (Phase 1).
@@ -180,7 +180,8 @@ without touching the source list).
 `prompt_variant`/`dietary_restrictions`/`cache_version` record what the teacher
 actually ran with: context distillation re-renders these traces under the
 **student** prompt later, which is only sound if we know the teacher-side config
-(episodes are restriction-free this phase, so `dietary_restrictions` is null).
+(`dietary_restrictions` is null for free episodes, the restriction phrase list
+for conditioned ones — see WS-C3's mixed corpus).
 
 ---
 
@@ -283,6 +284,34 @@ possible.
 count decided AFTER inspecting the pilot (all 3000? fewer? findability-
 filtered?). Runs fast against the warm cache; misses still fetch live so
 trajectories aren't constrained.
+
+**WS-C3 is a MIXED corpus (free + dietary-conditioned), one build for one SFT
+run.** `--conditioned-frac` sets the conditioned share of `--limit`; the sized
+run uses **`--limit 1000 --conditioned-frac 0.4`** → **600 free + 400
+conditioned** (a 3:2 free:conditioned split). Rationale:
+- Filtering is a *narrower* skill than the full agentic loop (search behavior is
+  restriction-independent; only the final "keep complying items" step differs),
+  so it needs solid-minority representation, not a second full corpus. Keeping
+  free dominant (60%) preserves "no restriction → full menu" as the default
+  behavior and guards against over-filtering.
+- A dietary restriction is a per-episode INPUT that changes the target, so it is
+  **visible to both teacher and student** (recorded in `dietary_restrictions`,
+  slotted into the system prompt) — it is NOT distilled away. The student learns
+  the *skill* from restriction-conditioned examples, not the prompt trick.
+- Conditioned episodes **reuse the front of the seeded restaurant order**
+  (`rows[i % len]`, rotating `DIETARY_POOL`), so (a) every one is a warm-cache
+  hit — cost is Anthropic tokens only (~$80 for 400), no new Brave/scrape — and
+  (b) each pairs contrastively with that restaurant's free trace (same menu,
+  restriction flips the target — exactly the conditioning signal). Trace files:
+  free `<rid>.json`, conditioned `<rid>__<slug>.json` (no collision).
+- `DIETARY_POOL` spreads across axes (vegetarian/vegan/gluten-free/dairy-free,
+  single allergens, halal/kosher/pescatarian/keto, + a couple combos) so the
+  student generalizes to unseen phrasings. Some restaurant+restriction combos
+  yield `found=true, menu=[]` (nothing complies) — a valid target, kept.
+- Split discipline for the later conditioned EVAL: draw it from **eval-split**
+  restaurants (unseen restaurant + ideally unseen restriction phrasing) to test
+  that filtering generalizes and the student (no teacher guidance) still avoids
+  leaking drinks / delivery-app sources.
 
 Shared mechanics (all stages):
 - Extract `queries`/`urls` from the message list; validate `final_json` against
@@ -446,9 +475,10 @@ early so Wave 2 agents import a stable signature.
   **product = live** — selected by a flag.
 - Findability is a **build-time label**, not a runtime judgment; Opus judges with
   a generous budget; hand-spot-check the negatives.
-- **English-only** sourcing (US/CA/UK/AU metros to start); corpus episodes are
-  **restriction-free** — dietary-restriction conditioning is deferred, but the
-  trace schema records the field so conditioned passes slot in later.
+- **English-only** sourcing (US/CA/UK/AU metros to start); WS-C3 is a **mixed
+  corpus** — 60% restriction-free + 40% dietary-conditioned (3:2), built in one
+  pass via `--conditioned-frac` so it feeds a single SFT run. The restriction is
+  a visible per-episode input (recorded in `dietary_restrictions`), not distilled.
 - Frozen (`canned`) eval over the eval split requires the **explicit warm pass
   (WS-C2)**; live-policy eval is off the table (not reproducible across days).
 - **WS-C is staged (pilot → warm → sized run)**: cache warming is decoupled from
