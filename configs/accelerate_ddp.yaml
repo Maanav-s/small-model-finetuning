@@ -1,0 +1,23 @@
+# 2-GPU DDP config for scripts/train_sft.py on a RunPod 2x H200 pod.
+# Launch: accelerate launch --config_file configs/accelerate_ddp.yaml scripts/train_sft.py ...
+#
+# Plain DDP (one process per GPU, gradients all-reduced) -- no DeepSpeed/FSDP: a
+# 4B LoRA fits comfortably in one H200's 141 GB, so model/optimizer sharding buys
+# nothing and only adds moving parts. bf16 mixed precision matches the trainer's
+# bf16=True. NVLink is a nice-to-have (check `nvidia-smi topo -m`) but PCIe is fine
+# for a 4B all-reduce.
+compute_environment: LOCAL_MACHINE
+distributed_type: MULTI_GPU
+mixed_precision: bf16
+num_machines: 1
+num_processes: 2
+machine_rank: 0
+gpu_ids: all
+rdzv_backend: static
+same_network: true
+main_training_function: main
+downcast_bf16: 'no'
+tpu_use_cluster: false
+tpu_use_sudo: false
+use_cpu: false
+debug: false
