@@ -445,11 +445,21 @@ Wave 0 (DONE):     contracts + `data/` git-ignore + run_episode trace-return cha
 Wave 1 (DONE):     WS-A (cache)      WS-B (sourcing)      WS-D (s3 sync)
 Wave 2 (DONE):     WS-C1 (pilot ~100 traces)          WS-G (eval harness, build-only)
 Wave 3 (DONE):     WS-E on pilot traces (templates + URL funnel)
-Wave 4:            WS-C2 (bulk warm, ALL 3500, direct + browser-on-thin)
-Wave 5 (parallel): WS-C3 (sized teacher run, ~1000)    WS-F (findability, warm cache)
-then:              WS-G frozen eval RUN; WS-E re-run over the full corpus
-Wave 6:            WS-I (traces -> student-rendered SFT dataset) — bridge to Phase 3
+Wave 4 (DONE):      WS-C2 (bulk warm, ALL 3500, direct + browser-on-thin)
+Wave 5 (DONE):      WS-C3 (mixed 1000-trace teacher run, 600 free + 400 conditioned)
+                   WS-F (findability, warm cache) — NOT yet built
+then:              WS-G frozen eval RUN (scaffold built: scripts/eval_split.py); WS-E re-run over the full corpus
+Wave 6 (BUILT):     WS-I (scripts/build_sft.py) + SFT trainer (scripts/train_sft.py, LoRA/2×H200) — bridge to Phase 3
 ```
+
+**WS-C3 result (2026-07-12):** 1000 traces under `data/traces/` — 600 free
+(100% schema-valid, 94.5% found, mean 54 items) + 400 dietary-conditioned (99.5%
+schema-valid, 92.2% found, **mean 29 items** — roughly half the free item count,
+confirming the teacher actually filtered to the restriction rather than dumping
+the full menu). 0 episode failures; not-found = 68/1000 (6.8%), a healthy natural
+abstention rate. Remaining before the SFT build: (1) manual not-found review →
+`--reject-list`, (2) push `data/` (traces + cache) to S3, (3) `build_sft.py` on
+the reviewed corpus → `data/sft/train.jsonl`.
 
 - WS-C1 needs only Wave-1 output → start immediately; WS-G build alongside.
 - WS-E's pilot templates drive WS-C2; WS-C2's warm cache makes WS-C3 fast and

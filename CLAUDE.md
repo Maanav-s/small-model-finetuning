@@ -4,11 +4,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-Fine-tune a small open-weight LLM (`google/gemma-4-E4B-it`) to take a restaurant name as input and return its menu as structured JSON, using **web search + scraping** as inference-time tools. The phases: **agentic tool-call loop (done) → tool-call caching + training corpus (current, [notes/phase2_plan.md](notes/phase2_plan.md)) → SFT distillation → GRPO RL → eval**. The target JSON schema lives in [src/schema.py](src/schema.py) (the single contract everything imports). Planning/spec markdowns live in [notes/](notes/) (incl. [notes/S3_setup.md](notes/S3_setup.md), the bucket/IAM details).
+Fine-tune a small open-weight LLM (`google/gemma-4-E4B-it`) to take a restaurant name as input and return its menu as structured JSON, using **web search + scraping** as inference-time tools. The phases: **agentic tool-call loop (done) → tool-call caching + training corpus (done — 1000-trace mixed corpus, [notes/phase2_plan.md](notes/phase2_plan.md)) → SFT distillation (current) → GRPO RL → eval**. The target JSON schema lives in [src/schema.py](src/schema.py) (the single contract everything imports). Planning/spec markdowns live in [notes/](notes/) (incl. [notes/S3_setup.md](notes/S3_setup.md), the bucket/IAM details).
 
 > **Tooling note:** the two live web tools are **finalized to Brave (search, REST) + a local headless Chromium (scrape, no key)** (the earlier Tavily/Firecrawl/MCP-server and Jina wiring has been removed) — see "Web tools" below. The old offline `web_search` stub (`sample_menu.md`, `--offline`) has been **removed**; the live tools are the only source.
 
-**Status:** early scaffold (Phase 1). Code lives in [src/](src/), split into **shared resources** (directly in `src/`) and two **per-model agent folders** ([src/gemma/](src/gemma/), [src/claude/](src/claude/)).
+**Status:** the Phase-2 training corpus is built — **1000 teacher traces** (600 restriction-free + 400 dietary-conditioned) under `data/traces/`, plus the Phase-3 bridge scripts ([scripts/build_sft.py](scripts/build_sft.py) trace→SFT dataset, [scripts/train_sft.py](scripts/train_sft.py) LoRA trainer for 2×H200, [scripts/eval_split.py](scripts/eval_split.py) eval-split runner+scorer). Next is the first SFT run. Code lives in [src/](src/), split into **shared resources** (directly in `src/`) and two **per-model agent folders** ([src/gemma/](src/gemma/), [src/claude/](src/claude/)).
 
 **Shared (in `src/`)** — model-agnostic, imported by both agents:
 
