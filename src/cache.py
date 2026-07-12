@@ -156,7 +156,12 @@ class Cache:
         self.cache_version = cache_version
         self._hits = self._misses = self._writes = 0
         self._lock = threading.Lock()
-        # check_same_thread=False + WAL supports the parallel corpus build (WS-C).
+        # check_same_thread=False lets the WS-C thread pool share this one
+        # connection; the _lock below -- NOT WAL -- is what makes that safe:
+        # every read/write is serialized in Python, so SQLite never sees
+        # concurrent access and WAL's own reader/writer concurrency goes unused.
+        # WAL + synchronous=NORMAL is kept purely for cheap commits (append to
+        # -wal, fsync deferred to checkpoint).
         self._conn = sqlite3.connect(path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
@@ -259,4 +264,14 @@ class Cache:
             }
 
     def close(self):
-        self._conn.close()
+        # Fold the WAL back into the main db and truncate the -wal sidecar so a
+        # clean shutdown leaves a self-contained single file. (A crash can still
+        # leave -wal lagging the bare db; WS-D's VACUUM INTO snapshot in
+        # scripts/cache_sync.py covers that case -- always sync via that script,
+        # never a manual copy of data/cache.sqlite.)
+        with self._lock:
+            try:
+                self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            except sqlite3.Error:
+                pass  # busy/failed checkpoint must not turn close() into a raise
+            self._conn.close()
