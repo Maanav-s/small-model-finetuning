@@ -44,6 +44,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -441,11 +442,20 @@ def main() -> None:
         eval_strategy="epoch" if eval_ds is not None else "no",
     )
 
+    # Gemma 4 E4B is multimodal: the same projection names (q_proj/.../down_proj) also live in the
+    # vision_tower and audio_tower, where they are wrapped in Gemma4ClippableLinear -- a type PEFT's
+    # LoRA cannot adapt (it only supports bare nn.Linear et al.). A bare-suffix target_modules list
+    # matches those towers too and raises "Target module ... is not supported". The language model's
+    # own projections are plain nn.Linear, so scope LoRA to them with a regex: PEFT treats a *string*
+    # target_modules as a full-match regex (a list is bare-suffix matched and can't express the scope).
+    _names = "|".join(re.escape(t) for t in args.lora_target_modules)
+    lora_target = rf".*language_model\..*\.({_names})$"
+
     lora_config = LoraConfig(
         r=args.lora_r,
         lora_alpha=args.lora_alpha,
         lora_dropout=args.lora_dropout,
-        target_modules=args.lora_target_modules,
+        target_modules=lora_target,
         bias="none",
         task_type="CAUSAL_LM",
     )
