@@ -1,0 +1,285 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RunPod Training Handoff — Gemma-4-E4B menu-extraction SFT</title>
+<style>
+  :root{
+    --bg:#f7f8fa; --panel:#fff; --border:#e3e6ea; --text:#1a1d21; --muted:#5c6470;
+    --accent:#2563eb; --code-bg:#f1f3f5; --code-text:#0f172a;
+    --warn-bg:#fef3c7; --warn-bd:#f59e0b; --warn-tx:#7c5200;
+    --crit-bg:#fee2e2; --crit-bd:#dc2626; --crit-tx:#8a1414;
+    --ok-bg:#dcfce7; --ok-bd:#16a34a; --ok-tx:#14532d;
+  }
+  @media (prefers-color-scheme:dark){
+    :root{
+      --bg:#14171a; --panel:#1b1f23; --border:#2a3037; --text:#e6e9ee; --muted:#9aa4b0;
+      --accent:#6ea8fe; --code-bg:#0f1317; --code-text:#d7e0ea;
+      --warn-bg:#3a2c0f; --warn-bd:#a97a12; --warn-tx:#f4d386;
+      --crit-bg:#3a1717; --crit-bd:#b03434; --crit-tx:#f6b4b4;
+      --ok-bg:#12331f; --ok-bd:#2f7d4b; --ok-tx:#b6f0c9;
+    }
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--text);
+    font:15px/1.6 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+  .wrap{max-width:960px;margin:0 auto;padding:32px 22px 80px}
+  h1{font-size:26px;margin:0 0 4px}
+  h2{font-size:20px;margin:34px 0 10px;padding-top:10px;border-top:1px solid var(--border)}
+  h3{font-size:16px;margin:20px 0 6px}
+  .lede{color:var(--muted);margin:0 0 8px}
+  code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.9em;
+    background:var(--code-bg);color:var(--code-text);padding:1px 5px;border-radius:5px}
+  pre{background:var(--code-bg);color:var(--code-text);border:1px solid var(--border);
+    border-radius:9px;padding:12px 14px;overflow-x:auto;font-size:13px;line-height:1.5}
+  pre code{background:none;padding:0}
+  a{color:var(--accent)}
+  .box{border:1px solid var(--border);border-left-width:4px;border-radius:8px;
+    padding:11px 15px;margin:14px 0;background:var(--panel)}
+  .warn{background:var(--warn-bg);border-left-color:var(--warn-bd);color:var(--warn-tx)}
+  .crit{background:var(--crit-bg);border-left-color:var(--crit-bd);color:var(--crit-tx)}
+  .ok{background:var(--ok-bg);border-left-color:var(--ok-bd);color:var(--ok-tx)}
+  .box .lbl{font-weight:700;text-transform:uppercase;font-size:11px;letter-spacing:.05em;
+    display:block;margin-bottom:3px}
+  table{border-collapse:collapse;width:100%;margin:12px 0;font-size:14px;display:block;overflow-x:auto}
+  th,td{border:1px solid var(--border);padding:7px 10px;text-align:left;vertical-align:top}
+  th{background:var(--code-bg)}
+  ul,ol{padding-left:22px}
+  li{margin:3px 0}
+  .kv{width:100%}
+  .kv td:first-child{white-space:nowrap;color:var(--muted);width:1%}
+  .pill{display:inline-block;background:var(--code-bg);border:1px solid var(--border);
+    border-radius:999px;padding:0 8px;font-size:12px;color:var(--muted)}
+  .step{font-weight:700;color:var(--accent)}
+  hr{border:none;border-top:1px solid var(--border);margin:20px 0}
+  .small{font-size:13px;color:var(--muted)}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<h1>RunPod Training Handoff</h1>
+<p class="lede">Fine-tune <code>google/gemma-4-E4B-it</code> (LoRA / bf16) on the menu-extraction SFT corpus, on a
+single H100 SXM, then push the adapter + merged model to S3. <span class="pill">for the setup agent</span></p>
+
+<div class="box ok">
+<span class="lbl">Mission in one line</span>
+Provision 1× H100 SXM on RunPod, rebuild the SFT dataset from the S3 corpus, run <code>scripts/train_sft.py</code>,
+<b>measure whether the run is compute- or memory-bound</b>, and push the outputs to S3 from the pod. Report the
+diagnostic numbers so the human decides whether/how to scale.
+</div>
+
+<h2>0 · What you (the agent) already have vs. need</h2>
+<p><b>Authenticated on your machine:</b> AWS CLI, RunPod CLI (<code>runpodctl</code>), GitHub CLI (<code>gh</code>).</p>
+<p><b>You must obtain from the human before starting:</b></p>
+<ul>
+  <li>A <b>Hugging Face token</b> with access to the gated <code>google/gemma-4-E4B-it</code> (an account that accepted the license). Needed on the pod for <i>both</i> the tokenizer (dataset rebuild) and the model download. → <code>HF_TOKEN</code></li>
+  <li>Confirmation to spend on a RunPod H100 SXM (~$2–4/hr; the run is ~1–3 h).</li>
+</ul>
+
+<h3>Fixed project facts (do not re-derive)</h3>
+<table class="kv">
+  <tr><td>GitHub repo</td><td><code>Maanav-s/small-model-finetuning</code> — branch <code>phase2-caching</code> (the training scripts live there, not on <code>main</code>)</td></tr>
+  <tr><td>S3 bucket</td><td><code>restaurant-menu-corpus</code>, prefix <code>v1</code>, region <code>us-west-2</code></td></tr>
+  <tr><td>In S3 now</td><td><code>cache.sqlite</code>, <code>restaurants.jsonl</code>, <code>splits.json</code>, <code>traces/</code> (1000). <b>No</b> <code>train.jsonl</code> — the pod rebuilds it.</td></tr>
+  <tr><td>Package mgr</td><td><b>uv only</b> — <code>uv run python …</code>, <code>uv sync</code>. Never bare <code>python</code>/<code>pip</code>.</td></tr>
+  <tr><td>Torch</td><td>pinned to the <b>cu128</b> wheel (CUDA 12.8) → the pod's NVIDIA driver must support CUDA 12.8.</td></tr>
+  <tr><td>Python</td><td><code>&gt;=3.13</code></td></tr>
+  <tr><td>Attention</td><td><code>sdpa</code> only — see the gotchas box. Do <b>not</b> install <code>flash-attn</code>.</td></tr>
+</table>
+
+<h2>1 · Provision the pod (RunPod)</h2>
+<p>Create <b>one</b> pod, deliberately single-GPU (the whole point is to read the bound before scaling):</p>
+<table>
+  <tr><th>Resource</th><th>Spec</th><th>Why</th></tr>
+  <tr><td>GPU</td><td><b>1× H100 SXM (80 GB HBM3)</b></td><td>Probe box. Verify the exact <code>--gpuType</code> id via <code>runpodctl</code> / the RunPod console — the id strings drift (SXM ≠ PCIe ≠ NVL).</td></tr>
+  <tr><td>Image</td><td>CUDA 12.8-capable PyTorch image (e.g. a recent <code>runpod/pytorch</code> CUDA ≥12.4 image, or an <code>nvidia/cuda:12.8.*-devel</code> base)</td><td><code>uv sync</code> installs the pinned <code>torch 2.11+cu128</code> regardless of the image's torch, but the host driver must handle CUDA 12.8. Run <code>nvidia-smi</code> to confirm.</td></tr>
+  <tr><td>Container disk</td><td>~40 GB</td><td>OS + venv + build.</td></tr>
+  <tr><td>Network volume</td><td>~120 GB, mounted at <code>/workspace</code></td><td>Persists the HF model cache + training outputs across pod restarts. Put <code>HF_HOME=/workspace/hf-cache</code> and <code>--output-dir /workspace/gemma-menu-sft</code> here.</td></tr>
+</table>
+
+<h3>Environment variables / secrets to set on the pod</h3>
+<pre><code>HF_TOKEN=&lt;hf token, gated gemma access&gt;
+HF_HOME=/workspace/hf-cache
+
+# scoped, temporary AWS creds (see §2) — NOT long-lived keys
+AWS_ACCESS_KEY_ID=&lt;temp&gt;
+AWS_SECRET_ACCESS_KEY=&lt;temp&gt;
+AWS_SESSION_TOKEN=&lt;temp&gt;
+AWS_DEFAULT_REGION=us-west-2
+S3_BUCKET=restaurant-menu-corpus
+S3_PREFIX=v1</code></pre>
+<p class="small">Prefer RunPod "secrets"/env injection over baking these into the image. The AWS values expire (§2), so a leaked pod image doesn't leak durable credentials.</p>
+
+<h2>2 · Scoped AWS credentials for the pod (this enables push-from-pod)</h2>
+<div class="box crit">
+<span class="lbl">Security rule</span>
+The devbox uses an EC2 <b>instance profile</b> — that identity does <b>not</b> exist on a RunPod pod, and the project rule is
+<b>no long-lived static keys</b>. Mint <b>short-lived, least-privilege</b> credentials scoped to just this bucket/prefix.
+</div>
+<p><b>Recommended — temporary STS credentials (~12 h, covers the run, then auto-expire):</b></p>
+<ol>
+  <li>Create (or reuse) an IAM role/user whose policy is exactly the S3 access below (nothing else).</li>
+  <li>Mint temp creds and inject the three <code>AWS_*</code> values into the pod env:
+    <pre><code># if it's a role you can assume:
+aws sts assume-role \
+  --role-arn arn:aws:iam::&lt;acct&gt;:role/&lt;menu-corpus-pod-role&gt; \
+  --role-session-name gemma-sft-pod \
+  --duration-seconds 43200        # 12h
+
+# or, if your CLI identity is an IAM user (creds inherit the user's perms):
+aws sts get-session-token --duration-seconds 43200</code></pre>
+  </li>
+</ol>
+<p>Least-privilege policy (read the corpus, write the model outputs):</p>
+<pre><code>{
+  "Version": "2012-10-17",
+  "Statement": [
+    { "Sid": "List", "Effect": "Allow", "Action": ["s3:ListBucket"],
+      "Resource": "arn:aws:s3:::restaurant-menu-corpus",
+      "Condition": { "StringLike": { "s3:prefix": ["v1/*"] } } },
+    { "Sid": "ReadCorpusWriteModels", "Effect": "Allow",
+      "Action": ["s3:GetObject", "s3:PutObject"],
+      "Resource": "arn:aws:s3:::restaurant-menu-corpus/v1/*" }
+  ]
+}</code></pre>
+<p class="small"><b>Fallback</b> if role/STS setup is heavy: create a dedicated IAM user with this inline policy + one access key, use it, and <b>delete the key</b> when training finishes. Never commit it or bake it into an image.</p>
+
+<h2>3 · Bootstrap the pod</h2>
+<p>SSH/exec into the pod, then:</p>
+<pre><code># repo (gh is authenticated on your machine; on the pod use a token or deploy key,
+# or clone over https with a gh-generated token)
+git clone https://github.com/Maanav-s/small-model-finetuning.git
+cd small-model-finetuning
+git checkout phase2-caching
+
+# uv + deps (installs torch 2.11+cu128, transformers/trl/peft/accelerate)
+curl -LsSf https://astral.sh/uv/install.sh | sh
+uv sync
+
+# gated model access
+huggingface-cli login --token "$HF_TOKEN"     # or rely on HF_TOKEN env
+
+# sanity: driver supports CUDA 12.8, one 80GB GPU visible
+nvidia-smi
+uv run python -c "import torch;print('cuda',torch.cuda.is_available(),torch.version.cuda,torch.cuda.get_device_name(0))"</code></pre>
+
+<h3>Rebuild the SFT dataset from S3 (train.jsonl is NOT in S3)</h3>
+<pre><code># pull ONLY the traces (73 MB); cache.sqlite is not needed for training
+uv run python scripts/cache_sync.py pull --only traces
+
+# regenerate the student-rendered SFT set. Deterministic (seed 42 + the
+# version-controlled reject-list). Needs the gated tokenizer (HF login above).
+uv run python scripts/build_sft.py --reject-list data/review/reject_list.txt
+# expect: ~948 examples written -> data/sft/train.jsonl</code></pre>
+<div class="box warn"><span class="lbl">Check</span>
+<code>build_sft.py</code> should report <b>~948 written</b> (1000 traces − 50 rejected − 2 unparseable). If the count is wildly off, stop — the traces pull or the tokenizer version is wrong.
+</div>
+
+<h2>4 · Dry-run (no GPU) — confirm the dataset + mask</h2>
+<pre><code>uv run python scripts/train_sft.py --data data/sft/train.jsonl --dry-run --eval-frac 0.05</code></pre>
+<p>This builds + masks the dataset and prints the token-length distribution and one masked example, <b>without loading the model</b>. Confirm the kept-count and that the "TRAINED (loss) tokens" look like the assistant tool-calls + final JSON only.</p>
+
+<h2>5 · Launch training — SINGLE GPU (different from the 2-GPU recipe!)</h2>
+<div class="box crit"><span class="lbl">Do not use accelerate/torchrun here</span>
+The <code>configs/accelerate_ddp.yaml</code> + <code>accelerate launch</code> recipe in <code>notes/runpod_sft.md</code> is for <b>2 GPUs</b>.
+On one GPU, run <b>plain</b> <code>uv run python</code> — a single process. Launching under accelerate/torchrun with the DDP config on 1 GPU is wrong.
+</div>
+<pre><code>uv run python scripts/train_sft.py \
+  --data data/sft/train.jsonl \
+  --output-dir /workspace/gemma-menu-sft \
+  --eval-frac 0.05 \
+  --num-train-epochs 3 \
+  --logging-steps 5 \
+  --num-processes 1 \
+  --max-length 8192          # START SMALL — see §6, then ramp up</code></pre>
+<p class="small">Effective batch on 1 GPU = <code>per_device(1) × grad_accum(8) × 1 = 8</code>. <code>--num-processes 1</code> only fixes the printed batch math. Leave <code>--attn sdpa</code> (default).</p>
+
+<h2>6 · The core task: is it compute- or memory-bound?</h2>
+<div class="box warn"><span class="lbl">Why this decides how to scale</span>
+Plain DDP <b>replicates</b> the model on every GPU — it splits the <i>batch</i>, not a single sequence's activations. So:
+<ul style="margin:6px 0 0">
+  <li><b>Memory-bound</b> (can't reach the target <code>--max-length</code>): adding more H100s via DDP <b>does not help</b> — each GPU still holds one full-length sequence. You need <b>more memory per device</b> (H200 = 141 GB), a lower <code>--max-length</code>, or FSDP/chunked-loss. </li>
+  <li><b>Compute-bound</b> (fits, GPU pinned ~100%): add GPUs (DDP, ~linear) to cut wall-clock.</li>
+</ul>
+</div>
+<p><b>The dominant memory term is the loss logits:</b> <code>seq_len × vocab(~256k) × 4 bytes (fp32)</code>. At 32k tokens that alone is tens of GB, transient, per sequence — this, not the 4B weights, is what pushes an 80 GB card. And because over-length examples are <b>dropped</b> (not truncated), the max <code>--max-length</code> you can fit directly sets how much of the corpus you train on:</p>
+<table>
+  <tr><th><code>--max-length</code></th><th>examples kept (of 948)</th><th>dropped</th></tr>
+  <tr><td>8192</td><td>~636 or fewer</td><td>most; pipeline test only</td></tr>
+  <tr><td>16384</td><td>~636</td><td>32.9%</td></tr>
+  <tr><td>32768</td><td>~786</td><td>17.1%</td></tr>
+</table>
+
+<h3>Diagnostic protocol</h3>
+<ol>
+  <li>With <code>--max-length 8192</code>, confirm it trains and checkpoints. In a second shell watch:
+    <pre><code>watch -n1 nvidia-smi                 # memory used vs 80GB, GPU-util %
+# or: nvidia-smi dmon -s um          # SM-util + mem columns, 1 Hz</code></pre>
+  </li>
+  <li>Note peak memory and the logged <code>it/s</code> once ~10–20 steps have passed (that's your throughput; ETA ≈ steps × sec/step).</li>
+  <li><b>Ramp <code>--max-length</code></b>: 8192 → 16384 → 32768, relaunching each time. Find the largest value that trains without CUDA OOM. That's the memory ceiling on 1× H100.</li>
+  <li>Classify:
+    <ul>
+      <li><b>Fits 32768, GPU-util pinned ~95–100%, memory has headroom</b> → <b>compute-bound</b>. One H100 is enough for the full corpus; add GPUs only to go faster.</li>
+      <li><b>OOMs before 32768</b> (or you had to shrink to fit and util is spiky/&lt;90%) → <b>memory-bound</b>. Record the ceiling.</li>
+    </ul>
+  </li>
+</ol>
+<div class="box"><span class="lbl">Record these numbers for the human</span>
+max feasible <code>--max-length</code> on 1× H100 · peak GPU memory at that length · GPU-util % · <code>it/s</code> · est. wall-clock for 3 epochs · final train &amp; eval loss.
+</div>
+
+<h3>Decision matrix (hand back to the human, don't self-escalate spend)</h3>
+<table>
+  <tr><th>Observation</th><th>Bound</th><th>Recommended scale-up</th></tr>
+  <tr><td>Fits 32k, util ~100%, want it faster</td><td>Compute</td><td>2–4× H100 with the existing DDP recipe (<code>accelerate launch --config_file configs/accelerate_ddp.yaml</code>, set <code>num_processes</code>=GPUs). Near-linear speedup.</td></tr>
+  <tr><td>Fits 32k, util ~100%, ~1–2 h is fine</td><td>Compute</td><td>Stay on 1× H100. Done.</td></tr>
+  <tr><td>OOM before 32k</td><td>Memory</td><td>Move to <b>1× H200 (141 GB)</b> to reach 32k (keeps 83% of data), OR accept a lower <code>--max-length</code> on H100 (fewer examples), OR (advanced) enable a chunked/fused cross-entropy to shrink the logits term. More H100s via DDP will <b>not</b> fix this.</td></tr>
+</table>
+
+<h2>7 · Push outputs to S3 (from the pod)</h2>
+<p>On completion, <code>train_sft.py</code> writes two local dirs under <code>--output-dir</code>:</p>
+<table class="kv">
+  <tr><td><code>/workspace/gemma-menu-sft/adapter/</code></td><td>LoRA adapter + tokenizer (small, ~tens of MB)</td></tr>
+  <tr><td><code>/workspace/gemma-menu-sft/merged/</code></td><td>base+adapter merged bf16 HF model + tokenizer (several GB) — what <code>eval_split.py --model-path</code> loads</td></tr>
+</table>
+<p>Nothing auto-pushes. Using the scoped creds from §2:</p>
+<pre><code># push the adapter FIRST as insurance (tiny), then the merged model
+DEST="s3://$S3_BUCKET/$S3_PREFIX/models/gemma-menu-sft-$(date +%Y%m%d)"
+aws s3 cp --recursive /workspace/gemma-menu-sft/adapter "$DEST/adapter"
+aws s3 cp --recursive /workspace/gemma-menu-sft/merged  "$DEST/merged"
+aws s3 ls "$DEST/" --recursive | tail        # verify</code></pre>
+<div class="box crit"><span class="lbl">Ephemeral pod</span>
+Get the outputs to S3 <b>before</b> tearing the pod down. Even on the <code>/workspace</code> volume they vanish if the volume is deleted. Verify the <code>aws s3 ls</code> shows the merged safetensors before stopping the pod.
+</div>
+
+<h2>8 · Done criteria / report back</h2>
+<ul>
+  <li>✅ <code>train.jsonl</code> rebuilt (~948) and dry-run mask looked correct.</li>
+  <li>✅ Training completed 3 epochs (or you stopped early with a clear reason); final train + eval loss captured.</li>
+  <li>✅ Bound classified with the numbers in §6, plus a one-line recommendation from the decision matrix.</li>
+  <li>✅ <code>adapter/</code> and <code>merged/</code> pushed to S3; paths reported.</li>
+  <li>➡️ <b>Not your job</b> (human/next step): the real eval is <code>uv run python scripts/eval_split.py --model gemma --model-path &lt;merged dir or its S3 pull&gt;</code> on the held-out split. Just leave the merged model in S3 and note its path.</li>
+</ul>
+
+<h2>Appendix · Gotchas that will bite you</h2>
+<div class="box warn"><span class="lbl">Attention</span>
+Keep <code>--attn sdpa</code>. Gemma-4-E4B's global layers use <code>head_dim=512</code>; FlashAttention-2 hard-caps head_dim at 256 (throws on the global layers), and there's no stable FA3 head_dim=512 training path even on Hopper/H100. SDPA's mem-efficient kernel (with the repo's GQA patch, already applied in <code>model.py</code>) is the one that serves 512-dim heads. Don't add <code>flash-attn</code>.
+</div>
+<ul>
+  <li><b>Gated model:</b> both <code>build_sft.py</code> (tokenizer) and training download <code>google/gemma-4-E4B-it</code> — HF login is required or they fail.</li>
+  <li><b>Single vs multi-GPU launch:</b> 1 GPU → plain <code>uv run python scripts/train_sft.py …</code>. Multi-GPU → <code>accelerate launch --config_file configs/accelerate_ddp.yaml …</code> with <code>num_processes</code> = GPU count. The trainer omits <code>device_map</code> on purpose so accelerate can place the model; don't add one.</li>
+  <li><b>Driver/CUDA:</b> torch is cu128 — if <code>torch.cuda.is_available()</code> is False, the host driver is too old for CUDA 12.8; pick a newer RunPod image.</li>
+  <li><b>No static AWS keys anywhere persistent.</b> Temp STS creds only; they expire on their own. Delete any fallback IAM access key after the run.</li>
+  <li><b>uv only</b> — never bare <code>python</code>/<code>pip</code>; reproduce the env with <code>uv sync</code>.</li>
+  <li><b>Data prep is deterministic</b> — if you ever need to re-run <code>build_sft.py</code>, same seed + same reject-list → same 948 rows.</li>
+</ul>
+
+<hr>
+<p class="small">Generated as a handoff for the RunPod setup agent. Source of truth for the pipeline: <code>scripts/train_sft.py</code>, <code>scripts/build_sft.py</code>, <code>scripts/cache_sync.py</code>, and <code>notes/runpod_sft.md</code> in the repo (branch <code>phase2-caching</code>). CLAUDE.md holds the hardware/attention rationale.</p>
+
+</div>
+</body>
+</html>
