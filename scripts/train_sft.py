@@ -440,6 +440,12 @@ def main() -> None:
         seed=args.seed,
         remove_unused_columns=False,
         eval_strategy="epoch" if eval_ds is not None else "no",
+        # Eval memory: the loss logits are seq_len x vocab(262k) x 4B. At the default eval
+        # batch of 8 that term is ~8x a training micro-batch and OOMs at 32k (one sequence
+        # already fills the card). Evaluate one sequence at a time, loss-only, so eval never
+        # materializes more than a single training step's worth of logits.
+        per_device_eval_batch_size=args.per_device_train_batch_size,
+        prediction_loss_only=True,
     )
 
     # Gemma 4 E4B is multimodal: the same projection names (q_proj/.../down_proj) also live in the
