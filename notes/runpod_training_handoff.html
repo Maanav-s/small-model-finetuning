@@ -82,7 +82,7 @@ diagnostic numbers so the human decides whether/how to scale.
 <table class="kv">
   <tr><td>GitHub repo</td><td><code>Maanav-s/small-model-finetuning</code> — branch <code>phase2-caching</code> (the training scripts live there, not on <code>main</code>)</td></tr>
   <tr><td>S3 bucket</td><td><code>restaurant-menu-corpus</code>, prefix <code>v1</code>, region <code>us-west-2</code></td></tr>
-  <tr><td>In S3 now</td><td><code>cache.sqlite</code>, <code>restaurants.jsonl</code>, <code>splits.json</code>, <code>traces/</code> (1000). <b>No</b> <code>train.jsonl</code> — the pod rebuilds it.</td></tr>
+  <tr><td>In S3 now</td><td>Raw corpus: <code>cache.sqlite</code>, <code>restaurants.jsonl</code>, <code>splits.json</code>, <code>traces/</code> (1000). <b>Prepared dataset:</b> <code>sft/train.jsonl</code> (60.6 MB, 948 examples) — the pod pulls this directly; no rebuild needed.</td></tr>
   <tr><td>Package mgr</td><td><b>uv only</b> — <code>uv run python …</code>, <code>uv sync</code>. Never bare <code>python</code>/<code>pip</code>.</td></tr>
   <tr><td>Torch</td><td>pinned to the <b>cu128</b> wheel (CUDA 12.8) → the pod's NVIDIA driver must support CUDA 12.8.</td></tr>
   <tr><td>Python</td><td><code>&gt;=3.13</code></td></tr>
@@ -165,16 +165,17 @@ huggingface-cli login --token "$HF_TOKEN"     # or rely on HF_TOKEN env
 nvidia-smi
 uv run python -c "import torch;print('cuda',torch.cuda.is_available(),torch.version.cuda,torch.cuda.get_device_name(0))"</code></pre>
 
-<h3>Rebuild the SFT dataset from S3 (train.jsonl is NOT in S3)</h3>
-<pre><code># pull ONLY the traces (73 MB); cache.sqlite is not needed for training
-uv run python scripts/cache_sync.py pull --only traces
-
-# regenerate the student-rendered SFT set. Deterministic (seed 42 + the
-# version-controlled reject-list). Needs the gated tokenizer (HF login above).
+<h3>Get the SFT dataset onto the pod</h3>
+<p><b>Primary — pull the prepared dataset from S3</b> (already built: 60.6 MB, 948 examples). No traces pull, no tokenizer, no rebuild:</p>
+<pre><code>mkdir -p data/sft
+aws s3 cp s3://$S3_BUCKET/$S3_PREFIX/sft/train.jsonl data/sft/train.jsonl
+wc -l data/sft/train.jsonl        # expect 948</code></pre>
+<p class="small">Integrity: the object carries its md5 as metadata (<code>x-amz-meta-md5</code>, = <code>07dd4615bf1cb27f04697e77fe040f0c</code>) — compare with <code>md5sum data/sft/train.jsonl</code> if you want to be sure.</p>
+<div class="box"><span class="lbl">Fallback — rebuild from traces (only if you must regenerate it)</span>
+Deterministic (seed 42 + the version-controlled reject-list); needs the gated tokenizer (HF login above):
+<pre><code>uv run python scripts/cache_sync.py pull --only traces      # 73 MB of traces
 uv run python scripts/build_sft.py --reject-list data/review/reject_list.txt
-# expect: ~948 examples written -> data/sft/train.jsonl</code></pre>
-<div class="box warn"><span class="lbl">Check</span>
-<code>build_sft.py</code> should report <b>~948 written</b> (1000 traces − 50 rejected − 2 unparseable). If the count is wildly off, stop — the traces pull or the tokenizer version is wrong.
+# -> ~948 written to data/sft/train.jsonl (1000 traces - 50 rejected - 2 unparseable)</code></pre>
 </div>
 
 <h2>4 · Dry-run (no GPU) — confirm the dataset + mask</h2>
