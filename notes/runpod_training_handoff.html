@@ -74,15 +74,16 @@ diagnostic numbers so the human decides whether/how to scale.
 <p><b>Authenticated on your machine:</b> AWS CLI, RunPod CLI (<code>runpodctl</code>), GitHub CLI (<code>gh</code>).</p>
 <p><b>You must obtain from the human before starting:</b></p>
 <ul>
-  <li>A <b>Hugging Face token</b> with access to the gated <code>google/gemma-4-E4B-it</code> (an account that accepted the license). Needed on the pod for <i>both</i> the tokenizer (dataset rebuild) and the model download. → <code>HF_TOKEN</code></li>
   <li>Confirmation to spend on a RunPod H100 SXM (~$2–4/hr; the run is ~1–3 h).</li>
 </ul>
+<div class="box ok"><span class="lbl">No Hugging Face token needed</span>
+The base model is served from the bucket (<code>v1/base-model/gemma-4-E4B-it/</code>), not the gated HF hub. The pod loads it from a local path via <code>GEMMA_MODEL_PATH</code> — no HF login, no HF network access, nothing to obtain.</div>
 
 <h3>Fixed project facts (do not re-derive)</h3>
 <table class="kv">
   <tr><td>GitHub repo</td><td><code>Maanav-s/small-model-finetuning</code> — branch <code>phase2-caching</code> (the training scripts live there, not on <code>main</code>)</td></tr>
   <tr><td>S3 bucket</td><td><code>restaurant-menu-corpus</code>, prefix <code>v1</code>, region <code>us-west-2</code></td></tr>
-  <tr><td>In S3 now</td><td>Raw corpus: <code>cache.sqlite</code>, <code>restaurants.jsonl</code>, <code>splits.json</code>, <code>traces/</code> (1000). <b>Prepared dataset:</b> <code>sft/train.jsonl</code> (60.6 MB, 948 examples) — the pod pulls this directly; no rebuild needed.</td></tr>
+  <tr><td>In S3 now</td><td>Raw corpus: <code>cache.sqlite</code>, <code>restaurants.jsonl</code>, <code>splits.json</code>, <code>traces/</code> (1000). <b>Prepared dataset:</b> <code>sft/train.jsonl</code> (60.6 MB, 948 examples). <b>Base model:</b> <code>base-model/gemma-4-E4B-it/</code> (~15 GB, config + safetensors + tokenizer). The pod pulls the dataset and the model directly — no rebuild, no HF token.</td></tr>
   <tr><td>Package mgr</td><td><b>uv only</b> — <code>uv run python …</code>, <code>uv sync</code>. Never bare <code>python</code>/<code>pip</code>.</td></tr>
   <tr><td>Torch</td><td>pinned to the <b>cu128</b> wheel (CUDA 12.8) → the pod's NVIDIA driver must support CUDA 12.8.</td></tr>
   <tr><td>Python</td><td><code>&gt;=3.13</code></td></tr>
@@ -100,8 +101,10 @@ diagnostic numbers so the human decides whether/how to scale.
 </table>
 
 <h3>Environment variables / secrets to set on the pod</h3>
-<pre><code>HF_TOKEN=&lt;hf token, gated gemma access&gt;
-HF_HOME=/workspace/hf-cache
+<pre><code># base model comes from S3 and loads from a local dir — no HF token/network
+GEMMA_MODEL_PATH=/workspace/base-model/gemma-4-E4B-it
+HF_HUB_OFFLINE=1
+TRANSFORMERS_OFFLINE=1
 
 # scoped, temporary AWS creds (see §2) — NOT long-lived keys
 AWS_ACCESS_KEY_ID=&lt;temp&gt;
@@ -110,7 +113,7 @@ AWS_SESSION_TOKEN=&lt;temp&gt;
 AWS_DEFAULT_REGION=us-west-2
 S3_BUCKET=restaurant-menu-corpus
 S3_PREFIX=v1</code></pre>
-<p class="small">Prefer RunPod "secrets"/env injection over baking these into the image. The AWS values expire (§2), so a leaked pod image doesn't leak durable credentials.</p>
+<p class="small">Prefer RunPod "secrets"/env injection over baking these into the image. The AWS values expire (§2), so a leaked pod image doesn't leak durable credentials. <code>GEMMA_MODEL_PATH</code> must be exported before any train/build command — if it's unset the code falls back to the gated hub id and would need a token.</p>
 
 <h2>2 · Scoped AWS credentials for the pod (this enables push-from-pod)</h2>
 <div class="box crit">
@@ -158,12 +161,16 @@ git checkout phase2-caching
 curl -LsSf https://astral.sh/uv/install.sh | sh
 uv sync
 
-# gated model access
-huggingface-cli login --token "$HF_TOKEN"     # or rely on HF_TOKEN env
+# base model FROM THE BUCKET (~15 GB) — no HF token, no HF network
+mkdir -p /workspace/base-model/gemma-4-E4B-it
+aws s3 cp --recursive s3://$S3_BUCKET/$S3_PREFIX/base-model/gemma-4-E4B-it \
+  /workspace/base-model/gemma-4-E4B-it
+export GEMMA_MODEL_PATH=/workspace/base-model/gemma-4-E4B-it   # also set in pod env
 
-# sanity: driver supports CUDA 12.8, one 80GB GPU visible
+# sanity: driver supports CUDA 12.8, one 80GB GPU visible, model dir loads offline
 nvidia-smi
-uv run python -c "import torch;print('cuda',torch.cuda.is_available(),torch.version.cuda,torch.cuda.get_device_name(0))"</code></pre>
+uv run python -c "import torch;print('cuda',torch.cuda.is_available(),torch.version.cuda,torch.cuda.get_device_name(0))"
+GEMMA_MODEL_PATH=/workspace/base-model/gemma-4-E4B-it uv run python -c "import sys;sys.path[:0]=['src','src/gemma'];from model import MODEL_ID;from transformers import AutoConfig;print('model dir OK:',AutoConfig.from_pretrained(MODEL_ID).model_type)"</code></pre>
 
 <h3>Get the SFT dataset onto the pod</h3>
 <p><b>Primary — pull the prepared dataset from S3</b> (already built: 60.6 MB, 948 examples). No traces pull, no tokenizer, no rebuild:</p>
@@ -270,7 +277,7 @@ Get the outputs to S3 <b>before</b> tearing the pod down. Even on the <code>/wor
 Keep <code>--attn sdpa</code>. Gemma-4-E4B's global layers use <code>head_dim=512</code>; FlashAttention-2 hard-caps head_dim at 256 (throws on the global layers), and there's no stable FA3 head_dim=512 training path even on Hopper/H100. SDPA's mem-efficient kernel (with the repo's GQA patch, already applied in <code>model.py</code>) is the one that serves 512-dim heads. Don't add <code>flash-attn</code>.
 </div>
 <ul>
-  <li><b>Gated model:</b> both <code>build_sft.py</code> (tokenizer) and training download <code>google/gemma-4-E4B-it</code> — HF login is required or they fail.</li>
+  <li><b>Base model from the bucket, no HF token:</b> the pod loads <code>google/gemma-4-E4B-it</code> from <code>GEMMA_MODEL_PATH</code> (the S3 copy) as a local path, so no HF login/network is used. If <code>GEMMA_MODEL_PATH</code> is <i>unset</i>, <code>model.py</code> falls back to the gated hub id and <i>would</i> need a token — so always export it.</li>
   <li><b>Single vs multi-GPU launch:</b> 1 GPU → plain <code>uv run python scripts/train_sft.py …</code>. Multi-GPU → <code>accelerate launch --config_file configs/accelerate_ddp.yaml …</code> with <code>num_processes</code> = GPU count. The trainer omits <code>device_map</code> on purpose so accelerate can place the model; don't add one.</li>
   <li><b>Driver/CUDA:</b> torch is cu128 — if <code>torch.cuda.is_available()</code> is False, the host driver is too old for CUDA 12.8; pick a newer RunPod image.</li>
   <li><b>No static AWS keys anywhere persistent.</b> Temp STS creds only; they expire on their own. Delete any fallback IAM access key after the run.</li>

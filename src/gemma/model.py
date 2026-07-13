@@ -27,7 +27,13 @@ from transformers import (  # noqa: E402
 # Single source of truth for the model id. E4B fits comfortably in bf16 (~9 GB)
 # on a 23 GB card and is far better at tool calling than E2B (which would skip
 # the search call and answer from memory).
-MODEL_ID = "google/gemma-4-E4B-it"
+#
+# Overridable via GEMMA_MODEL_PATH: set it to a local directory (or an alternate
+# hub id) to load the weights from there instead of the gated hub repo -- e.g. a
+# copy pulled from S3 onto a training pod, so no HF token or network is needed.
+# from_pretrained treats an existing local path as offline. Default is the
+# canonical gated hub id, so nothing changes when the env var is unset.
+MODEL_ID = os.environ.get("GEMMA_MODEL_PATH", "google/gemma-4-E4B-it")
 
 
 def _force_repeat_kv_for_efficient_sdpa() -> None:
