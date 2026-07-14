@@ -1,0 +1,318 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Local vLLM inference — self-hosted teacher + fast Gemma student serving</title>
+<style>
+  :root{
+    --bg:#f7f8fa; --panel:#fff; --border:#e3e6ea; --text:#1a1d21; --muted:#5c6470;
+    --accent:#2563eb; --code-bg:#f1f3f5; --code-text:#0f172a;
+    --warn-bg:#fef3c7; --warn-bd:#f59e0b; --warn-tx:#7c5200;
+    --crit-bg:#fee2e2; --crit-bd:#dc2626; --crit-tx:#8a1414;
+    --ok-bg:#dcfce7; --ok-bd:#16a34a; --ok-tx:#14532d;
+  }
+  @media (prefers-color-scheme:dark){
+    :root{
+      --bg:#14171a; --panel:#1b1f23; --border:#2a3037; --text:#e6e9ee; --muted:#9aa4b0;
+      --accent:#6ea8fe; --code-bg:#0f1317; --code-text:#d7e0ea;
+      --warn-bg:#3a2c0f; --warn-bd:#a97a12; --warn-tx:#f4d386;
+      --crit-bg:#3a1717; --crit-bd:#b03434; --crit-tx:#f6b4b4;
+      --ok-bg:#12331f; --ok-bd:#2f7d4b; --ok-tx:#b6f0c9;
+    }
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--text);
+    font:15px/1.6 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+  .wrap{max-width:960px;margin:0 auto;padding:32px 22px 80px}
+  h1{font-size:26px;margin:0 0 4px}
+  h2{font-size:20px;margin:34px 0 10px;padding-top:10px;border-top:1px solid var(--border)}
+  h3{font-size:16px;margin:20px 0 6px}
+  .lede{color:var(--muted);margin:0 0 8px}
+  code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.9em;
+    background:var(--code-bg);color:var(--code-text);padding:1px 5px;border-radius:5px}
+  pre{background:var(--code-bg);color:var(--code-text);border:1px solid var(--border);
+    border-radius:9px;padding:12px 14px;overflow-x:auto;font-size:13px;line-height:1.5}
+  pre code{background:none;padding:0}
+  a{color:var(--accent)}
+  .box{border:1px solid var(--border);border-left-width:4px;border-radius:8px;
+    padding:11px 15px;margin:14px 0;background:var(--panel)}
+  .warn{background:var(--warn-bg);border-left-color:var(--warn-bd);color:var(--warn-tx)}
+  .crit{background:var(--crit-bg);border-left-color:var(--crit-bd);color:var(--crit-tx)}
+  .ok{background:var(--ok-bg);border-left-color:var(--ok-bd);color:var(--ok-tx)}
+  .box .lbl{font-weight:700;text-transform:uppercase;font-size:11px;letter-spacing:.05em;
+    display:block;margin-bottom:3px}
+  table{border-collapse:collapse;width:100%;margin:12px 0;font-size:14px;display:block;overflow-x:auto}
+  th,td{border:1px solid var(--border);padding:7px 10px;text-align:left;vertical-align:top}
+  th{background:var(--code-bg)}
+  ul,ol{padding-left:22px}
+  li{margin:3px 0}
+  .kv{width:100%}
+  .kv td:first-child{white-space:nowrap;color:var(--muted);width:1%}
+  .pill{display:inline-block;background:var(--code-bg);border:1px solid var(--border);
+    border-radius:999px;padding:0 8px;font-size:12px;color:var(--muted)}
+  .step{font-weight:700;color:var(--accent)}
+  hr{border:none;border-top:1px solid var(--border);margin:20px 0}
+  .small{font-size:13px;color:var(--muted)}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<h1>Local vLLM inference</h1>
+<p class="lede">Two related moves for v2: (1) replace the <b>Sonnet teacher</b> with a self-hosted open model on
+vLLM to generate SFT traces at compute prices instead of API prices, and (2) serve the <b>Gemma student</b>
+through vLLM so eval and GRPO rollouts stop being single-GPU / <code>model.generate</code>-bound.
+<span class="pill">design + implementation plan</span></p>
+
+<div class="box ok">
+<span class="lbl">Thesis in one line</span>
+For this task, generation is <b>scrape-bound, not compute-bound</b>. That makes a self-hosted vLLM teacher
+1–2 orders of magnitude cheaper than the Sonnet API at corpus scale, and it makes a cheap GPU the right buy.
+The same vLLM serving layer also fixes the Gemma student's inference bottleneck. The one real risk is Gemma-4's
+<code>head_dim=512</code> attention on non-Hopper GPUs — validate that first.
+</div>
+
+<h2>0 · Why this is clean to do here</h2>
+<p>The pipeline already decouples the teacher's wire format from the student. <code>scripts/build_sft.py</code>
+re-templates every captured trace into Gemma's native tool format, and the SFT/GRPO target is
+<b>tool-call semantics + the final JSON</b> — not the teacher's token stream. The Claude baseline is the existing
+proof: <code>to_anthropic_tools</code> in <a href="../src/claude/claude_agent.py">src/claude/claude_agent.py</a>
+converts the same plain-callable tools from <code>setup_tools()</code> and drives an entirely different API,
+unchanged. Swapping in a vLLM teacher touches <b>only trace generation</b>; SFT, GRPO, schema, and the scrape
+backend are all untouched.</p>
+
+<div class="box"><span class="lbl">The bounded role of the teacher</span>
+The teacher is <b>only</b> an SFT data generator. GRPO's reward is programmatic (schema-valid + item count) — no
+teacher in the loop. So teacher quality sets the <i>student's ceiling for SFT</i> and nothing else; if it under-
+performs, the cost is a weaker warm-start, not a broken pipeline.</div>
+
+<h2>1 · The economic case</h2>
+<p>Each episode is a multi-turn agentic loop whose context grows as scraped pages are fed back (you hit
+<code>--max-length 32768</code> in v1). Rough per-episode: ~80–150k accumulated input tokens + a few k output.</p>
+<table>
+  <tr><th>Path</th><th>Unit price</th><th>~10k traces (est.)</th><th>Notes</th></tr>
+  <tr><td><b>Sonnet API</b></td><td>$3/M in, $15/M out</td><td><b>~$3,000–4,000</b></td><td>What v1 pays. Scales linearly with corpus size.</td></tr>
+  <tr><td><b>vLLM on RunPod</b></td><td>$1–3/GPU-hr</td><td><b>~$10–30 of GPU</b></td><td>Throughput is scrape-bound (below), so a modest card kept busy clears thousands/hr.</td></tr>
+</table>
+<p class="small">Even assuming the local run is 3× slower and needs a bigger card, it stays ~100× under API spend.
+The hypothesis "compute is far cheaper than API credits" holds decisively at v2 corpus scale.</p>
+
+<h2>2 · The real bottleneck is the scrape IP, not the GPU</h2>
+<div class="box warn"><span class="lbl">This reframes the whole sizing decision</span>
+Each episode's wall-clock is dominated by <b>scrape latency</b> (headless Chromium: network-idle wait +
+auto-scroll = seconds per call), not token generation. CLAUDE.md already flags the ceiling: "the single egress IP
+can hit per-site rate-limits under a heavy corpus build." With continuous batching you can hold 30–100 episodes in
+flight against one vLLM server, at which point the GPU is <i>underutilized</i> and the <b>scrape backend is the
+throughput ceiling and the ban risk</b>.</div>
+<p>Consequences:</p>
+<ul>
+  <li><b>Don't buy compute you can't use.</b> You are not FLOP-bound during trace generation, so the fastest card is
+  wasted money. Size for <i>fitting the model + KV cache at your target concurrency</i>.</li>
+  <li><b>The v2 scaling work is scrape parallelism</b> (proxy rotation / a scrape worker pool / spread egress), not
+  model serving. Plan that before 10×-ing the corpus, or the rate-limit wall caps you regardless of GPU.</li>
+</ul>
+
+<h2>3 · Instance &amp; model choice for the teacher</h2>
+<p>Because it is scrape-bound, optimize <b>$/hr and VRAM</b>, not throughput/FLOPs.</p>
+<table>
+  <tr><th>Model</th><th>Fit</th><th>Why</th></tr>
+  <tr><td><b>Qwen3-32B</b> (dense) or <b>Qwen3-30B-A3B</b> (MoE, 3B active)</td><td>AWQ int4 ~18 GB on one 80 GB card</td><td><b>Recommended default.</b> Strong tool use + structured output; MoE variant gives near-32B quality at much higher tok/s. Native 32k, YaRN→128k.</td></tr>
+  <tr><td><b>Hermes-3-Llama-3.1-70B</b></td><td>fp8/AWQ ~40–70 GB on one H200</td><td>Closer to frontier; purpose-built function-calling format; <b>native 128k context</b> — an edge for the huge menu pages that pushed v1 to 32k.</td></tr>
+  <tr><td>Qwen3-8B / Hermes-3-8B</td><td>trivial</td><td><b>Avoid as sole teacher</b> — tool-calling works but multi-hop reliability + long-context extraction sit well below Sonnet, and that gap distills into the student.</td></tr>
+</table>
+
+<h3>The card: A100 80 GB spot is the value pick</h3>
+<table class="kv">
+  <tr><td>Card</td><td><b>A100 80 GB</b> (~$1.19/hr on-demand; <b>Community Cloud / spot ~40–70% less</b>) — half the H100's $2.69 for VRAM you're not compute-limited on anyway.</td></tr>
+  <tr><td>Quantization</td><td><b>int4 AWQ/GPTQ, not bf16.</b> A100 is Ampere → <b>no native fp8</b> (that's a Hopper feature). 32B bf16 = 64 GB leaves almost no KV room; AWQ int4 ~18 GB frees ~60 GB for KV — and KV is what buys concurrency.</td></tr>
+  <tr><td>KV cache</td><td>The real VRAM consumer at 32k context. A single full-length episode is several GB of KV; 30–50 concurrent long slots is tens of GB. Add <code>--kv-cache-dtype fp8</code> to roughly halve it.</td></tr>
+  <tr><td>Spot is ideal</td><td>Trace generation is a <b>resumable batch job</b> (same seed-plan idempotent-skip as <code>eval_split.py</code>). Preemption just resumes — the textbook spot workload. This saves more than downsizing the card does.</td></tr>
+</table>
+<div class="box crit"><span class="lbl">Where "cheaper" backfires</span>
+Don't undersize below the KV headroom your target concurrency needs. If the card only fits ~10 concurrent slots,
+the GPU idles waiting on the scrape latency you couldn't overlap, wall-clock stretches, and you burn <i>more</i>
+GPU-hours than the bigger card would have. Optimum: cheapest card × int4 quant × enough KV to keep ~30–50 episodes
+in flight, then spot pricing on top.</div>
+
+<h2>4 · Implementation — the shared OpenAI-compatible runner</h2>
+<p>vLLM exposes an OpenAI-compatible server, so a single new runner drives <b>both</b> the vLLM teacher (Qwen/Hermes)
+and, later, the Gemma student — they're just different <code>base_url</code>s. It mirrors
+<a href="../src/claude/claude_agent.py">claude_agent.py</a> structurally: convert the tools once, then a manual
+tool loop.</p>
+
+<h3>4a · Tool translation (<code>to_openai_tools</code>)</h3>
+<p>Same shape as <code>_callable_to_anthropic</code>, different envelope. Reuses the callables from
+<code>setup_tools()</code> verbatim.</p>
+<pre><code>_JSON_TYPES = {str: "string", int: "integer", float: "number", bool: "boolean"}
+
+def _callable_to_openai(fn) -&gt; dict:
+    props, required = {}, []
+    for name, p in inspect.signature(fn).parameters.items():
+        props[name] = {"type": _JSON_TYPES.get(p.annotation, "string")}
+        if p.default is inspect.Parameter.empty:
+            required.append(name)
+    return {"type": "function", "function": {
+        "name": fn.__name__,
+        "description": inspect.getdoc(fn) or "",
+        "parameters": {"type": "object", "properties": props, "required": required},
+    }}
+
+def to_openai_tools(tools): return [_callable_to_openai(t) for t in tools]</code></pre>
+
+<h3>4b · The loop (<code>src/vllm/openai_agent.py</code>)</h3>
+<pre><code>from openai import OpenAI
+
+def run_episode(client, model, restaurant_name, tools, registry, system_prompt,
+                max_tool_calls=8, max_tokens=16384):
+    oai_tools = to_openai_tools(tools)
+    messages = [{"role": "system", "content": system_prompt},
+                {"role": "user", "content": restaurant_name}]
+    for step in range(max_tool_calls + 1):
+        out_of_budget = step == max_tool_calls
+        resp = client.chat.completions.create(
+            model=model, messages=messages, max_tokens=max_tokens, temperature=0.0,
+            tools=None if out_of_budget else oai_tools,
+            tool_choice=None if out_of_budget else "auto",
+        )
+        msg = resp.choices[0].message
+        if out_of_budget and messages[-1]["role"] == "tool":
+            # deliver BUDGET_FINALIZE_INSTRUCTION the same way the other loops do
+            messages.append({"role": "user", "content": BUDGET_FINALIZE_INSTRUCTION})
+        if not msg.tool_calls:
+            return (msg.content or "").strip()            # final answer
+        messages.append(msg.model_dump())                  # assistant turn verbatim
+        for tc in msg.tool_calls:
+            args = json.loads(tc.function.arguments or "{}")
+            out = registry[tc.function.name](**args) if tc.function.name in registry \
+                  else f"Error: unknown tool {tc.function.name!r}"
+            messages.append({"role": "tool", "tool_call_id": tc.id,
+                             "name": tc.function.name, "content": out})
+    return ""</code></pre>
+<p class="small">Note the transport difference from the Gemma/Claude loops: the OpenAI schema uses standalone
+<code>{"role":"tool"}</code> messages keyed by <code>tool_call_id</code> (no bundling, no prefix-preservation
+constraint — that only matters for the Gemma <i>training</i> template, not for a teacher generating data).</p>
+
+<h3>4c · Serving the teacher</h3>
+<pre><code># Qwen3 (or swap in NousResearch/Hermes-3-Llama-3.1-70B)
+vllm serve Qwen/Qwen3-32B-AWQ \
+  --served-model-name teacher \
+  --enable-auto-tool-choice --tool-call-parser hermes \
+  --max-model-len 40960 --kv-cache-dtype fp8 \
+  --max-num-seqs 48 --gpu-memory-utilization 0.92
+
+# client
+client = OpenAI(base_url="http://localhost:8000/v1", api_key="EMPTY")</code></pre>
+<p class="small">Qwen3 and Hermes-3 both use vLLM's <code>hermes</code> tool-call parser. <code>--max-num-seqs</code> is the
+concurrency knob; raise it until the scrape IP (not the GPU) is the bottleneck. Run the vLLM server and the scrape
+browser on the <b>same pod</b>, or point scrape at the devbox — either way the scrape egress is the thing to watch.</p>
+
+<h2>5 · Wiring it into <code>eval_split.py</code></h2>
+<p>Add a third <code>--model</code> choice that reuses the runner above. This is the smallest change and immediately
+lets the teacher (or a vLLM-served student) run through the existing seed-42 plan + scorer against the Sonnet
+baseline already on disk.</p>
+<pre><code># parse_args: choices=["claude", "gemma", "vllm"]; add --base-url, --served-model-name
+# build_runner: new branch
+if args.model == "vllm":
+    from openai_agent import run_episode as vllm_run_episode
+    client = OpenAI(base_url=args.base_url, api_key="EMPTY")
+    def runner(ep, tools, registry, sysp):
+        return vllm_run_episode(client, args.served_model_name, ep, tools, registry, sysp)
+    return runner
+# workers: vllm is a concurrent SERVER -&gt; do NOT force workers=1 (unlike gemma).
+#   default it to e.g. 16; the server batches across the pool via continuous batching.</code></pre>
+
+<h2>6 · The Gemma <i>student</i> on vLLM (the inference worry)</h2>
+<p>The v1 eval was slow and fragile for a structural reason: <code>eval_split.py</code> <b>forces
+<code>--workers 1</code></b> because a single HF <code>model.generate</code> isn't thread-safe, and the SDPA math
+path OOMs on long context (it moved to an A100 for headroom). A vLLM server fixes both — it's concurrent by
+construction (continuous batching) and uses paged KV. This is the direct answer to "I'm worried about inference on
+this Gemma model": serve it once, raise the worker count, done. It also becomes the GRPO rollout engine later.</p>
+
+<div class="box crit"><span class="lbl">Validate this FIRST — same demon as the SDPA saga</span>
+Gemma-4-E4B's global-attention layers have <b><code>head_dim=512</code></b> (CLAUDE.md). That is exactly what broke
+FlashAttention-2 (caps at 256) and forced the whole SDPA GQA patch. vLLM's default attention backends inherit the
+same constraint:
+<ul>
+  <li><b>On Hopper (H100/H200):</b> FlashAttention-3 / FlashInfer handle head_dim ≥ 256 → should work. <b>Validate
+  the vLLM-Gemma path on the H200 you already have.</b></li>
+  <li><b>On Ampere (A100/A10, the current eval box):</b> FA caps at 256 → may fail or fall back. Try
+  <code>VLLM_ATTENTION_BACKEND=XFORMERS</code> (or Triton) and confirm it loads <i>and</i> produces correct output
+  before trusting any speedup. Treat "does Gemma-4-E4B even serve on this card under vLLM" as the go/no-go gate.</li>
+</ul>
+Also confirm vLLM loads the model as <code>Gemma4ForCausalLM</code> (text-only path). Liger only supports
+<code>gemma4_text</code>, not the multimodal <code>Gemma4ForConditionalGeneration</code> wrapper — vLLM's text class
+is the one to target since we never use the vision/audio towers.</div>
+
+<h3>Recommended path: raw <code>/v1/completions</code>, keep our template + parser</h3>
+<p>Do <b>not</b> use vLLM's server-side chat/tool parsing for the student. vLLM ships no Gemma-4 tool-call parser,
+and the student was SFT'd on Gemma's exact native wire format (<code>&lt;|tool_call&gt;call:NAME{…}&lt;tool_call|&gt;</code>,
+the bundled <code>tool_responses</code> turn, the reasoning-guard prefix rules). Any re-templating risks drift from
+what it was trained on. Instead, let vLLM do <b>only fast batched decode</b> and keep rendering + parsing in our code,
+byte-identical to <a href="../src/gemma/agent.py">agent.py</a>:</p>
+<pre><code># render locally with the SAME chat template used in training, then send the string
+prompt = tokenizer.apply_chat_template(
+    messages, tools=tools, add_generation_prompt=True,
+    enable_thinking=True, tokenize=False)            # -&gt; str
+
+comp = client.completions.create(
+    model="gemma-menu", prompt=prompt,
+    max_tokens=4096, temperature=0.0,                # == do_sample=False
+    stop=["&lt;tool_call|&gt;"],                            # == agent.py stop_strings
+    extra_body={"add_special_tokens": False})        # template already emits BOS
+text = comp.choices[0].text
+parsed = tokenizer.parse_response(text)              # OUR parser, unchanged</code></pre>
+<p>This is a drop-in swap of <code>generate_turn</code> in <a href="../src/gemma/agent.py">agent.py</a>:
+<code>model.generate(...)</code> → one <code>/v1/completions</code> call, everything else (the tool loop, the
+bundled <code>tool_responses</code> turns, the parse-failure recovery, budget finalize) stays exactly as written.
+The template never leaves our control, so training/inference stay matched — and the loop is now safe to run
+concurrently against the server, so eval workers can go &gt; 1.</p>
+<pre><code># serve the merged student
+vllm serve /workspace/models/gemma-menu-sft/merged \
+  --served-model-name gemma-menu \
+  --max-model-len 40960 --gpu-memory-utilization 0.90
+  # on Ampere add: VLLM_ATTENTION_BACKEND=XFORMERS (env), and validate output first</code></pre>
+<p class="small">QLoRA-fidelity reminder (v1 finding): an adapter trained on a bf16 base misbehaves applied on a
+4-bit base. Serve the <b>merged bf16</b> checkpoint under vLLM (or base+adapter in bf16), never a 4-bit base + adapter.</p>
+
+<h2>7 · Validation plan (before committing to a v2 corpus)</h2>
+<ol>
+  <li><span class="step">Teacher quality gate.</span> Serve Qwen3-32B (and/or Hermes-3-70B) on the H200, run the
+  <b>same seed-42 plan for 30–50 episodes</b> through <code>eval_split.py --model vllm</code>, score against the
+  existing Sonnet numbers (schema-valid 99.4%, found 95.0%, mean items 39.0). Greenlight if within ~5–10% on found%
+  and mean-items; else go bigger (70B → MoE-235B) rather than distilling a weak teacher.</li>
+  <li><span class="step">Gemma-serve gate.</span> Confirm the merged student <i>loads and generates correct output</i>
+  under vLLM on the target card (H200 first; Ampere only with the XFORMERS backend confirmed). Compare a handful of
+  episodes' JSON to the HF <code>model.generate</code> path — they should match at temperature 0.</li>
+  <li><span class="step">Throughput gate.</span> With Gemma served, raise <code>eval_split.py</code> workers and
+  confirm wall-clock drops and the scrape IP becomes the limiter — that's the signal the inference bottleneck is gone.</li>
+  <li><span class="step">Scale.</span> Only then run the full teacher corpus on the cheap A100 spot box.</li>
+</ol>
+
+<h2>8 · Open risks / caveats</h2>
+<table>
+  <tr><th>Risk</th><th>Mitigation</th></tr>
+  <tr><td>Gemma-4 <code>head_dim=512</code> unsupported by vLLM backend on Ampere</td><td>Validate on Hopper (H200) first; try <code>VLLM_ATTENTION_BACKEND=XFORMERS</code>/Triton on Ampere; fall back to the current HF path for eval if it won't serve.</td></tr>
+  <tr><td>Teacher quality below Sonnet → weaker student</td><td>The 30–50-episode gate catches it before spend; escalate model size on failure.</td></tr>
+  <tr><td>Scrape IP rate-limits/bans under high concurrency</td><td>The actual v2 scaling work: proxy rotation / scrape pool / spread egress. Tune <code>--max-num-seqs</code> to the scrape ceiling, not the GPU's.</td></tr>
+  <tr><td>vLLM output non-determinism across batch sizes</td><td>Fine for trace generation; for the Gemma-serve correctness gate, compare structure/JSON, not exact tokens.</td></tr>
+  <tr><td>Long menu pages exceed context</td><td>Hermes-3 (128k native) or Qwen3+YaRN; keep the <code>MAX_TOOL_CHARS</code> cap as the backstop.</td></tr>
+</table>
+
+<div class="box ok"><span class="lbl">Bottom line</span>
+Self-hosting the teacher is the right v2 move — ~100× cheaper, and since the job is scrape-bound a cheap A100 spot
+box + int4 Qwen3/Hermes-3 is the correct buy, not a big H100. The same vLLM layer serves the Gemma student
+concurrently and removes the single-worker eval bottleneck. Gate everything on the <code>head_dim=512</code>
+serve check and a 30–50-episode teacher-quality comparison against the Sonnet baseline already on disk.
+</div>
+
+<p class="small">Implementation surface, when greenlit: new <code>src/vllm/openai_agent.py</code>
+(<code>to_openai_tools</code> + <code>run_episode</code>), a <code>--model vllm</code> branch +
+<code>--base-url</code>/<code>--served-model-name</code> in <a href="../scripts/eval_split.py">eval_split.py</a>
+(and do <b>not</b> force <code>workers=1</code> for it), and a <code>vllm</code> extra in
+<code>pyproject.toml</code>. The Gemma-serve swap is a one-function change to <code>generate_turn</code> in
+<a href="../src/gemma/agent.py">agent.py</a> guarded behind a flag/env so the HF path stays the default.</p>
+
+</div>
+</body>
+</html>

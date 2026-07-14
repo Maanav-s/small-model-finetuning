@@ -111,6 +111,10 @@ def parse_args(argv=None):
     parser.add_argument("--model-path", default=None,
                         help="gemma: a local merged HF checkpoint dir (a fine-tuned student) to "
                              "load instead of the base model; claude: an optional model-id override")
+    parser.add_argument("--adapter-path", default=None,
+                        help="gemma: load a LoRA adapter dir on top of the (4-bit) base model, "
+                             "instead of a fully-merged --model-path checkpoint. Evaluates the "
+                             "adapter without materializing/pulling the ~15GB merged model.")
     parser.add_argument("--reference", type=Path, default=None,
                         help="dir of teacher eval traces to score against (build_corpus.py "
                              "--split eval). Omit to run candidates only + print self-stats.")
@@ -193,6 +197,13 @@ def build_runner(args, label):
     if args.model_path:
         gemma_model.MODEL_ID = args.model_path
     gmodel, tokenizer = load_model(quantize=True)
+    if args.adapter_path:
+        # QLoRA-style inference: LoRA adapter applied on top of the 4-bit base
+        # (avoids needing the merged bf16 checkpoint on disk). The base is MODEL_ID
+        # (hub id / GEMMA_MODEL_PATH); do not also pass --model-path here.
+        from peft import PeftModel  # noqa: E402
+        gmodel = PeftModel.from_pretrained(gmodel, args.adapter_path)
+        gmodel.eval()
 
     def runner(episode_input, tools, registry, system_prompt):
         return gemma_run_episode(
