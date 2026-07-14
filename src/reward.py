@@ -36,6 +36,7 @@ Two modes (pick per-restaurant by whether a teacher reference is available):
 
 from __future__ import annotations
 
+import json
 import math
 from dataclasses import dataclass
 
@@ -179,13 +180,30 @@ def make_grpo_reward(*, weights: RewardWeights = DEFAULT_WEIGHTS):
     final_json directly (the tool loop's parsed answer), prefer passing that in as
     the completion so scoring doesn't re-parse -- the rollout wiring (Phase 3 #3)
     will decide which. menu_reward accepts either, so this stays stable.
+
+    Each `reference` entry may be a dict (a parsed final_json) OR a JSON string
+    (the form scripts/build_grpo.py stores, to keep the dataset column a flat
+    pyarrow type); strings are json-loaded here. A None / unparseable entry ->
+    reference-free scoring for that example.
     """
     def reward_func(completions, reference=None, **_kwargs) -> list[float]:
         n = len(completions)
         refs = reference if reference is not None else [None] * n
         return [
-            menu_reward(_completion_text(c), r, weights=weights)
+            menu_reward(_completion_text(c), _coerce_reference(r), weights=weights)
             for c, r in zip(completions, refs)
         ]
 
     return reward_func
+
+
+def _coerce_reference(reference):
+    """A reference dataset entry -> a menu dict (or None). Accepts a dict as-is or
+    json-loads a string (build_grpo stores references as compact JSON strings)."""
+    if isinstance(reference, str):
+        try:
+            obj = json.loads(reference)
+        except json.JSONDecodeError:
+            return None
+        return obj if isinstance(obj, dict) else None
+    return reference if isinstance(reference, dict) else None
