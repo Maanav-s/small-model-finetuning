@@ -24,7 +24,8 @@ weights rather than carried in the prompt at inference (see CLAUDE.md). Every it
 in the block is a behavioral nudge about HOW to work that does NOT change what the
 correct menu is, so it is safe to drop from the student; everything that DOES
 define the task -- schema, the food-only scope rule, dietary restrictions, tools,
-and the shared tool-loop orientation -- is identical across variants.
+the shared tool-loop orientation, and the termination rule (_ALWAYS_ANSWER_RULE:
+every episode must end with a JSON object) -- is identical across variants.
 """
 
 from __future__ import annotations
@@ -153,6 +154,34 @@ Tool-use rules:
   Do NOT expect a tool to return structured menu data - YOU produce the JSON.
 """
 
+# Appended for BOTH variants: the termination rule. This is the ONE thing the v1
+# student failed at -- not menu quality but COMMITTING to an answer: 72% of eval
+# episodes returned an EMPTY final reply (bf16 serving cut that to ~35%, so the
+# rest is a real behavioural gap), while the menus it did produce were
+# teacher-quality (notes/experiments.md). BUDGET_FINALIZE_INSTRUCTION already
+# nudges this on the LAST turn only; this makes "always end with the JSON" a
+# standing rule in the system prompt instead of a last-second correction.
+#
+# Why SHARED and not student-only: `variant` gates exactly one block
+# (_TEACHER_GUIDANCE) by design, and this is not distillable strategy -- it is a
+# task-completion requirement ("an episode must end with a JSON object"), the same
+# category as the schema. Shared also keeps a future SFT run's teacher-rendered
+# trajectories and the student prompt consistent.
+_ALWAYS_ANSWER_RULE = """\
+
+Finishing:
+- Your tool-call budget is LIMITED. ALWAYS finish by replying with the JSON object.
+  NEVER end your turn with an empty reply, and never stop without an answer - an
+  empty reply is the WORST possible outcome and counts as a total failure, worse
+  than an incomplete menu.
+- As soon as you have gathered what you reasonably can - or the moment you are told
+  you have no tool calls left - STOP calling tools and output the menu JSON from the
+  information you ALREADY have. A PARTIAL menu (found=true with just the items you
+  did find) is far better than no reply.
+- If you genuinely could not find any menu, reply with the found=false shape above.
+  Either way, every episode MUST end with a single raw JSON object.
+"""
+
 # Teacher-only working guidance -- the block that "teacher" includes and "student"
 # omits (see the module docstring on context distillation). Every item shapes HOW
 # the agent works, not WHAT the correct menu is, so the student learns it from the
@@ -232,6 +261,7 @@ def build_system_prompt(dietary_restrictions=None, *, variant: str = "teacher") 
         not_found=NOT_FOUND_SNIPPET,
     )
     prompt += _SHARED_TOOL_ORIENTATION
+    prompt += _ALWAYS_ANSWER_RULE
     if variant == "teacher":
         prompt += _TEACHER_GUIDANCE
     return prompt
