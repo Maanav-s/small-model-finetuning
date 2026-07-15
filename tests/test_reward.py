@@ -210,6 +210,20 @@ def test_grpo_rewards_fallback_parse_from_completion():
     assert grounding_reward([completion])[0] > 0.0
 
 
+def test_grpo_grounding_reads_tool_message_not_answer():
+    # TRL appends {"role":"tool"} results INTO completions during a tool rollout
+    # (grpo_trainer ~1559). grounding must read THOSE, not the final answer -- this
+    # is the plumbing train_grpo.py depends on.
+    _s, _f, grounding_reward = make_grpo_rewards()[0]
+    call = {"role": "assistant", "content": None,
+            "tool_calls": [{"type": "function", "function": {"name": "scrape_url", "arguments": {"url": "x"}}}]}
+    tool_msg = {"role": "tool", "name": "scrape_url",
+                "content": "Menu: Margherita Pizza $12, Marinara Pizza $10"}
+    grounded = [call, tool_msg, {"role": "assistant", "content": json.dumps(menu("Margherita Pizza", "Marinara Pizza"))}]
+    hallucinated = [call, tool_msg, {"role": "assistant", "content": json.dumps(menu("Dragon Roll", "Wagyu Skewer"))}]
+    assert grounding_reward([grounded])[0] > 0 > grounding_reward([hallucinated])[0]
+
+
 def test_include_dietary_adds_zero_weight_slot():
     funcs, weights = make_grpo_rewards(include_dietary=True)
     assert [f.__name__ for f in funcs][-1] == "dietary_reward"
