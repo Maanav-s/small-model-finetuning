@@ -204,7 +204,7 @@ def build_runner(args, label):
 
     if args.model == "vllm":
         # OpenAI-compatible vLLM server (teacher / tool-parser models). No torch.
-        sys.path.insert(0, str(REPO_ROOT / "src" / "vllm"))
+        sys.path.insert(0, str(REPO_ROOT / "src" / "serving"))
         from openai_agent import build_client  # noqa: E402
         from openai_agent import run_episode as vllm_run_episode  # noqa: E402
 
@@ -225,7 +225,7 @@ def build_runner(args, label):
         from transformers import AutoTokenizer  # noqa: E402
 
         sys.path.insert(0, str(REPO_ROOT / "src" / "gemma"))
-        sys.path.insert(0, str(REPO_ROOT / "src" / "vllm"))
+        sys.path.insert(0, str(REPO_ROOT / "src" / "serving"))
         from agent import run_episode as gemma_run_episode  # noqa: E402
         from openai_agent import build_client, build_gemma_completions  # noqa: E402
 

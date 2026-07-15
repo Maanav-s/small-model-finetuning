@@ -107,6 +107,10 @@ def load_policy_model(model_path: str | None, attn: str = "sdpa"):
         src, dtype=torch.bfloat16, attn_implementation=attn
     )
     model.config.use_cache = False  # required with gradient_checkpointing
+    # Gemma 4 is multimodal: max_position_embeddings lives on the text sub-config, but
+    # TRL's tool loop reads config.max_position_embeddings at the top level -> expose it.
+    if not hasattr(model.config, "max_position_embeddings"):
+        model.config.max_position_embeddings = model.config.get_text_config().max_position_embeddings
     return model
 
 

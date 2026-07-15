@@ -1,4 +1,4 @@
-"""Unit tests for src/vllm/openai_agent.py (the OpenAI-compatible vLLM runner).
+"""Unit tests for src/serving/openai_agent.py (the OpenAI-compatible vLLM runner).
 
 Pure-local, no server / no `openai` package: run_episode takes an injected client,
 so a scripted fake drives the tool loop. Covers to_openai_tools shape and the
@@ -12,7 +12,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src"))
-sys.path.insert(0, str(ROOT / "src" / "vllm"))
+sys.path.insert(0, str(ROOT / "src" / "serving"))
 
 from openai_agent import run_episode, to_openai_tools  # noqa: E402
 
