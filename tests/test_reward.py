@@ -18,6 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from reward import (  # noqa: E402
     DEFAULT_WEIGHTS,
+    GROUNDING_SLACK,
     HALLUCINATION_PENALTY,
     RewardWeights,
     _evidence_from_completion,
@@ -29,6 +30,9 @@ from reward import (  # noqa: E402
     menu_reward,
     structure_score,
 )
+
+# A fully-ungrounded menu scores the penalty on the ungrounded fraction beyond SLACK.
+FULLY_HALLUCINATED_GROUNDING = -HALLUCINATION_PENALTY * (1.0 - GROUNDING_SLACK)
 
 
 def it(name, price=None):
@@ -93,8 +97,20 @@ def test_grounding_fully_grounded_positive():
     assert grounding_score(menu(*REAL), EVIDENCE) > 0.0
 
 
-def test_grounding_fully_hallucinated_is_max_penalty():
-    assert grounding_score(menu(*FAKE), EVIDENCE) == pytest.approx(-HALLUCINATION_PENALTY)
+def test_grounding_fully_hallucinated_is_penalised():
+    assert grounding_score(menu(*FAKE), EVIDENCE) == pytest.approx(FULLY_HALLUCINATED_GROUNDING)
+    assert grounding_score(menu(*FAKE), EVIDENCE) < 0.0
+
+
+def test_grounding_slack_absorbs_matcher_noise():
+    # 6 real + 1 fake (frac 6/7 ≈ 0.857): ungrounded_frac ≈0.143 < SLACK -> NO penalty,
+    # so a mostly-real menu isn't punished for one unmatched item.
+    ev = "aaa bbb ccc ddd eee fff"
+    m = menu("aaa", "bbb", "ccc", "ddd", "eee", "fff", "zzz-fake")
+    from reward import GROUND_SATURATION_TAU  # noqa: E402
+    import math
+    expected = (1 - math.exp(-6 / GROUND_SATURATION_TAU)) * (6 / 7)  # penalty term is 0
+    assert grounding_score(m, ev) == pytest.approx(expected)
 
 
 def test_grounding_zero_when_nothing_to_grade():
@@ -183,7 +199,7 @@ def test_grpo_rewards_use_final_json_and_evidence_kwargs():
     assert structure_reward(completions, final_json=fj, evidence=ev) == [1.0, 1.0, 1.0]
     assert found_reward(completions, final_json=fj, evidence=ev) == [1.0, 1.0, 0.0]
     g = grounding_reward(completions, final_json=fj, evidence=ev)
-    assert g[0] > 0 and g[1] == pytest.approx(-HALLUCINATION_PENALTY) and g[2] == 0.0
+    assert g[0] > 0 and g[1] == pytest.approx(FULLY_HALLUCINATED_GROUNDING) and g[2] == 0.0
 
 
 def test_grpo_rewards_fallback_parse_from_completion():

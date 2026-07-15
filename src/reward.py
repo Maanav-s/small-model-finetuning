@@ -78,15 +78,25 @@ class RewardWeights:
 DEFAULT_WEIGHTS = RewardWeights()
 
 # grounded-item completeness saturates: 1 - exp(-n_grounded / TAU). Diminishing
-# returns so volume alone can't be farmed (≈0.49 at 10 grounded items, 0.86 at 30).
-GROUND_SATURATION_TAU = 15.0
+# returns so volume alone can't be farmed. TAU=20 keeps the gradient meaningful
+# across the realistic menu size (teacher menus average ~39 items): completeness is
+# ≈0.39 at 10 grounded items, 0.63 at 20, 0.86 at 40 -- so extracting MORE of a
+# large menu keeps paying, instead of flattening by ~30 items (TAU=15 did).
+GROUND_SATURATION_TAU = 20.0
 
-# How hard a fully-ungrounded (hallucinated) menu is punished: the grounding term is
-# `completeness·grounded_frac - HALLUCINATION_PENALTY·(1 - grounded_frac)`, so a
-# 0%-grounded menu scores -HALLUCINATION_PENALTY. Tune this to set where a
-# partly-hallucinated menu crosses BELOW honest abstention -- the key calibration
-# knob (see test_reward for the ordering it enforces).
+# How hard hallucinated items are punished. The grounding term is
+#   completeness·grounded_frac - HALLUCINATION_PENALTY·max(0, ungrounded_frac - SLACK)
+# so a 0%-grounded menu scores about -HALLUCINATION_PENALTY·(1 - SLACK). This is the
+# key knob for where a partly-hallucinated menu crosses BELOW honest abstention.
 HALLUCINATION_PENALTY = 1.0
+
+# Ungrounded-fraction tolerance before the penalty bites. is_grounded is a strict
+# substring test (high precision, but it FALSE-NEGATIVES on legitimately reworded
+# items -- "Margherita" on the page vs "Margherita Pizza" in the answer). Without
+# slack, that matcher noise would penalise real menus. 0.15 lets ~1-in-7 items go
+# unmatched as assumed-real before any penalty applies, so the penalty targets
+# genuine hallucination, not matcher imperfection. Revisit against real rollout data.
+GROUNDING_SLACK = 0.15
 
 # Gemma renders a tool result as <|tool_response>...<tool_response|>. When evidence
 # isn't supplied as a kwarg we recover it from those spans in the completion text
@@ -170,7 +180,10 @@ def grounding_score(menu, evidence: str) -> float:
     n_grounded, n_total = count_grounded(items, evidence)
     grounded_frac = n_grounded / n_total
     completeness = 1.0 - math.exp(-n_grounded / GROUND_SATURATION_TAU)
-    return completeness * grounded_frac - HALLUCINATION_PENALTY * (1.0 - grounded_frac)
+    # reward real-item volume (scaled by cleanliness), penalise the hallucinated
+    # fraction beyond the SLACK tolerance for matcher false-negatives.
+    penalty = HALLUCINATION_PENALTY * max(0.0, (1.0 - grounded_frac) - GROUNDING_SLACK)
+    return completeness * grounded_frac - penalty
 
 
 def dietary_score(menu, dietary_restrictions, judge=None) -> float:
