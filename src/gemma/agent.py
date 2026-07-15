@@ -38,12 +38,28 @@ def build_messages(restaurant_name: str, system_prompt: str = SYSTEM_PROMPT) -> 
     ]
 
 
-def generate_turn(model, tokenizer, messages: list[dict], tools: list) -> str:
+def generate_turn(model, tokenizer, messages: list[dict], tools: list,
+                  vllm_generate=None) -> str:
     """Render `messages`, generate one model turn, return the decoded text.
 
     Keeps special tokens (skip_special_tokens=False) so parse_response can see
     the <|tool_call> markers.
+
+    vllm_generate: optional `callable(prompt_str) -> generated_text`. When given,
+    generation is delegated to a vLLM /v1/completions server (fast, concurrent --
+    for eval/GRPO on the SAME rendered template, so training/inference stay matched;
+    see notes/vllm_inference.html and openai_agent.build_gemma_completions). When
+    None (default), the local HF model.generate path below is used unchanged. The
+    callable must reproduce the HF stop behaviour: stop at "<tool_call|>" and return
+    text that still ENDS with that marker so parse_response sees a complete call.
     """
+    if vllm_generate is not None:
+        prompt = tokenizer.apply_chat_template(
+            messages, tools=tools, add_generation_prompt=True,
+            enable_thinking=True, tokenize=False,
+        )
+        return vllm_generate(prompt)
+
     inputs = tokenizer.apply_chat_template(
         messages,
         tools=tools,
@@ -80,8 +96,14 @@ def run_episode(
     tools: list,
     tool_registry: dict,
     system_prompt: str,
+    vllm_generate=None,
 ) -> str:
-    """Run the tool-call loop for one restaurant; return the final answer text."""
+    """Run the tool-call loop for one restaurant; return the final answer text.
+
+    vllm_generate (optional): delegate generation to a vLLM completions server
+    instead of the local HF model (see generate_turn). `model` may be None on that
+    path -- only the tokenizer (for rendering) is needed.
+    """
     messages = build_messages(restaurant_name, system_prompt=system_prompt)
 
     for step in range(MAX_TOOL_CALLS + 1):
@@ -102,7 +124,7 @@ def run_episode(
                 "tool_responses": [{"name": name, "response": BUDGET_FINALIZE_INSTRUCTION}],
             })
 
-        text = generate_turn(model, tokenizer, messages, tools)
+        text = generate_turn(model, tokenizer, messages, tools, vllm_generate=vllm_generate)
         try:
             parsed = tokenizer.parse_response(text)  # {role, [thinking], content?, tool_calls?}
         except (ValueError, TypeError) as e:

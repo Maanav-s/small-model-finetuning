@@ -106,11 +106,22 @@ def parse_args(argv=None):
     )
     parser.add_argument("candidate_dir", type=Path,
                         help="directory to write candidate trace JSON files into (one per episode)")
-    parser.add_argument("--model", choices=["claude", "gemma"], required=True,
-                        help="which runner produces the candidates")
+    parser.add_argument("--model", choices=["claude", "gemma", "vllm"], required=True,
+                        help="which runner produces the candidates. 'vllm' drives an "
+                             "OpenAI-compatible vLLM server (teacher / tool-parser models); "
+                             "'gemma' + --gemma-vllm-base-url serves the student via vLLM.")
     parser.add_argument("--model-path", default=None,
                         help="gemma: a local merged HF checkpoint dir (a fine-tuned student) to "
                              "load instead of the base model; claude: an optional model-id override")
+    parser.add_argument("--base-url", default="http://localhost:8000/v1",
+                        help="vllm: OpenAI-compatible base URL of the vLLM server")
+    parser.add_argument("--served-model-name", default=None,
+                        help="vllm: served model name on the vLLM server (--served-model-name at "
+                             "serve time). Also the Gemma completions model when --gemma-vllm-base-url is set.")
+    parser.add_argument("--gemma-vllm-base-url", default=None,
+                        help="gemma: serve the student via a vLLM /v1/completions server at this URL "
+                             "(fast + concurrent) instead of loading HF weights locally. Renders with "
+                             "our own template/parser (agent.generate_turn's vLLM path).")
     parser.add_argument("--adapter-path", default=None,
                         help="gemma: load a LoRA adapter dir on top of the (4-bit) base model, "
                              "instead of a fully-merged --model-path checkpoint. Evaluates the "
@@ -145,11 +156,15 @@ def parse_args(argv=None):
                         help="print the planned episodes and exit (no API/GPU calls)")
     args = parser.parse_args(argv)
 
-    # Single GPU model isn't thread-safe: gemma is forced to one worker.
+    # Concurrency: a local single-GPU HF gemma runner isn't thread-safe (forced to
+    # 1 worker). vLLM (server) runners -- '--model vllm' or gemma via
+    # --gemma-vllm-base-url -- ARE concurrent, so default them high.
+    local_gemma = args.model == "gemma" and not args.gemma_vllm_base_url
+    is_vllm = args.model == "vllm" or (args.model == "gemma" and args.gemma_vllm_base_url)
     if args.workers is None:
-        args.workers = 1 if args.model == "gemma" else 3
-    elif args.model == "gemma" and args.workers != 1:
-        print("[warn] gemma runner is single-GPU / not thread-safe -- forcing --workers 1")
+        args.workers = 1 if local_gemma else (16 if is_vllm else 3)
+    elif local_gemma and args.workers != 1:
+        print("[warn] local gemma runner is single-GPU / not thread-safe -- forcing --workers 1")
         args.workers = 1
     return args
 
@@ -158,6 +173,8 @@ def model_label(args) -> str:
     """The `model` field stamped into each candidate trace (checkpoint or base id)."""
     if args.model == "gemma":
         return args.model_path or GEMMA_MODEL_ID
+    if args.model == "vllm":
+        return args.served_model_name or "vllm"
     return args.model_path or CLAUDE_MODEL_ID
 
 
@@ -185,7 +202,45 @@ def build_runner(args, label):
 
         return runner
 
-    # gemma: load once, reuse. --model-path points load_model's from_pretrained
+    if args.model == "vllm":
+        # OpenAI-compatible vLLM server (teacher / tool-parser models). No torch.
+        sys.path.insert(0, str(REPO_ROOT / "src" / "vllm"))
+        from openai_agent import build_client  # noqa: E402
+        from openai_agent import run_episode as vllm_run_episode  # noqa: E402
+
+        client = build_client(args.base_url)
+        served = args.served_model_name or "teacher"
+
+        def runner(episode_input, tools, registry, system_prompt):
+            final_text, _messages = vllm_run_episode(
+                client, served, episode_input, tools, registry, system_prompt
+            )
+            return final_text
+
+        return runner
+
+    # gemma via a vLLM completions server: render with OUR template, decode on vLLM.
+    # Tokenizer-only (no HF weights loaded locally), so it's concurrent + fast.
+    if args.gemma_vllm_base_url:
+        from transformers import AutoTokenizer  # noqa: E402
+
+        sys.path.insert(0, str(REPO_ROOT / "src" / "gemma"))
+        sys.path.insert(0, str(REPO_ROOT / "src" / "vllm"))
+        from agent import run_episode as gemma_run_episode  # noqa: E402
+        from openai_agent import build_client, build_gemma_completions  # noqa: E402
+
+        tokenizer = AutoTokenizer.from_pretrained(args.model_path or GEMMA_MODEL_ID)
+        vllm_generate = build_gemma_completions(
+            build_client(args.gemma_vllm_base_url), args.served_model_name or "gemma-menu"
+        )
+
+        def runner(episode_input, tools, registry, system_prompt):
+            return gemma_run_episode(None, tokenizer, episode_input, tools, registry,
+                                     system_prompt, vllm_generate=vllm_generate)
+
+        return runner
+
+    # gemma (local HF): load once, reuse. --model-path points load_model's from_pretrained
     # source at a merged student checkpoint. load_model (src/gemma/model.py) reads
     # its module-global MODEL_ID, so we retarget that instead of editing model.py --
     # this keeps its SDPA GQA patch + 4-bit/device_map setup intact.
