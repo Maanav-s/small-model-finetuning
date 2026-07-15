@@ -18,7 +18,6 @@ sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(ROOT / "scripts"))
 
 from build_grpo import load_eval_rids, trace_to_grpo_row  # noqa: E402
-from reward import make_grpo_reward  # noqa: E402
 
 
 def trace(final_obj, *, dietary=None, rid="r1", episode="Joe's Pizza, NYC"):
@@ -86,14 +85,12 @@ def test_unparseable_final_raises():
         trace_to_grpo_row(t)
 
 
-def test_row_reference_scores_through_reward():
-    # End-to-end: a row's reference string, scored against a perfect completion.
+def test_reference_is_analysis_only_metadata():
+    # The reward is now teacher-free (grounding-based), so `reference` is retained
+    # only as offline-analysis metadata -- it is NOT consumed by the reward. Assert
+    # it still round-trips so eval/analysis can use it.
     row = trace_to_grpo_row(trace(MENU))
-    fn = make_grpo_reward()
-    out = fn([json.dumps(MENU)], reference=[row["reference"]])
-    assert out == [pytest.approx(1.0)]
-    # and an empty rollout scores the 0 floor.
-    assert fn([""], reference=[row["reference"]]) == [0.0]
+    assert json.loads(row["reference"]) == MENU
 
 
 def test_load_eval_rids(tmp_path):

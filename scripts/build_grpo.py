@@ -2,10 +2,10 @@
 
 Unlike build_sft.py -- which bakes the full teacher trajectory into a trainable
 sequence -- GRPO generates the trajectory ON-POLICY at train time, so a row needs
-only two things: the PROMPT to roll out from, and a REFERENCE to score the rollout
-against. `scripts/train_grpo.py` hands each prompt to TRL's GRPOTrainer (with the
-web_search/scrape_url tools + vLLM), which produces G tool-use rollouts, and
-`src/reward.py` scores each rollout's final menu against `reference`.
+essentially just the PROMPT to roll out from. `scripts/train_grpo.py` hands each
+prompt to TRL's GRPOTrainer (with the web_search/scrape_url tools + vLLM), which
+produces G tool-use rollouts, and `src/reward.py` scores each rollout from the
+episode itself (schema + found + GROUNDING in the scraped evidence).
 
 Prompt = the SHIPPED student view (same as eval): system = build_system_prompt(
 dietary, variant="student") (teacher guidance absent; the dietary restriction --
@@ -13,11 +13,12 @@ target-defining -- kept), then the user episode input. The tool DECLARATIONS are
 NOT in the prompt: GRPOTrainer renders them from the tool callables, exactly as
 the agent loop and eval do (tools=TOOLS passed to apply_chat_template).
 
-Reference = the teacher's cleaned final_json (schema.extract_json of the last
-assistant turn), stored as a compact JSON STRING (pyarrow-friendly nested-schema
-sidestep; src/reward.make_grpo_reward json-loads it). found=false references are
-KEPT -- they are the abstention signal the reward grades (a correct abstention on
-an unfindable restaurant scores high; see src/reward.py).
+Reference = the teacher's cleaned final_json, stored as a compact JSON STRING.
+IMPORTANT: this is **analysis-only metadata** -- the reward is now teacher-free
+(pure RL: it does NOT score against this reference; see src/reward.py). It is kept
+only so offline eval/analysis can compare rollouts to the teacher if wanted. The
+`dietary_restrictions` column IS used at train time (a future local dietary judge
+grades conditioned menus against it).
 
 Output (one JSON object per line in data/grpo/train.jsonl):
   {

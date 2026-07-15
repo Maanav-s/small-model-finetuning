@@ -1,89 +1,106 @@
-"""The GRPO reward — score one rollout's menu answer to a scalar in [0, 1].
+"""The GRPO reward — PURE RL, no teacher reference (Phase 3).
 
-Phase 3 (GRPO RL) reward, built by *composing* the pure per-episode terms in
-eval_metrics.py (the same scoring contract the eval harness uses), so the reward
-and the eval can't drift. Nothing here does I/O; it takes a candidate answer
-(raw model text OR an already-parsed final_json dict) and returns a reward, so it
-is importable from a TRL reward callback, a notebook, or a test with no GPU/network.
+Scores a rollout from signals intrinsic to the episode only: the schema, the
+model's own found/abstain call, and whether the menu is GROUNDED in the tool
+outputs the agent actually scraped. There is deliberately NO comparison to a
+teacher menu -- the teacher generated the SFT warm-start, but GRPO optimizes
+against the environment, not against Claude, so the policy can in principle
+exceed the teacher instead of being capped at imitating it.
 
-Design — shaped, gated, bounded to [0, 1]:
-  reward = w_valid·schema_valid                      # emit a valid menu AT ALL
-         + schema_valid·( w_found·found_correct      # right found/abstain call
-                        + w_content·content          # completeness (+ correctness)
-                        + w_price·price )             # price agreement / coverage
-An unparseable or schema-invalid answer scores **0** (the floor). A valid, found-
-correct, fully-matching menu scores **1.0**. The intermediate shaping is the point:
-within a GRPO group (G rollouts for one restaurant) a *more complete* valid menu
-outranks a thin one, which outranks an **empty** answer. That gradient targets the
-v1 failure mode head-on — the dominant SFT failure was an *empty* final answer
-(non-termination), not a wrong menu (see notes/experiments.md), so the reward's
-first job is to make "produce a valid, complete menu" strictly beat "give up".
+Split into SEPARATE reward functions (TRL's GRPOTrainer takes a `reward_funcs`
+list, sums them with `reward_weights`, and logs each term's mean independently --
+so `structure`, `found`, and `grounding` each get their own training curve to
+watch). The three live terms:
 
-Two modes (pick per-restaurant by whether a teacher reference is available):
-  - REFERENCE-BASED (recommended): score against the teacher's final_json via
-    score_episode. `content` = item-level F1 (recall AND precision), so padding
-    the menu with invented items is *penalised* (precision drops) — the reward is
-    not hackable by hallucinating length. `found_correct` grades abstention, and
-    dietary-conditioned episodes are handled for free when the reference is the
-    teacher's menu *under the same restriction* (matching a filtered menu rewards
-    compliance without a separate per-item dietary classifier).
-  - REFERENCE-FREE (fallback): no teacher menu, so `content` is a *saturating*
-    function of raw item count and `price` is price coverage. This CANNOT detect
-    hallucination (no precision signal) and rewards claiming a menu even when the
-    restaurant is unfindable, so prefer reference-based; use this only on
-    restaurants known to be findable. See REWARD-HACKING notes on the two modes.
+  structure  schema_valid (jsonschema vs MENU_SCHEMA)            -> {0, 1}
+  found      committed to a menu: valid AND found AND items>0    -> {0, 1}
+  grounding  are the items REAL -- each item name present in the -> [-penalty, ~1]
+             tool-response text the agent scraped this episode;
+             rewards grounded volume, PENALISES ungrounded items
+
+  dietary    (STUB, weight 0) compliance of a conditioned menu with its dietary
+             restriction -- a semantic judgment (is this dish vegetarian?) that
+             needs world knowledge, so it is deferred to a small LOCALLY-inferenced
+             judge model. See dietary_reward + notes below.
+
+Why grounding replaces the old F1-vs-teacher term: without a reference we lose the
+precision signal that stopped the model padding the menu with invented items. The
+replacement is FAITHFULNESS TO THE RETRIEVED EVIDENCE -- an item counts only if its
+name actually appears in what the agent scraped. Hallucinated items are not in the
+evidence, so they are penalised; and since an unfindable restaurant yields no menu
+in the scraped pages, confidently inventing one also scores negative. This makes
+"honestly abstain" (found=false -> grounding 0) strictly better than "confidently
+hallucinate" (grounding < 0), while a grounded, complete menu scores highest.
+
+REWARD ORDERING (the gradient GRPO follows), with default weights + penalty:
+  schema-invalid            ~0     (hard floor: structure/found/grounding all gate on valid)
+  confident hallucination   < 0    (grounding penalty dominates)
+  honest abstention          +     (structure only; grounding neutral)
+  grounded, complete menu    ++    (all three positive)
+
+EVIDENCE PLUMBING (important): grounding needs the concatenated tool-response text
+for the rollout. The clean path is the GRPO rollout (a TRL `rollout_func` running
+our agent loop) attaching per-trajectory `final_json` and `evidence` kwargs -- we
+run the tool loop ourselves anyway, so both are in hand. make_grpo_rewards() reads
+those kwargs first and only falls back to best-effort parsing of the completion.
+This is the one part that must be validated against TRL's actual reward-callback
+inputs on GPU (see the GRPO wiring / notes).
 """
 
 from __future__ import annotations
 
-import json
 import math
+import re
 from dataclasses import dataclass
 
-from eval_metrics import score_episode, self_report
+from eval_metrics import flatten_items, is_schema_valid, normalize_name
 from schema import extract_json
 
 
 @dataclass(frozen=True)
 class RewardWeights:
-    """Component weights; sum to 1.0 so a perfect answer scores exactly 1.0.
-
-    valid   — floor credit for emitting ANY schema-valid menu (targets the
-              empty-output failure: a valid-but-thin menu must beat "").
-    found   — correct found/abstain call (score_episode.found_correct).
-    content — completeness: F1 vs the reference (ref mode) or a saturating item
-              count (ref-free). The dominant term — this is what "a good menu" means.
-    price   — price agreement on matched items (ref mode) or price coverage (ref-free).
+    """Per-term weights, passed to GRPOConfig.reward_weights in list order
+    (structure, found, grounding, dietary). Not required to sum to 1 -- GRPO
+    normalises advantages within each generation group, so only the RELATIVE
+    magnitudes matter. grounding dominates because "are the items real" is the
+    hardest-won and most game-prone signal.
     """
 
-    valid: float = 0.10
-    found: float = 0.20
-    content: float = 0.60
-    price: float = 0.10
+    structure: float = 0.2
+    found: float = 0.2
+    grounding: float = 0.6
+    dietary: float = 0.0  # stub until the local dietary judge exists
 
-    def total(self) -> float:
-        return self.valid + self.found + self.content + self.price
+    def as_list(self) -> list[float]:
+        return [self.structure, self.found, self.grounding, self.dietary]
 
 
 DEFAULT_WEIGHTS = RewardWeights()
 
-# Reference-free content saturation: content = 1 - exp(-n_items / TAU). Diminishing
-# returns so the model isn't rewarded without bound for padding item count (the only
-# lever ref-free mode has against hallucination). At TAU=15: ~10 items -> 0.49,
-# ~20 -> 0.74, ~30 -> 0.86, ~45 -> 0.95. Teacher menus average ~39 items.
-ITEM_SATURATION_TAU = 15.0
+# grounded-item completeness saturates: 1 - exp(-n_grounded / TAU). Diminishing
+# returns so volume alone can't be farmed (≈0.49 at 10 grounded items, 0.86 at 30).
+GROUND_SATURATION_TAU = 15.0
+
+# How hard a fully-ungrounded (hallucinated) menu is punished: the grounding term is
+# `completeness·grounded_frac - HALLUCINATION_PENALTY·(1 - grounded_frac)`, so a
+# 0%-grounded menu scores -HALLUCINATION_PENALTY. Tune this to set where a
+# partly-hallucinated menu crosses BELOW honest abstention -- the key calibration
+# knob (see test_reward for the ordering it enforces).
+HALLUCINATION_PENALTY = 1.0
+
+# Gemma renders a tool result as <|tool_response>...<tool_response|>. When evidence
+# isn't supplied as a kwarg we recover it from those spans in the completion text
+# (NOT the whole completion -- the final answer's own item names must not count as
+# their own grounding).
+_TOOL_RESPONSE_RE = re.compile(r"<\|tool_response>(.*?)<tool_response\|>", re.DOTALL)
 
 
+# ---------------------------------------------------------------------------
+# Candidate + evidence coercion
+# ---------------------------------------------------------------------------
 def _as_menu(candidate) -> dict | None:
-    """Coerce a candidate answer to a parsed menu dict, or None if unusable.
-
-    Accepts a raw model string (parsed via schema.extract_json, the SAME
-    tolerant parser the eval harness and corpus builder use) or an
-    already-parsed final_json dict. A None / empty / unparseable answer -> None,
-    which every mode scores as the 0 floor (this is the empty-output case).
-    """
-    if candidate is None:
-        return None
+    """A candidate answer -> a parsed menu dict, or None (unusable -> the floor).
+    Accepts a dict (parsed final_json) or a raw string (schema.extract_json)."""
     if isinstance(candidate, dict):
         return candidate
     if isinstance(candidate, str):
@@ -92,72 +109,129 @@ def _as_menu(candidate) -> dict | None:
     return None
 
 
-def _saturating_item_content(n_items: int) -> float:
-    """Bounded [0, 1) completeness proxy for reference-free mode (see TAU note)."""
-    return 1.0 - math.exp(-max(0, n_items) / ITEM_SATURATION_TAU)
+def is_grounded(item_name, normalized_evidence: str) -> bool:
+    """True if the item name appears (normalized substring) in the scraped evidence.
+
+    Both sides go through eval_metrics.normalize_name (casefold, punctuation ->
+    space, whitespace collapsed), then a contiguous substring test. Contiguous (not
+    token-subset) on purpose: it is HIGH-PRECISION -- it won't falsely ground a
+    hallucinated dish just because its common food-words ("grilled", "salad") each
+    occur somewhere on the page. The cost is under-grounding a legitimately reworded
+    item; for an anti-hallucination signal, precision is the right side to favour (a
+    real item wrongly flagged loses some reward; a fake item wrongly grounded
+    defeats the whole term).
+    """
+    nn = normalize_name(item_name)
+    return bool(nn) and nn in normalized_evidence
 
 
-def menu_reward(
-    candidate,
-    reference=None,
-    *,
-    weights: RewardWeights = DEFAULT_WEIGHTS,
-    breakdown: bool = False,
-):
-    """Scalar reward in [0, 1] for one candidate menu answer.
+def count_grounded(items: list[dict], evidence: str) -> tuple[int, int]:
+    """(n_grounded, n_total) item names found in `evidence`."""
+    norm = normalize_name(evidence or "")
+    n_grounded = sum(is_grounded(it.get("name"), norm) for it in items) if norm else 0
+    return n_grounded, len(items)
 
-    candidate : raw model text OR a parsed final_json dict (None/"" -> 0 floor).
-    reference : the teacher's final_json dict to score against (REFERENCE-BASED
-                mode). Pass None for REFERENCE-FREE mode.
-    weights   : component weights (RewardWeights).
-    breakdown : if True, return (reward, components_dict) for logging/debugging.
 
-    A schema-invalid or unparseable answer scores 0 regardless of mode.
+# ---------------------------------------------------------------------------
+# The live component scores (pure; each in its own range)
+# ---------------------------------------------------------------------------
+def structure_score(menu) -> float:
+    """1.0 if the answer is a schema-valid menu, else 0.0."""
+    return 1.0 if is_schema_valid(menu) else 0.0
+
+
+def found_score(menu) -> float:
+    """1.0 if the model committed to a menu (valid AND found AND at least one item).
+
+    Rewards *finding* a menu over abstaining. Deliberately independent of grounding
+    so its curve reads cleanly as "is the policy attempting menus?" -- the grounding
+    term separately decides whether those attempts are real, and its penalty makes a
+    hallucinated attempt net-negative overall.
+    """
+    if not is_schema_valid(menu):
+        return 0.0
+    return 1.0 if (menu.get("found") and flatten_items(menu)) else 0.0
+
+
+def grounding_score(menu, evidence: str) -> float:
+    """Faithfulness of the menu to the scraped evidence, in [-HALLUCINATION_PENALTY, ~1].
+
+    0.0 when there is nothing to grade (invalid, abstained, or no items -- no claim
+    to be faithful about). Otherwise rewards the VOLUME of grounded items
+    (saturating) scaled by the grounded FRACTION, minus a penalty on the ungrounded
+    fraction -- so a fully grounded menu is positive and a fully hallucinated one is
+    -HALLUCINATION_PENALTY.
+    """
+    if not is_schema_valid(menu):
+        return 0.0
+    items = flatten_items(menu)
+    if not items:
+        return 0.0
+    n_grounded, n_total = count_grounded(items, evidence)
+    grounded_frac = n_grounded / n_total
+    completeness = 1.0 - math.exp(-n_grounded / GROUND_SATURATION_TAU)
+    return completeness * grounded_frac - HALLUCINATION_PENALTY * (1.0 - grounded_frac)
+
+
+def dietary_score(menu, dietary_restrictions, judge=None) -> float:
+    """STUB (returns 0.0 without a judge). Compliance of a conditioned menu with its
+    restriction.
+
+    Grading this needs a per-item semantic judgment ("is Chicken Alfredo
+    vegetarian?", "is this gluten-free?") -- world knowledge a substring/keyword rule
+    can't supply reliably. The plan is a small LOCALLY-inferenced judge model (a
+    compact instruct model or a fine-tuned classifier) exposed here as
+    `judge(item, restrictions) -> compliant?`, scoring the net compliant fraction for
+    conditioned episodes only. Until that exists this returns 0.0 and carries weight
+    0, so it never perturbs training.
+    """
+    if judge is None or not dietary_restrictions:
+        return 0.0
+    items = flatten_items(menu)
+    if not items:
+        return 0.0
+    ok = sum(bool(judge(it, dietary_restrictions)) for it in items)
+    violations = len(items) - ok
+    return (ok - violations) / len(items)
+
+
+# ---------------------------------------------------------------------------
+# Composite (for eval/logging/tests -- TRL uses the split functions below)
+# ---------------------------------------------------------------------------
+def menu_reward(candidate, evidence: str = "", *, weights: RewardWeights = DEFAULT_WEIGHTS,
+                dietary_restrictions=None, dietary_judge=None, breakdown: bool = False):
+    """Weighted sum of the component scores for one rollout (teacher-free).
+
+    candidate : raw model text or a parsed final_json dict.
+    evidence  : concatenated tool-response text the agent scraped this episode
+                (grounding is scored against this -- empty => everything ungrounded).
+    Returns the scalar reward (can be NEGATIVE for a hallucinated menu -- that is
+    the point), or (reward, components) if breakdown=True.
     """
     menu = _as_menu(candidate)
-    comp = {"schema_valid": 0.0, "found": 0.0, "content": 0.0, "price": 0.0}
-
-    if reference is not None:
-        s = score_episode(menu if menu is not None else {}, reference)
-        if s["schema_valid"]:
-            comp["schema_valid"] = 1.0
-            comp["found"] = 1.0 if s["found_correct"] else 0.0
-            correct_abstention = (
-                s["found_reference"] is False and s["found_candidate"] is False
-            )
-            if correct_abstention:
-                # Nothing to extract and the model correctly abstained: full
-                # content+price credit so a right abstention ranks near the top.
-                comp["content"], comp["price"] = 1.0, 1.0
-            else:
-                comp["content"] = s["f1"] if s["f1"] is not None else 0.0
-                comp["price"] = s["price_agreement"] if s["price_agreement"] is not None else 0.0
-    else:
-        # Reference-free: self-report only (no precision signal -- see docstring).
-        sr = self_report(menu)
-        if sr["schema_valid"]:
-            comp["schema_valid"] = 1.0
-            comp["found"] = 1.0 if sr["found"] else 0.0
-            comp["content"] = _saturating_item_content(sr["n_items"])
-            comp["price"] = sr["price_coverage"] if sr["price_coverage"] is not None else 0.0
-
+    comp = {
+        "structure": structure_score(menu),
+        "found": found_score(menu),
+        "grounding": grounding_score(menu, evidence),
+        "dietary": dietary_score(menu, dietary_restrictions, dietary_judge),
+    }
     reward = (
-        weights.valid * comp["schema_valid"]
-        + comp["schema_valid"] * (
-            weights.found * comp["found"]
-            + weights.content * comp["content"]
-            + weights.price * comp["price"]
-        )
+        weights.structure * comp["structure"]
+        + weights.found * comp["found"]
+        + weights.grounding * comp["grounding"]
+        + weights.dietary * comp["dietary"]
     )
-    reward = max(0.0, min(1.0, reward))
     if breakdown:
         return reward, {**comp, "reward": reward}
     return reward
 
 
+# ---------------------------------------------------------------------------
+# Completion / evidence extraction for the TRL callbacks
+# ---------------------------------------------------------------------------
 def _completion_text(completion) -> str:
-    """Pull the answer text from a TRL completion (a str, or a conversational
-    message list whose last message's `content` is the final assistant text)."""
+    """The final answer text from a TRL completion (a str, or a message list whose
+    last message content is the final assistant text)."""
     if isinstance(completion, str):
         return completion
     if isinstance(completion, list) and completion:
@@ -167,43 +241,75 @@ def _completion_text(completion) -> str:
     return str(completion or "")
 
 
-def make_grpo_reward(*, weights: RewardWeights = DEFAULT_WEIGHTS):
-    """Build a TRL-GRPO reward callback over menu_reward.
+def _evidence_from_completion(completion) -> str:
+    """Best-effort tool-response text from a completion when `evidence` isn't passed.
 
-    Returns `reward_func(completions, reference=None, **kwargs) -> list[float]`,
-    the shape TRL's GRPOTrainer calls: `completions` is the batch of rollouts and
-    any dataset columns (here `reference`, a per-example teacher final_json or
-    None) arrive as parallel-list kwargs. Reference-free falls out when the column
-    is absent or an entry is None.
-
-    NOTE: this scores the completion TEXT. When the agentic rollout captures the
-    final_json directly (the tool loop's parsed answer), prefer passing that in as
-    the completion so scoring doesn't re-parse -- the rollout wiring (Phase 3 #3)
-    will decide which. menu_reward accepts either, so this stays stable.
-
-    Each `reference` entry may be a dict (a parsed final_json) OR a JSON string
-    (the form scripts/build_grpo.py stores, to keep the dataset column a flat
-    pyarrow type); strings are json-loaded here. A None / unparseable entry ->
-    reference-free scoring for that example.
+    Preferred path is the rollout attaching `evidence` explicitly (see module
+    docstring). Fallback: pull tool-response content from a conversational message
+    list (role 'tool'/'tool_response', or bundled `tool_responses`), or from the
+    Gemma <|tool_response>...<tool_response|> spans in a rendered string. Crucially
+    this excludes the final answer, so an item can't ground itself.
     """
-    def reward_func(completions, reference=None, **_kwargs) -> list[float]:
+    if isinstance(completion, str):
+        return "\n".join(_TOOL_RESPONSE_RE.findall(completion))
+    if isinstance(completion, list):
+        parts: list[str] = []
+        for m in completion:
+            if not isinstance(m, dict):
+                continue
+            if m.get("role") in ("tool", "tool_response"):
+                parts.append(str(m.get("content") or ""))
+            for tr in m.get("tool_responses") or []:
+                if isinstance(tr, dict):
+                    parts.append(str(tr.get("response") or ""))
+        return "\n".join(parts)
+    return ""
+
+
+def make_grpo_rewards(*, weights: RewardWeights = DEFAULT_WEIGHTS, include_dietary: bool = False):
+    """Build the TRL-GRPO `reward_funcs` list + matching `reward_weights`.
+
+    Returns (funcs, reward_weights). Pass both to GRPOTrainer/GRPOConfig; TRL calls
+    each `func(completions, **columns) -> list[float]`, sums them weighted, and logs
+    each term's mean under its __name__ (structure_reward / found_reward /
+    grounding_reward). Each example's menu and evidence come from the rollout kwargs
+    `final_json` and `evidence` when present (the clean path), else are parsed from
+    the completion. `dietary_reward` is included only when include_dietary=True; it
+    carries weight 0 and returns 0.0 until a local judge is wired in.
+    """
+    def _resolve(completions, kwargs):
         n = len(completions)
-        refs = reference if reference is not None else [None] * n
-        return [
-            menu_reward(_completion_text(c), _coerce_reference(r), weights=weights)
-            for c, r in zip(completions, refs)
-        ]
+        fj = kwargs.get("final_json") or [None] * n
+        ev = kwargs.get("evidence") or [None] * n
+        menus, evids = [], []
+        for i, c in enumerate(completions):
+            menus.append(_as_menu(fj[i]) if fj[i] is not None else _as_menu(_completion_text(c)))
+            evids.append(ev[i] if ev[i] is not None else _evidence_from_completion(c))
+        return menus, evids
 
-    return reward_func
+    def structure_reward(completions, **kwargs) -> list[float]:
+        menus, _ = _resolve(completions, kwargs)
+        return [structure_score(m) for m in menus]
 
+    def found_reward(completions, **kwargs) -> list[float]:
+        menus, _ = _resolve(completions, kwargs)
+        return [found_score(m) for m in menus]
 
-def _coerce_reference(reference):
-    """A reference dataset entry -> a menu dict (or None). Accepts a dict as-is or
-    json-loads a string (build_grpo stores references as compact JSON strings)."""
-    if isinstance(reference, str):
-        try:
-            obj = json.loads(reference)
-        except json.JSONDecodeError:
-            return None
-        return obj if isinstance(obj, dict) else None
-    return reference if isinstance(reference, dict) else None
+    def grounding_reward(completions, **kwargs) -> list[float]:
+        menus, evids = _resolve(completions, kwargs)
+        return [grounding_score(m, e or "") for m, e in zip(menus, evids)]
+
+    funcs = [structure_reward, found_reward, grounding_reward]
+    reward_weights = [weights.structure, weights.found, weights.grounding]
+
+    if include_dietary:
+        def dietary_reward(completions, dietary_restrictions=None, **kwargs) -> list[float]:
+            menus, _ = _resolve(completions, kwargs)
+            dr = dietary_restrictions or [None] * len(menus)
+            # judge stays None: returns 0.0 until a local judge is wired in (see
+            # dietary_score). Present so the curve/slot exists ahead of time.
+            return [dietary_score(m, dr[i]) for i, m in enumerate(menus)]
+        funcs.append(dietary_reward)
+        reward_weights.append(weights.dietary)
+
+    return funcs, reward_weights
