@@ -13,6 +13,66 @@ Conventions:
 
 ---
 
+## 2026-07-16 — GRPO `--use-vllm` smoke PASSES (A100): 6 bugs, and the config the real run needs
+
+First run of the **vLLM rollout path** for GRPO (the prior smoke used `--use-vllm` OFF, i.e.
+transformers generation, so none of this surface was exercised). Tiny: `--max-steps 2
+--num-generations 4 --limit 8`, CUDA-13 A100 80GB, colocate. **Result: `SMOKE_RC=0`, 2/2 steps,
+adapter + checkpoint-2 saved.** It took **7 attempts**; each fix exposed the next layer.
+
+**THE HEADLINE ANSWER: `skip_special_tokens` is NOT a problem on TRL's rollout path.**
+`tools/call_frequency: 151.2`, `tools/failure_frequency: 0` — tool calls fire and parse. This was
+the top risk (it would have silently zeroed grounding and looked like a bad model). TRL's tool loop
+uses the Gemma tokenizer's built-in `response_schema`, so it sees the markers. Cleared.
+
+**Bugs found (all invisible until it ran; all fixed + pushed):**
+
+| # | failure | cause |
+|---|---|---|
+| 4 | `OSError: Can't load feature extractor for '/workspace/merged'` | **TRL colocate loads vLLM from the model PATH on disk** (not by syncing the in-memory HF policy — I had assumed the latter). So the `preprocessor_config.json` gap applies to GRPO exactly as to `vllm serve`. Fix: point `--model-path` at `merged-text`. |
+| 5 | `ValueError: Target modules .*language_model\..*$ not found` | Fixing #4 exposed it: the LoRA regex assumes the multimodal tree (it exists to exclude the towers PEFT can't adapt), but `to_text_only` DROPS the towers, so text-only modules are plain `model.layers.N.`. Fix: derive targets from the model's real module names. |
+| 6 | `TypeError: <lambda>() takes 2 positional arguments but 3 were given` | `model.py`'s SDPA GQA patch hardcoded transformers 5.10.x's `use_gqa_in_sdpa(attention_mask, key)`. transformers **5.14.1** (pulled by vLLM into the GRPO env) calls it with 3. Fires mid-training at the first forward. Fix: `*args, **kwargs` — it answers False unconditionally anyway. |
+| 7 | `OutOfMemoryError: Tried to allocate 32.00 GiB` | Gemma 4's **vocab_size=262144** ⇒ fp32 logits = `bs × max_completion_length × vocab × 4B` = `4 × 8192 × 262144 × 4B` = **34.4 GB**, matching the alloc exactly. Our guard forced `per_device_bs` to be a *multiple* of G; TRL's real rule is that the **effective** batch (`bs × accum × num_processes`) be divisible by G — TRL computes group advantages over the whole generation batch and only chunks fwd/bwd, so **`per_device_bs` is a pure memory knob**. Fix: match TRL's rule ⇒ bs=1 legal ⇒ logits 8.6 GB. |
+
+Also learned: **`vllm_gpu_memory_utilization` is NOT a memory lever** — it's a fraction of TOTAL VRAM
+covering vLLM's *weights + KV*, so below ~0.19 (15 GB weights / 79 GB) vLLM has no room for KV blocks
+and dies with `No available memory for the cache blocks`. Floor is ~0.28 in practice.
+
+**Passing config (A100 80GB):** `--per-device-train-batch-size 1 --gradient-accumulation-steps 16
+--vllm-gpu-memory-utilization 0.30`, `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` (the last OOM
+showed 8.04 GiB reserved-but-unallocated fragmentation).
+
+**Smoke metrics — plumbing only, DO NOT read as quality:**
+
+    tools/call_frequency 151.2   tools/failure_frequency 0
+    rewards/structure/mean 0.75  rewards/found/mean 0.25  rewards/grounding/mean -0.2125
+    completions/mean_length 5161  max 7367  clipped_ratio 0.375
+    step_time 343.6s
+
+- **grounding is NEGATIVE (-0.21) because the smoke ran `--cache-policy canned`** — which starves
+  grounding *by design* (reward.py and train_grpo's default both say `live`): a canned MISS returns a
+  constant, so anything the student explored that the teacher didn't yields junk evidence, and its
+  items can't ground. My smoke chose canned for speed/offline determinism. **The real run MUST use
+  `live`** or the reward measures nothing.
+- **`clipped_ratio 0.375` is a REAL problem for the real run:** 37.5% of rollouts hit
+  `max_completion_length=8192` and were truncated. TRL appends tool responses *into* the completion,
+  and scraped pages are large, so 8192 is too small for an 8-tool-call episode. Truncated ⇒ no final
+  JSON ⇒ that likely explains most of `found=0.25`.
+
+**Why the real run should move to an H200 (141 GB), not the A100:**
+1. `clipped_ratio 0.375` ⇒ need `max_completion_length` ≫ 8192 ⇒ more logits memory (16384 @ bs=1 =
+   17.2 GB).
+2. `step_time 343.6s` ⇒ **23.7 h/epoch** (249 steps @ 4 prompts/step over 995 prompts) ≈ $33/epoch on
+   A100. A bigger KV cache (util 0.3 of 141 GB = 42 GB vs 24 GB) buys rollout concurrency.
+3. **G=4 is minimal** for group-relative advantage (`frac_reward_zero_std: 0.25` — a quarter of groups
+   had zero reward variance, i.e. no learning signal from them). Headroom would allow G=8.
+On the A100 every knob is spent: vLLM ~24 GB + policy 15 GB + logits 8.6 GB, bs already at 1 and
+`vllm_gpu_memory_utilization` already at its floor.
+
+**Artifacts:** pod-local (smoke adapter discarded — it's 2 steps of a starved reward).
+
+---
+
 ## 2026-07-16 — v1 SFT student, FULL 500-episode eval, bf16 via vLLM (the real headline)
 
 **First clean full-500 eval of the v1 student served correctly** (merged bf16, text-only, on vLLM
