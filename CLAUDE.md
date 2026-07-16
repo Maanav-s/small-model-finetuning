@@ -160,6 +160,26 @@ The HF `model.generate` path is single-GPU and not thread-safe, which is why [sc
 
 - **Serve the merged bf16 checkpoint, never 4-bit base + adapter** (the v1 QLoRA-fidelity finding: an adapter trained on a bf16 base misbehaves on a 4-bit base — 4-bit serving alone cost ~32 points of success rate; see [notes/experiments.md](notes/experiments.md)).
 
+### GRPO (`--use-vllm`) is a DIFFERENT setup from serving — don't copy the eval recipe
+
+- **ONE unified cu130 env, not two.** Eval talks to a vLLM **server** over HTTP, so vLLM lives in its own venv (CLAUDE.md's "never install vllm into `.venv`" rule). TRL's GRPO **colocate** mode imports `vllm` **in-process** alongside the trainer, so vLLM + torch + trl MUST share one env. Build it vLLM-first so it pins the stack, then add the rest — the repo's `torch>=2.11.0` is satisfied by vLLM's cu130 wheel, and on a CUDA-13 host cu130 is the *correct* build (the `cu128` pin in [pyproject.toml](pyproject.toml) is a dev-box convention, not a requirement):
+
+  ```bash
+  python -m venv /opt/grpo && /opt/grpo/bin/pip install vllm==0.25.1   # pins torch 2.11+cu130
+  /opt/grpo/bin/pip install "trl>=1.5.1" "peft>=0.19.1" "accelerate>=1.13.0" "bitsandbytes>=0.49.2" jmespath datasets
+  /opt/grpo/bin/pip install requests python-dotenv playwright markdownify beautifulsoup4 jsonschema
+  /opt/grpo/bin/playwright install --with-deps chromium
+  ```
+
+  Verified 2026-07-16: resolves to torch 2.11.0+cu130 / vllm 0.25.1 / **trl 1.8.0** / peft 0.19.1 / transformers 5.14.1, and TRL 1.8.0 still accepts the 1.5.1-era GRPOConfig fields (`max_tool_calling_iterations` et al).
+- **Point `--model-path` at the `merged-text` (backfilled, text-only) checkpoint, NOT `merged`.** **TRL colocate loads vLLM from the model PATH on disk** — it does *not* build the vLLM engine by syncing the in-memory HF policy. So both vLLM gotchas above apply to GRPO exactly as they do to `vllm serve`: pointing at raw `merged` dies with `OSError: Can't load feature extractor for '/workspace/merged'` (the missing `preprocessor_config.json`, via `vllm/multimodal/processing/context.py`). `merged-text` fixes both at once — text-only class (no `AutoProcessor`) *and* the 54 backfilled tensors. `load_policy_model`'s HF-side load is happy with it too (it drops the 54 as unexpected, which is correct — they're dead weights).
+
+  ```bash
+  uv run python scripts/to_text_only.py /workspace/merged /workspace/merged-text --base /workspace/kv
+  /opt/grpo/bin/python scripts/train_grpo.py --data data/grpo/train.jsonl \
+      --model-path /workspace/merged-text --use-vllm --vllm-mode colocate ...
+  ```
+
 ## Model access
 
 `google/gemma-4-E4B-it` is **gated**. First load requires `huggingface-cli login` with a token from an account that has accepted the license on the model's HF page. Weights cache to `~/.cache/huggingface/hub`.

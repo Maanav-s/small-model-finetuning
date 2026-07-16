@@ -23,19 +23,24 @@ How the pieces line up with TRL 1.5.1's GRPOTrainer:
   reward is teacher-free so `reference` is ignored). Only `prompt` is fed to TRL.
 
 Generation backend:
-- Default (--use-vllm OFF) uses transformers generation -- slower, but validates the
-  whole loop WITHOUT the head_dim=512 vLLM serve gate (the same constraint from the
-  SDPA saga; see CLAUDE.md). Reuses model.py's SDPA GQA patch so long contexts don't
-  OOM on the math kernel.
-- --use-vllm turns on TRL's vLLM path (colocate by default) for fast rollouts -- but
-  it requires vLLM to actually serve Gemma-4-E4B on the card (validate on Hopper).
+- Default (--use-vllm OFF) uses transformers generation -- correct but SLOW: GRPO does
+  num_generations x batch agentic rollouts per step, and the HF path is single-GPU /
+  not thread-safe (the same reason eval_split forces --workers 1; that made a 500-ep
+  eval take 5.4 h). Reuses model.py's SDPA GQA patch so long contexts don't OOM.
+- --use-vllm turns on TRL's vLLM path (colocate) for fast rollouts. The head_dim=512
+  "serve gate" this used to warn about is a NON-ISSUE (vLLM handles Gemma-4's mixed
+  heads natively; see CLAUDE.md "vLLM serving"). The real requirements are the CUDA-13
+  host + the unified cu130 env + `merged-text` -- see CLAUDE.md's GRPO subsection.
 
-Run (H200, from repo root):
-  # smoke (transformers gen, tiny): does the loop run + reward fire?
-  uv run python scripts/train_grpo.py --data data/grpo/train.jsonl \
-      --max-steps 2 --num-generations 4 --limit 8 --output-dir /workspace/gemma-menu-grpo
-  # with vLLM rollouts (after the serve gate passes):
-  uv run python scripts/train_grpo.py --data data/grpo/train.jsonl --use-vllm ...
+Run (CUDA-13 A100/H200, from repo root; NOTE the /opt/grpo env, not uv/.venv --
+colocate needs vllm in-process with trl, which the repo's cu128 pin can't give):
+  # smoke: does the loop run, rollouts parse tool calls, and rewards fire?
+  /opt/grpo/bin/python scripts/train_grpo.py --data data/grpo/train.jsonl \
+      --model-path /workspace/merged-text --use-vllm --vllm-mode colocate \
+      --max-steps 2 --num-generations 4 --limit 8 --cache-policy canned \
+      --output-dir /workspace/grpo-smoke
+  # --model-path MUST be the backfilled text-only checkpoint (to_text_only.py --base):
+  # TRL colocate loads vLLM from the PATH, so raw `merged` dies on AutoProcessor.
 
 Dev box: --dry-run builds the dataset + resolved config + wires the reward and runs
 it on one synthetic TRL-shaped completion, WITHOUT loading the model or training.
