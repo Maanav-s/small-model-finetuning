@@ -228,9 +228,25 @@ def _reward_selfcheck(reward_funcs, reward_weights) -> None:
 # ---------------------------------------------------------------------------
 def main() -> None:
     args = build_arg_parser().parse_args()
+    # TRL's ACTUAL rule (grpo_config.py, num_generations): the EFFECTIVE batch
+    # (num_processes * per_device_batch_size * gradient_accumulation_steps) must be
+    # divisible by num_generations -- NOT per_device_batch_size itself. TRL generates the
+    # whole generation batch and computes group-relative advantages over it, then chunks
+    # only the forward/backward into per_device_bs micro-batches. So per_device_bs is a
+    # pure MEMORY knob and a group may span accumulation steps.
+    #
+    # That matters a lot for Gemma 4: vocab_size=262144 makes the fp32 logits tensor
+    # (bs x max_completion_length x vocab x 4B) enormous -- bs=4 @ 8192 is 34.4 GB, which
+    # OOMs an 80 GB card in colocate (HF policy ~15 GB + vLLM's own weight copy + KV
+    # cache are already resident). bs=2 halves it to 17.2 GB with NO algorithmic change
+    # (G, max_completion_length untouched). Do NOT "fix" colocate OOM by cutting
+    # --max-completion-length: that truncates the long tool-heavy rollouts specifically,
+    # biasing training against the episodes that gathered the most evidence.
     per_device_bs = args.per_device_train_batch_size or args.num_generations
-    if per_device_bs % args.num_generations != 0:
-        sys.exit(f"--per-device-train-batch-size ({per_device_bs}) must be a multiple of "
+    _effective = per_device_bs * args.gradient_accumulation_steps  # x num_processes (1 here)
+    if _effective % args.num_generations != 0:
+        sys.exit(f"effective batch (per_device_bs {per_device_bs} x accum "
+                 f"{args.gradient_accumulation_steps} = {_effective}) must be divisible by "
                  f"--num-generations ({args.num_generations})")
 
     from reward import make_grpo_rewards
