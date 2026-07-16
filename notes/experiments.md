@@ -92,6 +92,97 @@ integrated — the real lever if we push context or batch further.)
 
 ---
 
+## 2026-07-15 — Prompt fix for termination: `_ALWAYS_ANSWER_RULE` (paired n=50) ✅
+
+**Hypothesis:** the residual empty-output failure that survived the bf16 fix (~35-40% empty) is
+fixable by PROMPTING — tell the student, as a standing system-prompt rule, that every episode must
+end with a JSON object. Implemented as the shared `_ALWAYS_ANSWER_RULE` in `src/prompts.py`
+(branch `prompt-termination`): never end with an empty reply; the moment you can't call more tools,
+emit the menu from what you have; a partial menu beats no reply; else the found=false shape.
+
+**Setup — a clean A/B.** Same 50 episodes (seed 42, 30 free + 20 conditioned), same merged v1 SFT
+student, **same HF bf16 stack**, same warm cache, same code path as the 2026-07-14 bf16 subset below.
+**Only the prompt differs.** (Run on an H200; the baseline ran on an A100 — the only uncontrolled
+variable, immaterial at temperature 0.)
+
+Self-report:
+
+| split | old prompt | **new prompt** |
+|---|---|---|
+| all schema-valid | 62.0% | **88.0%** |
+| all found | 56.0% | **88.0%** |
+| free found (30) | 70.0% | **90.0%** |
+| conditioned found (20) | 35.0% | **85.0%** |
+
+**Paired on the 50 identical episodes:**
+
+| outcome | old prompt | **new prompt** |
+|---|---|---|
+| success | 28 (56%) | **44 (88%)** |
+| empty | 19 (38%) | **6 (12%)** |
+| free | 21/30 | **27/30** |
+| conditioned | 7/20 | **17/20** |
+
+**16 episodes fixed (empty→success), 0 regressed.** Monotone improvement.
+
+**The one number that needed scrutiny — and its resolution.** Mean items *when successful* fell
+31.9 → 22.7, which would be alarming if the rule were causing PREMATURE termination (stop searching
+too early → thinner menus). It isn't — it's pure composition:
+- Episodes successful under BOTH prompts (n=28): items **31.9 → 30.9**, with 20/28 within ±2
+  (3 bigger, 5 smaller). The already-working episodes are **untouched**.
+- The 16 RESCUED episodes (previously returned *nothing*) average **8.2 items** — thin but real,
+  exactly what the rule asks for. They drag the mean down while strictly adding value.
+
+**Takeaways:**
+1. **The v1 student's dominant failure was largely a missing instruction, not a missing capability.**
+   It obeys a termination rule it was never SFT'd on — so "the behaviour didn't distill" was the wrong
+   diagnosis; nothing in the shipped student prompt ever told it to commit. NOTE this contradicts
+   CLAUDE.md's guidance ("add contrastive data rather than leaking guidance into the student prompt")
+   for THIS failure mode — because termination is a task-completion requirement, not distillable strategy.
+2. **Conditioned episodes were mostly a termination failure, not a dietary-filtering failure**
+   (7/20 → 17/20). The "dietary filtering is the hard part" read from 2026-07-14 was largely an
+   artifact of empty outputs; the real filtering gap is much smaller than it looked.
+3. **This de-risks GRPO**: a policy that reliably emits an answer gives GRPO real reward signal to
+   optimize, instead of a wall of zero-reward empty rollouts.
+
+**Caveat:** measured on the v1 checkpoint under a prompt it wasn't trained with (train/inference
+mismatch). A future SFT run should render its data under this same student prompt so train == inference.
+
+**Artifacts:** local scratch (S3 push pending — the dev-box AWS session expired). Intended:
+`v1/eval/20260715/gemma_bf16_newprompt/{report.json, candidates.tgz, eval.log}`
+
+---
+
+## 2026-07-15 — vLLM serving: what actually blocks it (head_dim was a red herring)
+
+Findings from trying to serve the merged student on vLLM (H200), which resolve a risk the vLLM design
+doc has flagged since day one:
+
+1. **`head_dim=512` is a NON-ISSUE.** vLLM logs:
+   `Gemma4 model has heterogeneous head dimensions (head_dim=256, global_head_dim=512). Using FA4 for
+   all layers to avoid mixed FA3/FA4 penalty.` It recognises Gemma-4's mixed heads and handles them
+   natively. `notes/vllm_inference.html`'s central caveat ("validate on Hopper; may fail on Ampere")
+   is **obsolete**.
+2. **The real requirement: vLLM ≥0.20 AND driver ≥580 (CUDA 13).** Gemma-4 support and cu130 torch
+   arrived together, so no version pin escapes the driver requirement:
+
+   | vLLM | torch | gemma4 |
+   |---|---|---|
+   | 0.12.0 | 2.9.0+cu128 | ✗ |
+   | 0.18.1 | 2.10.0+cu128 | ✗ |
+   | 0.20.2 / 0.21.0 / 0.22.1 / 0.25.1 | 2.11.0+**cu130** | ✓ |
+
+   The driver is a **host** property (RunPod images inherit it) — a CUDA-12.8 host cannot serve
+   Gemma-4 on vLLM at any vLLM version. Pick a host with driver ≥580.
+3. **Our merged checkpoints can't be served on vLLM's multimodal path at all**:
+   `train_sft._save_outputs` saves model+tokenizer only, so there is no `preprocessor_config.json`
+   and vLLM's `AutoProcessor` dies. Neither the S3 base copy nor the HF cache has that file.
+   **Fix: `scripts/to_text_only.py`** rebuilds a text-only `Gemma4ForCausalLM` from the multimodal
+   checkpoint (verified `missing=0 unexpected=0`, 7.46B params, towers dropped) — which is what the
+   design doc wanted anyway ("we never use the vision/audio towers") and needs no processor.
+
+---
+
 ## 2026-07-14 — Gemma v1 SFT student, bf16 subset (n=50, paired vs 4-bit)
 
 **Why:** the full eval above served the merged bf16 checkpoint **re-quantized to 4-bit nf4**. This tests

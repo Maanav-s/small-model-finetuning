@@ -229,20 +229,34 @@ path OOMs on long context (it moved to an A100 for headroom). A vLLM server fixe
 construction (continuous batching) and uses paged KV. This is the direct answer to "I'm worried about inference on
 this Gemma model": serve it once, raise the worker count, done. It also becomes the GRPO rollout engine later.</p>
 
-<div class="box crit"><span class="lbl">Validate this FIRST — same demon as the SDPA saga</span>
-Gemma-4-E4B's global-attention layers have <b><code>head_dim=512</code></b> (CLAUDE.md). That is exactly what broke
-FlashAttention-2 (caps at 256) and forced the whole SDPA GQA patch. vLLM's default attention backends inherit the
-same constraint:
-<ul>
-  <li><b>On Hopper (H100/H200):</b> FlashAttention-3 / FlashInfer handle head_dim ≥ 256 → should work. <b>Validate
-  the vLLM-Gemma path on the H200 you already have.</b></li>
-  <li><b>On Ampere (A100/A10, the current eval box):</b> FA caps at 256 → may fail or fall back. Try
-  <code>VLLM_ATTENTION_BACKEND=XFORMERS</code> (or Triton) and confirm it loads <i>and</i> produces correct output
-  before trusting any speedup. Treat "does Gemma-4-E4B even serve on this card under vLLM" as the go/no-go gate.</li>
-</ul>
-Also confirm vLLM loads the model as <code>Gemma4ForCausalLM</code> (text-only path). Liger only supports
-<code>gemma4_text</code>, not the multimodal <code>Gemma4ForConditionalGeneration</code> wrapper — vLLM's text class
-is the one to target since we never use the vision/audio towers.</div>
+<div class="box ok"><span class="lbl">RESOLVED 2026-07-15 — head_dim=512 is a NON-ISSUE</span>
+<b>Tested on an H200. vLLM handles Gemma-4's heterogeneous heads natively</b>, logging:
+<code>Gemma4 model has heterogeneous head dimensions (head_dim=256, global_head_dim=512). Using FA4 for all layers
+to avoid mixed FA3/FA4 penalty.</code> The fear inherited from the SDPA/FlashAttention-2 saga (FA2 caps head_dim at
+256) does <b>not</b> carry over to vLLM — it has first-class Gemma-4 support. The original "validate on Hopper, may
+fail on Ampere with XFORMERS" caveat that stood here is <b>obsolete</b>.</div>
+
+<div class="box crit"><span class="lbl">What ACTUALLY blocks vLLM serving (the real gates)</span>
+<ol>
+  <li><b>vLLM ≥0.20 AND driver ≥580 (CUDA 13).</b> Gemma-4 support and the cu130 torch build arrived together, so
+  no version pin escapes the driver requirement (measured):
+  <table>
+    <tr><th>vLLM</th><th>torch</th><th>gemma4 support</th></tr>
+    <tr><td>0.12.0</td><td>2.9.0+cu128</td><td>✗</td></tr>
+    <tr><td>0.18.1</td><td>2.10.0+cu128</td><td>✗</td></tr>
+    <tr><td>0.20.2 / 0.21.0 / 0.22.1 / 0.25.1</td><td>2.11.0+<b>cu130</b></td><td>✓</td></tr>
+  </table>
+  The NVIDIA driver is a <b>host</b> property (containers inherit it via the NVIDIA runtime) — <b>a "CUDA-13 image"
+  does not help</b>. A CUDA-12.8 host (e.g. driver 570.x) <i>cannot</i> serve Gemma-4 on vLLM at any vLLM version.
+  Provision a host whose driver is ≥580 (RunPod exposes a CUDA-version filter).</li>
+  <li><b>Our merged SFT checkpoints cannot be served on the multimodal path.</b>
+  <code>train_sft._save_outputs</code> saves model + tokenizer only, so there is no
+  <code>preprocessor_config.json</code>; vLLM sees <code>Gemma4ForConditionalGeneration</code>, calls
+  <code>AutoProcessor</code>, and dies. Neither the S3 base copy nor the HF cache carries that file.
+  <b>Fix: <code>scripts/to_text_only.py</code></b> rebuilds a text-only <code>Gemma4ForCausalLM</code> from the
+  multimodal checkpoint (verified <code>missing=0 unexpected=0</code>; 7.46B params, towers dropped). That is the
+  class to target anyway — we never use the vision/audio towers — and it needs no processor.</li>
+</ol></div>
 
 <h3>Recommended path: raw <code>/v1/completions</code>, keep our template + parser</h3>
 <p>Do <b>not</b> use vLLM's server-side chat/tool parsing for the student. vLLM ships no Gemma-4 tool-call parser,
