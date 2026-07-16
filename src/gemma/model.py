@@ -59,8 +59,15 @@ def _force_repeat_kv_for_efficient_sdpa() -> None:
     compute time -- the KV *cache* still stores 2 heads -- and the score-matrix
     saving dwarfs it. With matched heads, default SDPA dispatch picks the
     efficient kernel on its own, so no `sdpa_kernel(...)` override is needed.
+
+    The replacement takes `*args, **kwargs` DELIBERATELY -- do not "tighten" it to
+    the real signature. It answers False unconditionally, so it does not care what
+    it is handed, and transformers keeps changing the arity: a 2-arg
+    `(attention_mask, key)` lambda works on 5.10.x but dies on 5.14.1 (which vLLM
+    pulls into the GRPO env) with `TypeError: <lambda>() takes 2 positional
+    arguments but 3 were given` -- mid-training, at the first forward pass.
     """
-    _sdpa_attn.use_gqa_in_sdpa = lambda attention_mask, key: False
+    _sdpa_attn.use_gqa_in_sdpa = lambda *args, **kwargs: False
 
 
 def load_model(quantize: bool = False, attn: str = "sdpa"):
