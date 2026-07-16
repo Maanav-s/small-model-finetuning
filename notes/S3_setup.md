@@ -9,6 +9,37 @@ Manual AWS setup is done. This is what exists and how WS-D (`scripts/cache_sync.
 - Private: Block Public Access is ON (all four settings)
 - Default encryption: SSE-S3 (AES256)
 - Object ownership: `BucketOwnerEnforced` — ACLs are disabled, access is IAM-policy-only
+- **Versioning: ENABLED (2026-07-16).** Was off until then, which meant every delete/overwrite was
+  permanent — dangerous for `models/`, whose merged checkpoint costs an H100 training run to
+  re-derive. No lifecycle policy (nothing expires; at ~32 GB the whole bucket is ~$0.75/mo, so
+  there is no cost case for pruning).
+
+## What's in the bucket (surveyed 2026-07-16: 1034 objects, 32.40 GB)
+
+| prefix | objs | size | notes |
+|---|---|---|---|
+| `v1/base-model/gemma-4-E4B-it/` | 6 | 16.02 GB | pinned base. **Not a faithful HF mirror** — no `preprocessor_config.json` (harmless: we serve text-only) |
+| `v1/base-model/kv-shared-backfill/` | 1 | 110 MB | **the 54 dead KV-shared tensors** (layers 24–41 `k_norm`/`k_proj`/`v_proj`) for `to_text_only.py --base`. Lets a pod fix a merged checkpoint for vLLM **without** pulling the 16 GB base |
+| `v1/models/gemma-menu-sft-20260714/merged/` | 6 | 15.88 GB | the v1 SFT student (bf16). **Missing 54 tensors** by construction — see experiments.md 2026-07-16 |
+| `v1/models/gemma-menu-sft-20260714/adapter/` | 7 | 0.17 GB | LoRA (139 MB) + tokenizer |
+| `v1/cache.sqlite` | 1 | 153.7 MB | frozen tool-call cache |
+| `v1/traces/` | 1000 | 73.1 MB | teacher corpus |
+| `v1/sft/train.jsonl` | 1 | 60.6 MB | 948 SFT examples |
+| `v1/restaurants.jsonl`, `v1/splits.json` | 2 | 0.94 MB | corpus index + seeded splits |
+| `v1/eval/2026071{4,5}/` | 11 | 1.3 MB | claude, gemma (4-bit full), gemma_bf16, gemma_bf16_newprompt |
+
+Two model copies are **98.6% of the bytes**; everything else is rounding error.
+
+### Integrity metadata (`x-amz-meta-md5`)
+
+Convention: upload big artifacts with an `md5` metadata entry. Held by `sft/train.jsonl`
+(`07dd4615…`), `base-model/model.safetensors` (`2ef04081…`), and `kv-shared-backfill`
+(`eb53b4c4…`). **GAP: `models/…/merged/model.safetensors` has NO metadata** — the one artifact
+you cannot re-derive is the one you cannot verify. Its ETag is `814e974e…-1894`, i.e. a
+**multipart** ETag (1894 × 8 MB parts), which is *not* an md5, and it carries no
+`ChecksumSHA256`/`CRC32C` either. Fill this in from the next pod that pulls it (it downloads the
+whole file anyway — `md5sum` it there, then `copy-object --metadata-directive REPLACE`); versioning
+now makes that copy-in-place safe.
 
 ## Credentials — no static keys
 

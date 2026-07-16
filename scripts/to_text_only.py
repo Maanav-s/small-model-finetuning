@@ -28,6 +28,13 @@ straight out of the base safetensors. Do NOT instead disable vLLM's check
 (`enable_weights_track`): that leaves those params as uninitialized memory rather
 than an honest error.
 
+`--base` does NOT need the full 16 GB base. Those 54 tensors are 110 MB, pre-extracted to
+`s3://restaurant-menu-corpus/v1/base-model/kv-shared-backfill/` -- point --base at a dir
+holding just that file (the backfill only globs *.safetensors):
+
+    aws s3 cp --recursive s3://restaurant-menu-corpus/v1/base-model/kv-shared-backfill/ /w/kv/
+    python to_text_only.py /w/merged /w/merged-text --base /w/kv
+
 Usage: python to_text_only.py <src_dir> <dst_dir> [--base <base_model_dir>]
 """
 import sys
