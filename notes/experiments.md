@@ -13,6 +13,59 @@ Conventions:
 
 ---
 
+## 2026-07-16 — v1 SFT student, FULL 500-episode eval, bf16 via vLLM (the real headline)
+
+**First clean full-500 eval of the v1 student served correctly** (merged bf16, text-only, on vLLM
+— not 4-bit, not a 50-ep subset). Same seed-42 plan as every prior run (300 free + 200
+conditioned, `--conditioned-frac 0.4`, student prompt, `--cache-policy live`). Served the
+backfilled text-only checkpoint on a CUDA-13 A100 at `--max-model-len 98304`, `--workers 16`.
+**500/500 completed, 0 failed, 0 context-400s.**
+
+Self-report (no reference):
+
+| slice | schema-valid | found=true | mean items | mean sections | price cov |
+|---|---|---|---|---|---|
+| **all (n=500)** | **83.4%** | **78.8%** | 24.0 | 4.11 | 0.728 |
+| free (n=300) | 83.3% | 78.3% | 29.3 | 4.66 | 0.730 |
+| conditioned (n=200) | 83.5% | 79.5% | 16.1 | 3.29 | 0.726 |
+
+**The headline: 78.8% found on the full 500, up from 24% on the 2026-07-14 4-bit full-500.** Almost
+all of that gain is the serving fix (bf16 not 4-bit) + the `_ALWAYS_ANSWER_RULE` termination prompt,
+both already established on subsets; this is the first time they're confirmed at full scale on both
+splits. The 24%→79% arc is the whole "the v1 student was never as bad as it looked" story landing.
+
+**The surprise — conditioned no longer collapses.** Every prior read (bf16 subset: 70% free vs 35%
+conditioned) said dietary filtering was the big v2 quality lever. At full scale that gap **is gone**:
+conditioned found=true 79.5% ≈ free 78.3%, and schema-validity is identical across slices (83.5 vs
+83.3). Re-reading [[v1-sft-failure-mode]]: the "conditioned is the hard part" finding was itself
+mostly a *termination* artifact on a 20-episode slice (7/20→17/20 under the new prompt). With
+termination fixed and n=200, conditioned success matches free. **What conditioning still costs is
+menu SIZE, not success**: conditioned mean items 16.1 vs free 29.3 — expected and correct, since a
+dietary filter legitimately removes items. So the model finds and filters fine; it just returns a
+(correctly) smaller menu. This meaningfully weakens the case for a separate dietary-judge model as a
+v2 priority.
+
+**Caveats:** self-report only (schema-valid + non-empty + item/price counts), NOT scored against a
+teacher reference, so "found=true" ≠ "menu is correct" — it means well-formed and non-empty.
+`price_coverage 0.73` is a soft quality signal (share of items carrying a price). A reference-scored
+pass (`--reference`) is the next fidelity step if we want a precision/recall number.
+
+**Throughput:** 500 episodes in **~34 min** (~15 eps/min, 16 workers) vs the HF `--workers 1` path's
+**5.4 h** for the same 500 — **~9–10× faster**. This is the entire reason the vLLM serving work
+mattered: full-500 evals are now a coffee break, not an afternoon.
+
+**Three silent bugs surfaced getting here**, all invisible under HF, all only findable by actually
+serving (details in the 2026-07-16 vLLM entry below): (1) 54 missing KV-shared tensors; (2)
+`skip_special_tokens=True` eating the tool protocol; (3) unclamped `max_tokens` 400ing long episodes.
+Bug 3 was caught *during this eval's first 3 episodes* — before the fix it would have scored the
+longest, most-gathered episodes as FAILED, biasing the headline DOWN.
+
+**Artifacts:** `v1/eval/20260716/gemma_bf16_vllm_500/{report.json, candidates.tgz, eval.log}`
+(all with `x-amz-meta-md5`). Merged checkpoint md5 now also stamped:
+`66145fec9549e32682c2a426dbf4739f`.
+
+---
+
 ## 2026-07-16 — vLLM serving: the three real blockers, all found and fixed
 
 Ran the whole path on a **CUDA-13 A100 80GB PCIe** ($1.39/hr): provision → pull merged
