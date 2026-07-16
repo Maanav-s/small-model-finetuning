@@ -230,8 +230,13 @@ def build_runner(args, label):
         from openai_agent import build_client, build_gemma_completions  # noqa: E402
 
         tokenizer = AutoTokenizer.from_pretrained(args.model_path or GEMMA_MODEL_ID)
+        # Pass the tokenizer so max_tokens gets clamped to the server's context window.
+        # Without it, a long (tool-heavy) episode 400s and eval_split scores it FAILED --
+        # silently penalising exactly the episodes that gathered the most. See
+        # openai_agent.build_gemma_completions.
         vllm_generate = build_gemma_completions(
-            build_client(args.gemma_vllm_base_url), args.served_model_name or "gemma-menu"
+            build_client(args.gemma_vllm_base_url), args.served_model_name or "gemma-menu",
+            tokenizer=tokenizer,
         )
 
         def runner(episode_input, tools, registry, system_prompt):

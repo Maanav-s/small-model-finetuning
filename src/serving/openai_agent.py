@@ -30,6 +30,7 @@ from __future__ import annotations
 import inspect
 import json
 import sys
+import urllib.request
 from pathlib import Path
 
 # Shared modules (prompts/tools/schema) live in src/, the parent of this vllm/
@@ -90,8 +91,22 @@ def build_client(base_url: str, api_key: str = "EMPTY"):
 _GEMMA_STOP = "<tool_call|>"
 
 
+def _detect_max_model_len(client, model: str):
+    """Ask the vLLM server what context window it's serving (None if unavailable)."""
+    try:
+        url = str(client.base_url).rstrip("/") + "/models"
+        with urllib.request.urlopen(url, timeout=10) as f:
+            for m in json.load(f).get("data", []):
+                if m.get("id") == model and m.get("max_model_len"):
+                    return int(m["max_model_len"])
+    except Exception:  # noqa: BLE001 -- detection is best-effort; clamping just turns off
+        return None
+    return None
+
+
 def build_gemma_completions(client, model: str, max_tokens: int = 4096,
-                            stop: str = _GEMMA_STOP):
+                            stop: str = _GEMMA_STOP, tokenizer=None,
+                            max_model_len: int | None = None):
     """Return `generate(prompt_str) -> text` backed by vLLM /v1/completions, for the
     Gemma STUDENT (raw completions, NOT chat/tools -- vLLM has no Gemma tool parser).
 
@@ -116,10 +131,30 @@ def build_gemma_completions(client, model: str, max_tokens: int = 4096,
     Note the stop string can't match either when the markers are stripped -- which is
     why this also breaks the re-append below. Same rule as the HF path (decode with
     skip_special_tokens=False); it just has to be requested over HTTP here.
+
+    max_tokens IS CLAMPED to what actually fits (pass `tokenizer`; max_model_len is
+    auto-detected from the server). vLLM enforces `prompt + max_tokens <= max_model_len`
+    and 400s otherwise -- a failure mode the HF path does NOT have, because
+    transformers' max_new_tokens never checks the total. Measured 2026-07-16: an
+    agentic episode whose context grew to 36,865 tokens + a fixed 4096 request = 40,961
+    against a 40,960 window -> `BadRequestError`, which eval_split swallows as a FAILED
+    episode. So long (tool-heavy) episodes would silently depress the score rather than
+    error loudly -- exactly the episodes where the model had gathered the most.
     """
+    if max_model_len is None:
+        max_model_len = _detect_max_model_len(client, model)
+
     def generate(prompt: str) -> str:
+        eff_max = max_tokens
+        if tokenizer is not None and max_model_len:
+            n_prompt = len(tokenizer(prompt, add_special_tokens=False)["input_ids"])
+            # -8 margin: our count and the server's can differ by a token or two.
+            eff_max = min(max_tokens, max_model_len - n_prompt - 8)
+            if eff_max < 1:
+                # Prompt alone fills the window; nothing useful can be generated.
+                return ""
         comp = client.completions.create(
-            model=model, prompt=prompt, max_tokens=max_tokens, temperature=0.0,
+            model=model, prompt=prompt, max_tokens=eff_max, temperature=0.0,
             stop=[stop],
             extra_body={"add_special_tokens": False, "skip_special_tokens": False},
         )
