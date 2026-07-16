@@ -275,11 +275,28 @@ def main() -> None:
     tools, _registry, _sys_prompt = setup_tools(dietary_restrictions=None, variant="student", cache=cache)
     tokenizer = AutoTokenizer.from_pretrained(args.model_path or MODEL_ID)
 
-    # LoRA scoped to language_model (Gemma 4 multimodal; see train_sft.py) via regex.
+    # Load the policy BEFORE building the LoRA config: how we scope LoRA depends on the
+    # checkpoint's actual module tree, so inspect it rather than assume.
+    model = load_policy_model(args.model_path, attn=args.attn)
+
+    # LoRA scoping is checkpoint-shape-dependent (measured 2026-07-16):
+    #  - MULTIMODAL (Gemma4ForConditionalGeneration -- the raw merged SFT ckpt): modules
+    #    nest under `model.language_model.`, and the vision/audio towers use
+    #    Gemma4ClippableLinear which PEFT CANNOT adapt -> must scope by regex to the
+    #    language_model subtree (see train_sft.py).
+    #  - TEXT-ONLY (Gemma4ForCausalLM -- to_text_only.py output, REQUIRED for --use-vllm
+    #    since TRL colocate loads vLLM from the path): to_text_only DROPS the towers, so
+    #    there is nothing to exclude and modules are plain `model.layers.N.`. The
+    #    language_model regex then matches NOTHING and PEFT raises
+    #    "Target modules ... not found in the base model". Target the names directly.
     _names = "|".join(re.escape(t) for t in args.lora_target_modules)
+    _has_lm_nesting = any("language_model." in n for n, _ in model.named_modules())
+    _targets = (rf".*language_model\..*\.({_names})$" if _has_lm_nesting
+                else list(args.lora_target_modules))
+    print(f"  LoRA targets:          {'language_model-scoped regex (multimodal)' if _has_lm_nesting else 'plain module names (text-only, no towers)'}")
     lora_config = LoraConfig(
         r=args.lora_r, lora_alpha=args.lora_alpha, lora_dropout=args.lora_dropout,
-        target_modules=rf".*language_model\..*\.({_names})$", bias="none", task_type="CAUSAL_LM",
+        target_modules=_targets, bias="none", task_type="CAUSAL_LM",
     )
 
     grpo_config = GRPOConfig(
@@ -313,8 +330,6 @@ def main() -> None:
         vllm_gpu_memory_utilization=args.vllm_gpu_memory_utilization,
         vllm_server_base_url=args.vllm_server_base_url,
     )
-
-    model = load_policy_model(args.model_path, attn=args.attn)
 
     trainer = GRPOTrainer(
         model=model,
