@@ -99,13 +99,29 @@ def build_gemma_completions(client, model: str, max_tokens: int = 4096,
     (agent.generate_turn), so training/inference stay byte-matched; vLLM only does
     fast batched decode. vLLM STRIPS the stop string from the returned text, so we
     re-append `<tool_call|>` when generation stopped on it -- otherwise
-    tokenizer.parse_response wouldn't see a complete tool call. Needs GPU/server
-    validation (head_dim=512 serve gate); see notes/vllm_inference.html.
+    tokenizer.parse_response wouldn't see a complete tool call.
+
+    `skip_special_tokens=False` is LOAD-BEARING, not a tweak (verified on a served
+    A100, 2026-07-16). Gemma's tool protocol IS special tokens (`<|tool_call>`,
+    `<|"|>`, `<tool_call|>`), and vLLM's detokenizer defaults to skip_special_tokens
+    =True, which deletes them. The failure is SILENT and looks like a bad model:
+
+        skip_special_tokens=True  -> 'call:web_search{query:...}call:web_search{...}'
+                                     stop_reason=None, finish='length'  (rambles to
+                                     max_tokens; parse_response sees plain content,
+                                     zero tool calls -> the agent loop never fires)
+        skip_special_tokens=False -> '<|tool_call>call:web_search{query:<|"|>...<|"|>}'
+                                     stop_reason='<tool_call|>', finish='stop'
+
+    Note the stop string can't match either when the markers are stripped -- which is
+    why this also breaks the re-append below. Same rule as the HF path (decode with
+    skip_special_tokens=False); it just has to be requested over HTTP here.
     """
     def generate(prompt: str) -> str:
         comp = client.completions.create(
             model=model, prompt=prompt, max_tokens=max_tokens, temperature=0.0,
-            stop=[stop], extra_body={"add_special_tokens": False},
+            stop=[stop],
+            extra_body={"add_special_tokens": False, "skip_special_tokens": False},
         )
         choice = comp.choices[0]
         text = choice.text

@@ -13,6 +13,112 @@ Conventions:
 
 ---
 
+## 2026-07-16 — vLLM serving: the three real blockers, all found and fixed
+
+Ran the whole path on a **CUDA-13 A100 80GB PCIe** ($1.39/hr): provision → pull merged
+checkpoint → text-only convert → `vllm serve`. Three distinct blockers, each of which had been
+misattributed before. **None of them was `head_dim=512`.**
+
+**1. The driver wall was a PROVISIONING bug, not a hardware fact.** We knew we needed driver
+≥580 (vLLM ≥0.20 = Gemma-4 support = torch cu130) but kept landing on CUDA-12.8 hosts. Cause:
+**`runpodctl create pod` has no CUDA/driver flag** ([runpodctl#253](https://github.com/runpod/runpodctl/issues/253)),
+so the CLI cannot express the constraint at all. The **REST API** (`POST rest.runpod.io/v1/pods`)
+takes **`allowedCudaVersions: ["13.0"]`**. With it, the *same* `cu1281` image booted on
+**driver 580.126.20 / CUDA 13.0** — proving the image never mattered; only the host filter does.
+Now wrapped in [scripts/runpod_create.py](../scripts/runpod_create.py).
+
+**2. FA4 is Hopper-only — but that is NOT fatal.** The H200 logged `Using FA4 for all layers`;
+the A100 logs:
+
+    Gemma4 model has heterogeneous head dimensions (head_dim=256, global_head_dim=512).
+    FA4 not available, forcing TRITON_ATTN backend.
+
+vLLM **falls back cleanly to TRITON_ATTN** and still handles the mixed 256/512 heads. So Ampere
+is viable for Gemma-4 on vLLM — relevant because A100 ($1.39) vs H200 ($3.59) is the GRPO-rollout
+cost question. (Throughput on TRITON_ATTN vs FA4 is unmeasured; that's the open question, not
+whether it runs.)
+
+**3. THE REAL BUG — our merged checkpoint is missing 54 tensors, and it's our pipeline.**
+`vllm serve` died with:
+
+    ValueError: Following weights were not initialized from checkpoint:
+    {'model.layers.24..41.self_attn.k_norm.weight', ...}   # 18 layers
+
+Diffing the base checkpoint's safetensors header (via an S3 **range request** — no 16 GB download)
+against our merged one:
+
+| checkpoint | tensors | `k_norm` layers | `q_norm` layers |
+|---|---|---|---|
+| base `gemma-4-E4B-it` | **2130** | **0–41** | 0–41 |
+| our `merged` (SFT) | **2076** | **0–23** | 0–41 |
+
+Exactly **54 missing = 18 × {k_norm, k_proj, v_proj}** for layers 24–41, zero extras. Root cause:
+Gemma-4 E4B sets **`num_kv_shared_layers=18`**, so its last 18 of 42 layers reuse K/V from an
+earlier layer and never compute their own. **transformers honors this and never instantiates
+those params** → they are dropped as unexpected when loading the base → absent from every
+checkpoint we save since. This is **invisible under transformers** (`missing=0 unexpected=0`, and
+our 88% HF eval is unaffected — they really are dead weights). **vLLM's Gemma4 builds a fused
+`qkv_proj` + `k_norm` for every layer** and hard-fails if they're absent, even though its shared
+layers discard the K/V they compute.
+
+**Fix:** `to_text_only.py --base <base_dir>` copies those 54 tensors raw out of the base
+safetensors and injects them after `save_pretrained` (they can't come from `state_dict()` — the
+params don't exist on the model). Values are irrelevant (discarded downstream); existence is what
+vLLM demands. **Do NOT** instead disable vLLM's `enable_weights_track` check: that swaps a clean
+error for uninitialized memory.
+
+**`--base` does not need the full 16 GB.** safetensors keeps a JSON header at byte 0 with every
+tensor's `data_offsets`, so you can read the key list and then **range-GET only the tensors you
+want**. The 54 KV-shared tensors are **110 MB** (`k_norm` is 512 B; `k_proj`/`v_proj` are
+[512, 2560] bf16 ≈ 2.6 MB each) — a **145× smaller** pull than the whole checkpoint, and the
+mini-shard drops straight into `--base` since the backfill just globs `*.safetensors`. Worth
+remembering generally: pulling a whole checkpoint to inspect or borrow a few tensors is
+almost never necessary.
+
+**4. `ninja` must be on `PATH` (Ampere only).** TRITON_ATTN JIT-compiles kernels and shells out to
+**`ninja` by name**. Launching `/opt/vllm-env/bin/vllm serve` by absolute path does NOT activate the
+venv, so `PATH` lacks `/opt/vllm-env/bin` and the engine dies **late** — after weights load and CUDA
+graphs capture — with `FileNotFoundError: [Errno 2] No such file or directory: 'ninja'`, even though
+`ninja` is installed right beside the `vllm` binary. Launch via `env PATH=/opt/vllm-env/bin:$PATH`.
+Hopper/FA4 never compiles Triton kernels and never hits this.
+
+**5. THE SECOND REAL BUG — `skip_special_tokens=False` is load-bearing on the vLLM student path.**
+Gemma's tool protocol *is* special tokens, and vLLM's detokenizer defaults to stripping them.
+`build_gemma_completions` didn't request otherwise, so every vLLM rollout would have **silently**
+looked like a broken model:
+
+| `skip_special_tokens` | text | `stop_reason` | `finish` |
+|---|---|---|---|
+| `True` (vLLM default) | `call:web_search{query:...}` ×N, no markers | `None` | `length` |
+| `False` | `<\|tool_call>call:web_search{query:<\|"\|>...<\|"\|>}` | `<tool_call\|>` | `stop` |
+
+With markers stripped, `parse_response` sees plain `content` and **zero tool calls** (the agent loop
+never fires), and the `<tool_call\|>` stop string can never match — so generation rambles to
+`max_tokens` *and* the stop-marker re-append is dead code. CLAUDE.md already carried this rule
+("decode with `skip_special_tokens=False`") but it had only ever been applied to the **HF** path;
+it has to be requested explicitly over HTTP. Fixed in [src/serving/openai_agent.py](../src/serving/openai_agent.py).
+
+**VERIFIED END-TO-END** through the real `build_gemma_completions` under the real student prompt:
+
+    RAW:    <|tool_call>call:web_search{query:<|"|>Kashish Indian Curry Kirkland menu<|"|>}<tool_call|>
+    PARSED: {'role','tool_calls'} -> web_search(query="Kashish Indian Curry Kirkland menu")
+
+Serving stats (A100 80GB, `--max-model-len 40960 --gpu-memory-utilization 0.85`): model load
+**14.23 GiB / 3.8 s**, torch.compile 47 s (cached after), **KV cache 2,695,181 tokens →
+65.8× concurrency** at 40k ctx. That concurrency is the whole point vs the HF path's `--workers 1`.
+
+**Takeaways:** (a) `to_text_only.py`'s old `missing=0 unexpected=0` was a **false all-clear** — it
+only proves transformers' *own* expectations were met, not that the checkpoint is complete;
+(b) any future consumer that expects the full base key set will hit this same gap, so the merge
+in `train_sft.py` is lossy by construction — the backfill is the seam that repairs it;
+(c) **both real bugs were silent** — one a hard crash only vLLM could surface, one a
+plausible-looking degenerate output. Neither was reachable without actually serving the thing.
+
+**Artifacts:** pod-local only (nothing pushed to S3 — the text-only checkpoint is cheap to
+rebuild from `merged` + the 110 MB mini-shard, ~6 min).
+
+---
+
 ## 2026-07-14 — Gemma v1 SFT student, full eval (n=500, 4-bit serving)
 
 **Model:** `v1/models/gemma-menu-sft-20260714/merged` (the v1 SFT LoRA, merged to bf16), loaded

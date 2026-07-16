@@ -7,14 +7,41 @@ saves model+tokenizer only), so `vllm serve` dies on AutoProcessor. We never use
 the vision/audio towers anyway, so serve the text-only class: no processor needed,
 and the towers' weights are dropped (smaller, less VRAM).
 
-Usage: python to_text_only.py <src_dir> <dst_dir>
+THE KV-SHARED-LAYER BACKFILL (--base), measured 2026-07-16:
+Gemma-4 E4B sets `num_kv_shared_layers=18`, so its last 18 of 42 layers reuse K/V
+from an earlier layer instead of computing their own. transformers honors that and
+never *instantiates* k_norm/k_proj/v_proj for layers 24-41 -- so loading the base
+checkpoint silently DROPS those 54 tensors, and every checkpoint we save downstream
+(train_sft's merge, and this script) lacks them. That is invisible under transformers
+(the params don't exist, so nothing reads them; missing=0 unexpected=0) and our HF
+eval was unaffected -- they are genuinely dead weights.
+
+vLLM disagrees: its Gemma4 builds a FUSED qkv_proj + k_norm for EVERY layer, then
+hard-fails the load:
+
+    ValueError: Following weights were not initialized from checkpoint:
+    {'model.layers.24..41.self_attn.k_norm.weight', ...}
+
+The shared layers discard the K/V they compute, so the VALUES are irrelevant -- but
+the tensors must EXIST or vLLM won't start. `--base <base_model_dir>` copies them
+straight out of the base safetensors. Do NOT instead disable vLLM's check
+(`enable_weights_track`): that leaves those params as uninitialized memory rather
+than an honest error.
+
+Usage: python to_text_only.py <src_dir> <dst_dir> [--base <base_model_dir>]
 """
 import sys
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-src, dst = sys.argv[1], sys.argv[2]
+args = [a for a in sys.argv[1:]]
+base_dir = None
+if "--base" in args:
+    i = args.index("--base")
+    base_dir = args[i + 1]
+    del args[i:i + 2]
+src, dst = args[0], args[1]
 
 print(f"loading {src} (bf16) ...", flush=True)
 m = AutoModelForCausalLM.from_pretrained(src, dtype=torch.bfloat16, low_cpu_mem_usage=True)
@@ -64,4 +91,59 @@ print(f"text model params: {n_params/1e9:.2f}B  arch={type(text_model).__name__}
 print(f"saving -> {dst}", flush=True)
 text_model.save_pretrained(dst, safe_serialization=True)
 AutoTokenizer.from_pretrained(src).save_pretrained(dst)
+
+if base_dir:
+    # Backfill the KV-shared layers' k_norm/k_proj/v_proj (see module docstring).
+    # These params don't exist on `text_model`, so save_pretrained can't write them --
+    # they have to be read RAW from the base safetensors and injected after the save.
+    import glob
+    import json
+    import os
+
+    from safetensors import safe_open
+    from safetensors.torch import load_file, save_file
+
+    from transformers import AutoConfig as _AC
+    tcfg = _AC.from_pretrained(src).get_text_config()
+    n_shared = getattr(tcfg, "num_kv_shared_layers", 0)
+    if not n_shared:
+        print("no num_kv_shared_layers in config; nothing to backfill")
+    else:
+        first = tcfg.num_hidden_layers - n_shared
+        want = {f"model.layers.{i}.self_attn.{p}.weight"
+                for i in range(first, tcfg.num_hidden_layers)
+                for p in ("k_norm", "k_proj", "v_proj")}
+        print(f"backfilling {len(want)} KV-shared tensors (layers {first}..{tcfg.num_hidden_layers-1}) "
+              f"from {base_dir}", flush=True)
+
+        # map text-only name -> the base checkpoint's multimodal name
+        def base_name(k: str) -> str:
+            return k.replace("model.layers.", "model.language_model.layers.")
+
+        found = {}
+        for shard in sorted(glob.glob(os.path.join(base_dir, "*.safetensors"))):
+            with safe_open(shard, "pt") as f:
+                have = set(f.keys())
+                for k in want:
+                    if (bk := base_name(k)) in have:
+                        found[k] = f.get_tensor(bk).to(torch.bfloat16)
+        missing_bf = want - set(found)
+        if missing_bf:
+            sys.exit(f"backfill FAILED: base lacks {len(missing_bf)}, e.g. {sorted(missing_bf)[:3]}")
+
+        out = sorted(glob.glob(os.path.join(dst, "*.safetensors")))
+        if len(out) != 1:
+            sys.exit(f"expected 1 output shard to patch, found {len(out)}")
+        sd = load_file(out[0])
+        sd.update(found)
+        save_file(sd, out[0], metadata={"format": "pt"})
+        # keep the weight index (if any) consistent with what we just wrote
+        idx = os.path.join(dst, "model.safetensors.index.json")
+        if os.path.exists(idx):
+            j = json.load(open(idx))
+            for k in found:
+                j["weight_map"][k] = os.path.basename(out[0])
+            json.dump(j, open(idx, "w"), indent=2)
+        print(f"   backfilled {len(found)}; shard now has {len(sd)} tensors")
+
 print("DONE_TEXT_ONLY")

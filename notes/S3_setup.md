@@ -25,6 +25,33 @@ session/client (`boto3.client("s3")`) with no explicit credentials, and it will 
 the role on this box. Static keys would only be needed if this code ever runs somewhere
 other than the devbox.
 
+## Getting corpus/models onto a RunPod pod — use presigned URLs, not keys
+
+A pod is not the devbox, so it has no instance profile. The tempting fix is to mint an
+access key for the scoped `menu-corpus-pod` IAM user and drop it in `~/.aws/credentials`
+on the pod — **don't**: that's exactly the long-lived static key this project bans, and the
+secret is only shown once at creation (so it tends to get re-minted and left behind).
+
+**Presign from a box that already has credentials, and hand the pod URLs instead.** The pod
+holds no key material, each URL is read-only, single-object, and expires:
+
+```bash
+# on the devbox / any box with creds. --region is REQUIRED: the bucket is us-west-2, and a
+# presign that defaults to us-east-1 returns PermanentRedirect ("must be addressed using the
+# specified endpoint") -- the same cross-region bounce AWS_DEFAULT_REGION guards against.
+for f in config.json tokenizer.json model.safetensors; do
+  aws s3 presign "s3://restaurant-menu-corpus/v1/models/<ckpt>/merged/$f" \
+    --expires-in 10800 --region us-west-2
+done
+```
+
+Pipe the resulting `curl` script to the pod over ssh **stdin** (never argv — a presigned URL
+carries its signature in the query string, so it is a secret and would otherwise land in
+shell history / process lists). Measured 2026-07-16: 16 GB pulled in ~2 min.
+
+Pushing results back needs `aws s3 presign` on a `put-object` (or just pull from the devbox
+after the run). If you do create a key anyway, it needs the user's **explicit** say-so.
+
 ## What to put in `.env` / `.env.example`
 
 ```
