@@ -154,7 +154,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--save-strategy", default="steps")
     p.add_argument("--save-steps", type=int, default=50)
     p.add_argument("--attn", default="sdpa", choices=["sdpa", "eager"])
-    p.add_argument("--report-to", default="none")
+    p.add_argument("--report-to", default="none",
+                   help="'wandb' to log to Weights & Biases (needs `wandb login` or $WANDB_API_KEY "
+                        "on the box, and `pip install wandb` -- it is NOT a repo dep). Set "
+                        "$WANDB_PROJECT to name the project.")
+    p.add_argument("--run-name", default=None,
+                   help="run name for the tracker (wandb). Defaults to the output-dir name.")
     p.add_argument("--seed", type=int, default=42)
     # LoRA (scoped to language_model -- Gemma 4 is multimodal, see train_sft.py)
     p.add_argument("--lora-r", type=int, default=16)
@@ -340,6 +345,7 @@ def main() -> None:
         log_completions=True,
         num_completions_to_print=2,
         report_to=args.report_to,
+        run_name=args.run_name or Path(args.output_dir).name,
         seed=args.seed,
         use_vllm=args.use_vllm,
         vllm_mode=args.vllm_mode,
