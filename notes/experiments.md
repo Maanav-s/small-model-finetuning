@@ -13,6 +13,50 @@ Conventions:
 
 ---
 
+## 2026-07-16 — GRPO round 1 aborted: sync tools serialize every scrape (bug #8)
+
+First real GRPO run (H200 141 GB, `--cache-policy live`, G=8, `max_completion_length` 16384,
+bs=2×accum=16). Killed after ~40 min: **step 1 never completed, GPU pinned at 0%**.
+
+**Not stuck — serialized.** Diagnosis from the box: 6 Chromium processes, 13–17 established TCP
+connections, `cache.sqlite` growing ~2.6 MB — i.e. genuinely scraping, just one call at a time.
+
+**Root cause — TRL only parallelizes COROUTINE tools** (`grpo_trainer.py` ~1819):
+
+    if name in sync_tool_dict:    tool_call_results.append(sync_tool_dict[name](**args))  # inline, SERIAL
+    elif name in async_tool_dict: async_coros.append(...)   # -> asyncio.gather(*coros) -> PARALLEL
+
+`build_model_tools` returns plain `def` functions, so **every live scrape blocked the whole loop**:
+~**256 sequential network round-trips per step** (32 completions × up to 8 tool calls). Projected
+**>40 min/step ⇒ ~100 h ⇒ ~$440** for 150 steps, nearly all of it with the GPU idle.
+
+This is the **scrape-bound, not compute-bound** property the v2 notes predicted, in its worst form:
+we bought an H200 for *memory* (real — it fixed clipping and allowed G=8), but throughput was set by
+serialized network I/O, so the card idled.
+
+**Fix (`ceb6c89`): `tools._to_async`** wraps the blocking backends in `asyncio.to_thread` so TRL sees
+coroutines and gathers them. `to_thread` is the right primitive — the backends are genuinely blocking
+(`requests` + **sync** Playwright) and can't be made natively async — and its threadpool reuses
+threads, which fits `backends.py`'s **thread-local Chromium pool** exactly (one browser per worker
+thread, reused; the same property that makes the viz server's threadpool safe).
+
+- **Opt-in** (`setup_tools(async_tools=True)`), used only by `train_grpo`: `eval_split`,
+  `gemma/agent.py` and `claude_agent` call the registry synchronously and would get coroutines back.
+- **The model-facing schema is unchanged** — `functools.wraps` keeps `__name__`/`__doc__`/
+  `__annotations__`, so the docstring stays defined once on the sync function. Verified
+  `get_json_schema(sync) == get_json_schema(async)` for both tools: the student sees exactly the
+  declarations it was SFT'd on. (`iscoroutinefunction` reads code flags, not `__wrapped__`, so it
+  still reports True.)
+- Measured: 4 × 0.3 s blocking calls gathered finish in ~0.3 s, not ~1.2 s.
+
+**Lesson:** the smoke passed with `--cache-policy canned`, where tool calls are instant disk reads —
+so it could not have surfaced this. **A canned smoke validates the code path but hides every I/O
+property of the real run.** Cost so far: ~$4.39/hr × ~1 h of idle H200.
+
+**Still unmeasured:** the real step time with parallel tools. Re-run before trusting any projection.
+
+---
+
 ## 2026-07-16 — GRPO `--use-vllm` smoke PASSES (A100): 6 bugs, and the config the real run needs
 
 First run of the **vLLM rollout path** for GRPO (the prior smoke used `--use-vllm` OFF, i.e.
