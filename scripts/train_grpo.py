@@ -293,7 +293,12 @@ def main() -> None:
 
     # Tools: real backends wrapped in the cache (live -> grounding sees real content).
     cache = Cache(args.cache_path, miss_policy=args.cache_policy)
-    tools, _registry, _sys_prompt = setup_tools(dietary_restrictions=None, variant="student", cache=cache)
+    # async_tools=True is REQUIRED here, not a tuning knob: TRL runs sync tools inline
+    # one-at-a-time and only asyncio.gather's coroutines, so sync tools serialize every
+    # live scrape across the whole generation batch (measured >40 min/step, GPU at 0%).
+    # See tools._to_async.
+    tools, _registry, _sys_prompt = setup_tools(dietary_restrictions=None, variant="student",
+                                                cache=cache, async_tools=True)
     tokenizer = AutoTokenizer.from_pretrained(args.model_path or MODEL_ID)
 
     # Load the policy BEFORE building the LoRA config: how we scope LoRA depends on the

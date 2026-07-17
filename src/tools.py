@@ -23,6 +23,8 @@ cap stays retunable without re-scraping. cache=None (default) = uncached.
 
 from __future__ import annotations
 
+import asyncio
+import functools
 import re
 
 from backends import build_scrape, build_search
@@ -87,13 +89,50 @@ def _cap(text: str, label: str) -> str:
 # so it never sees which provider backs them. The backend's search_fn/scrape_fn
 # (from backends.py) do the actual network call; these wrappers add the
 # MAX_TOOL_CHARS cap and nothing else.
-def build_model_tools(search_fn, scrape_fn):
+def _to_async(fn):
+    """A blocking tool -> a coroutine that runs it in a worker thread.
+
+    WHY (measured 2026-07-16, GRPO round 1): TRL's GRPO tool loop splits the declared
+    tools by `inspect.iscoroutinefunction` (grpo_trainer.py ~1819):
+
+        if name in sync_tool_dict:   results.append(sync_tool_dict[name](**args))  # inline, SERIAL
+        elif name in async_tool_dict: async_coros.append(...)                      # asyncio.gather -> PARALLEL
+
+    So SYNC tools are executed one at a time, blocking the whole loop. With live tools
+    that is ~256 sequential network round-trips per step (32 completions x up to 8 calls),
+    which measured >40 min/step with the GPU pinned at 0% -- ~100 h for a 150-step run.
+    Making the tools coroutines lets TRL gather them, so the scrapes overlap.
+
+    `asyncio.to_thread` is the right primitive because the backends are genuinely
+    blocking (requests + SYNC Playwright) and cannot be made natively async. Its
+    ThreadPoolExecutor reuses threads, which suits backends.py's THREAD-LOCAL Chromium
+    pool exactly: each worker thread launches one browser and reuses it across calls
+    (the same property that makes the viz server's threadpool safe -- see CLAUDE.md).
+
+    functools.wraps keeps `__name__`/`__doc__`/`__annotations__`, so
+    apply_chat_template still renders the SAME tool schema the model was SFT'd on --
+    the docstring stays defined once, on the sync function, and cannot drift. (It also
+    sets `__wrapped__`, so inspect.signature reports the real signature, while
+    iscoroutinefunction still reports True -- it reads the code flags, not __wrapped__.)
+    """
+    @functools.wraps(fn)
+    async def _async_tool(*args, **kwargs):
+        return await asyncio.to_thread(fn, *args, **kwargs)
+    return _async_tool
+
+
+def build_model_tools(search_fn, scrape_fn, async_tools: bool = False):
     """Wrap the backend's (search_fn, scrape_fn) as the model-facing tools.
 
     Returns (tools, registry): `tools` is a list of plain functions (for
     apply_chat_template / to_anthropic_tools) and `registry` maps
     name -> callable(**kwargs) -> str. The docstrings here are what the model
     reads, so they stay vendor-neutral.
+
+    async_tools=True returns the SAME tools as coroutines (see _to_async) so TRL's
+    GRPO loop runs them in parallel instead of serially. OPT-IN on purpose: the other
+    callers (eval_split, gemma/agent.py, claude_agent) invoke the registry
+    synchronously and would get a coroutine object instead of a string.
     """
 
     def web_search(query: str) -> str:
@@ -125,6 +164,8 @@ def build_model_tools(search_fn, scrape_fn):
         return _cap(_slim_scrape(scrape_fn(url, mode)), "scrape_url")
 
     tools = [web_search, scrape_url]
+    if async_tools:
+        tools = [_to_async(fn) for fn in tools]
     registry = {fn.__name__: fn for fn in tools}
     return tools, registry
 
@@ -132,7 +173,8 @@ def build_model_tools(search_fn, scrape_fn):
 # ---------------------------------------------------------------------------
 # Setup
 # ---------------------------------------------------------------------------
-def setup_tools(dietary_restrictions=None, variant: str = "teacher", cache=None):
+def setup_tools(dietary_restrictions=None, variant: str = "teacher", cache=None,
+                async_tools: bool = False):
     """Build the live tools and return (tools, tool_registry, system_prompt).
 
     The tools are `web_search` (Brave; reads BRAVE_API_KEY) + `scrape_url` (local
@@ -146,6 +188,10 @@ def setup_tools(dietary_restrictions=None, variant: str = "teacher", cache=None)
     BEFORE the MAX_TOOL_CHARS cap above -- so the RAW uncapped response is stored
     and the cap stays retunable without re-scraping. The cache's miss_policy
     (live/canned/error) decides what a miss does; see src/cache.py.
+    async_tools (bool): return the tools as coroutines so TRL's GRPO loop executes them
+    in PARALLEL rather than one-at-a-time (see _to_async -- this is the difference
+    between ~40 min/step and a usable rollout rate on live tools). Only train_grpo.py
+    wants this; the sync callers would get coroutines back.
     """
     search_fn, scrape_fn = build_search(), build_scrape()
     if cache is not None:
@@ -156,7 +202,8 @@ def setup_tools(dietary_restrictions=None, variant: str = "teacher", cache=None)
         scrape_fn = cache.wrap(
             "scrape", scrape_fn, key_fn=norm_scrape, status_fn=scrape_status, provider="local"
         )
-    tools, registry = build_model_tools(search_fn, scrape_fn)
+    tools, registry = build_model_tools(search_fn, scrape_fn, async_tools=async_tools)
     cached = f", cached ({cache.miss_policy}) at {cache.path}" if cache is not None else ""
-    print(f"Live tools: web_search via Brave, scrape_url via local Chromium{cached}")
+    mode = " [async: parallel tool calls]" if async_tools else ""
+    print(f"Live tools: web_search via Brave, scrape_url via local Chromium{cached}{mode}")
     return tools, registry, build_system_prompt(dietary_restrictions, variant=variant)
