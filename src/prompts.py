@@ -215,7 +215,7 @@ Working guidance:
 - Source selection: prefer the restaurant's OWN website or online-ordering page
   (often hosted on Square, Toast, Clover, or BentoBox). These usually list the
   complete menu and scrape cleanly with mode="direct". AVOID third-party delivery
-  apps and directories - DoorDash, Uber Eats, Grubhub, Yelp. They are
+  apps and directories - DoorDash, Grubhub, Yelp. They are
   JavaScript-heavy and/or block scraping, so they often yield only a partial menu
   or nothing. Only fall back to them if no better source turns up.
 """
