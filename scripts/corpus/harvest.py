@@ -218,7 +218,7 @@ PLACES_MAX_PAGES = 3              # Text Search caps at 60 results (3 x 20) per 
 # Place Details round-trip needed (unlike the classic API).
 PLACES_FIELD_MASK = ",".join("places." + f for f in (
     "id", "displayName", "addressComponents", "primaryType",
-    "businessStatus", "location", "websiteUri",
+    "businessStatus", "userRatingCount", "location", "websiteUri",
 )) + ",nextPageToken"
 # Cuisine tiles to break past the 60-per-query cap and diversify the pool (the ""
 # tile is the generic "restaurants in <city>"). More tiles -> more coverage + more
@@ -235,7 +235,11 @@ def _places_search(query: str, api_key: str, page_token: str | None = None) -> d
     API returns 403 until it rolls out) with backoff; other HTTP errors raise."""
     headers = {"Content-Type": "application/json", "X-Goog-Api-Key": api_key,
                "X-Goog-FieldMask": PLACES_FIELD_MASK}
-    body = {"textQuery": query, "pageSize": PLACES_PAGE_SIZE}
+    # includedType + strictTypeFiltering drop non-restaurants (bars/cafes/grocery
+    # mislabeled as food); verified to KEEP specific-cuisine restaurants
+    # (italian_restaurant/seafood_restaurant/... all carry 'restaurant' in types).
+    body = {"textQuery": query, "pageSize": PLACES_PAGE_SIZE,
+            "includedType": "restaurant", "strictTypeFiltering": True}
     if page_token:
         body["pageToken"] = page_token
     for attempt in range(MAX_ATTEMPTS):
@@ -256,8 +260,13 @@ def _locality(place: dict) -> str | None:
     return None
 
 
-def place_to_row(place: dict, cfg: dict) -> dict | None:
-    """A Places result -> transient harvest row, or None to skip (unnamed/closed).
+def place_to_row(place: dict, cfg: dict, min_ratings: int = 0) -> dict | None:
+    """A Places result -> transient harvest row, or None to skip.
+
+    Skips: unnamed; non-OPERATIONAL (closed permanently/temporarily); and, when
+    min_ratings > 0, places under that userRatingCount floor -- ghost / delivery-
+    only / never-existed listings carry 0-few ratings, so this is the "does it
+    actually exist" filter (the API exposes no last-verified/recency field).
 
     is_chain starts False and is finalized by the name-frequency heuristic in
     dedup_and_flag_chains (Places has no chain field). cuisine is derived from
@@ -269,6 +278,8 @@ def place_to_row(place: dict, cfg: dict) -> dict | None:
         return None
     if place.get("businessStatus") not in (None, "OPERATIONAL"):
         return None                                   # drop closed / temporarily closed
+    if (place.get("userRatingCount") or 0) < min_ratings:
+        return None                                   # drop ghost / nonexistent listings
     city = _locality(place) or cfg["city"]
     loc = place.get("location") or {}
     ptype = place.get("primaryType") or ""
@@ -297,12 +308,15 @@ def harvest_places(region_keys: list[str], args) -> tuple[list, dict, list]:
     """Google Places (New) source: Text Search per region, tiled by cuisine to beat
     the 60-per-query cap, deduped by place id within the region. Same
     (rows_with_region, counts, failed) contract as harvest_osm. Reads
-    GOOGLE_PLACES_API_KEY from the environment and --places-tiles off `args`.
+    GOOGLE_PLACES_API_KEY from the environment and --places-tiles / --places-min-
+    ratings off `args`. Server-side the query filters to includedType=restaurant
+    (strict); client-side place_to_row drops non-OPERATIONAL + sub-min-ratings.
     """
     api_key = os.environ.get("GOOGLE_PLACES_API_KEY", "").strip()
     if not api_key:
         sys.exit("--source places needs GOOGLE_PLACES_API_KEY (repo-root .env)")
     n_tiles = max(0, getattr(args, "places_tiles", 8))
+    min_ratings = max(0, getattr(args, "places_min_ratings", 0))
     tiles = [""] + PLACES_TILES[:n_tiles]             # "" = the generic query
     rows_with_region: list = []
     region_fetch_counts: dict = {}
@@ -312,7 +326,7 @@ def harvest_places(region_keys: list[str], args) -> tuple[list, dict, list]:
             time.sleep(SLEEP_BETWEEN_REGIONS_S)
         cfg = REGIONS[rkey]
         seen_ids: set = set()
-        kept = 0
+        kept = dropped = 0
         try:
             for tile in tiles:
                 q = (f"{tile} restaurants in {cfg['city']}, {cfg['region']}" if tile
@@ -326,10 +340,12 @@ def harvest_places(region_keys: list[str], args) -> tuple[list, dict, list]:
                             continue
                         if pid:
                             seen_ids.add(pid)
-                        row = place_to_row(place, cfg)
+                        row = place_to_row(place, cfg, min_ratings)
                         if row is not None:
                             rows_with_region.append((row, rkey))
                             kept += 1
+                        else:
+                            dropped += 1               # closed / sub-min-ratings
                     token = j.get("nextPageToken")
                     if not token:
                         break
@@ -340,7 +356,8 @@ def harvest_places(region_keys: list[str], args) -> tuple[list, dict, list]:
             continue
         region_fetch_counts[rkey] = kept
         n_web = sum(1 for r, rk in rows_with_region if rk == rkey and r.get("website"))
-        print(f"[{rkey}] kept {kept} restaurant rows ({len(tiles)} tiles; {n_web} w/ own website)")
+        print(f"[{rkey}] kept {kept} restaurant rows ({len(tiles)} tiles; {n_web} w/ own "
+              f"website; {dropped} dropped closed/<{min_ratings}-ratings)")
     return rows_with_region, region_fetch_counts, failed_regions
 
 
@@ -568,6 +585,11 @@ def parse_args():
                         help="--source places: number of cuisine tiles per city beyond the generic "
                              "query, to beat the 60/query cap (0 = generic only; more = more coverage "
                              "+ more API cost). Default 8.")
+    parser.add_argument("--places-min-ratings", type=int, default=3,
+                        help="--source places: drop restaurants with fewer than this many Google "
+                             "ratings (the 'does it actually exist' filter -- ghost/closed listings "
+                             "have 0-few). Default 3; 0 disables. Closed places are always dropped "
+                             "via businessStatus, and the query is restricted to real restaurants.")
     parser.add_argument("--enrich-places", action="store_true", help="enrich (transient) price_tier via Google Places (needs GOOGLE_PLACES_API_KEY)")
     parser.add_argument("--db", type=Path, default=REPO_ROOT / "data" / "corpus.sqlite",
                         help="corpus.sqlite path (default data/corpus.sqlite)")
