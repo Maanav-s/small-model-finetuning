@@ -12,9 +12,13 @@ by default (--assign-split none). Pass --assign-split random to fill the split i
 the same run (fills only currently-unmarked rows, seeded), or run the dedicated
 scripts/corpus/assign_splits.py later.
 
-Sourcing is pluggable behind a clean fetch seam (`SOURCES`), but only OSM/Overpass
-is implemented today (no paid API key exists). The `source` column records
-provenance so a later Yelp/Foursquare harvester slots in without a schema change.
+Sourcing is pluggable behind a clean fetch seam (`SOURCES`): `osm` (Overpass, no
+key) and `places` (Google Places New Text Search, needs GOOGLE_PLACES_API_KEY).
+Places tiles by cuisine to beat its 60-results/query cap and yields name + city +
+own website + business status in one call; the `source` column records provenance.
+
+  uv run python scripts/corpus/harvest.py --source places --regions seattle --target 50
+  uv run python scripts/corpus/harvest.py --source places --places-tiles 12   # more coverage
 
   uv run python scripts/corpus/harvest.py                        # full default OSM harvest
   uv run python scripts/corpus/harvest.py --regions seattle --target 50
@@ -36,7 +40,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 # Shared modules live in src/ (flat-import, script-run convention -- see CLAUDE.md).
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
-# Load GOOGLE_PLACES_API_KEY (for --enrich-places) from the repo-root .env.
+# Load GOOGLE_PLACES_API_KEY (--source places / --enrich-places) from repo-root .env.
 load_dotenv(REPO_ROOT / ".env")
 
 from corpus import VALID_SPLITS, open_corpus, restaurant_id_for  # noqa: E402
@@ -176,12 +180,13 @@ def element_to_row(el: dict, cfg: dict) -> dict | None:
     }
 
 
-def harvest_osm(region_keys: list[str], endpoint: str) -> tuple[list, dict, list]:
+def harvest_osm(region_keys: list[str], args) -> tuple[list, dict, list]:
     """OSM/Overpass source: fetch every region -> (rows_with_region, counts, failed).
 
     `rows_with_region` is a list of (transient_row, harvest_region_key) tuples --
-    the shape a future source (yelp/foursquare) must also return so the dedup /
-    sampling / write pipeline below stays source-agnostic.
+    the shape every source must return so the dedup / sampling / write pipeline
+    below stays source-agnostic. Each source takes (region_keys, args) and reads
+    whatever config it needs off `args` (osm: --endpoint; places: --places-tiles).
     """
     rows_with_region: list = []
     region_fetch_counts: dict = {}
@@ -189,7 +194,7 @@ def harvest_osm(region_keys: list[str], endpoint: str) -> tuple[list, dict, list
     for i, rkey in enumerate(region_keys):
         if i > 0:
             time.sleep(SLEEP_BETWEEN_REGIONS_S)
-        elements = fetch_region(endpoint, rkey, REGIONS[rkey])
+        elements = fetch_region(args.endpoint, rkey, REGIONS[rkey])
         if elements is None:
             failed_regions.append(rkey)
             continue
@@ -203,9 +208,145 @@ def harvest_osm(region_keys: list[str], endpoint: str) -> tuple[list, dict, list
     return rows_with_region, region_fetch_counts, failed_regions
 
 
-# Source seam: name -> harvester. Only OSM today; add a source by implementing the
-# same (rows_with_region, region_fetch_counts, failed_regions) return contract.
-SOURCES = {"osm": harvest_osm}
+# ---------------------------------------------------------------------------
+# Google Places (New) source
+# ---------------------------------------------------------------------------
+PLACES_TEXT_URL = "https://places.googleapis.com/v1/places:searchText"
+PLACES_PAGE_SIZE = 20
+PLACES_MAX_PAGES = 3              # Text Search caps at 60 results (3 x 20) per query
+# One call yields name + structured city + primaryType + own website + status; no
+# Place Details round-trip needed (unlike the classic API).
+PLACES_FIELD_MASK = ",".join("places." + f for f in (
+    "id", "displayName", "addressComponents", "primaryType",
+    "businessStatus", "location", "websiteUri",
+)) + ",nextPageToken"
+# Cuisine tiles to break past the 60-per-query cap and diversify the pool (the ""
+# tile is the generic "restaurants in <city>"). More tiles -> more coverage + more
+# API cost; --places-tiles bounds how many cuisine tiles are used per city.
+PLACES_TILES = [
+    "italian", "chinese", "mexican", "thai", "japanese", "indian", "korean",
+    "vietnamese", "mediterranean", "american", "pizza", "sushi", "bbq",
+    "vegetarian", "seafood", "french", "greek", "breakfast", "burgers", "ramen",
+]
+
+
+def _places_search(query: str, api_key: str, page_token: str | None = None) -> dict:
+    """One Places (New) Text Search page. Retries a propagation 403 (a just-enabled
+    API returns 403 until it rolls out) with backoff; other HTTP errors raise."""
+    headers = {"Content-Type": "application/json", "X-Goog-Api-Key": api_key,
+               "X-Goog-FieldMask": PLACES_FIELD_MASK}
+    body = {"textQuery": query, "pageSize": PLACES_PAGE_SIZE}
+    if page_token:
+        body["pageToken"] = page_token
+    for attempt in range(MAX_ATTEMPTS):
+        resp = requests.post(PLACES_TEXT_URL, json=body, headers=headers, timeout=30)
+        if resp.status_code == 403 and "has not been used" in resp.text:
+            time.sleep(BACKOFF_BASE_S * (attempt + 1))
+            continue
+        resp.raise_for_status()
+        return resp.json()
+    resp.raise_for_status()
+    return {}
+
+
+def _locality(place: dict) -> str | None:
+    for comp in place.get("addressComponents", []):
+        if "locality" in comp.get("types", []):
+            return comp.get("longText")
+    return None
+
+
+def place_to_row(place: dict, cfg: dict) -> dict | None:
+    """A Places result -> transient harvest row, or None to skip (unnamed/closed).
+
+    is_chain starts False and is finalized by the name-frequency heuristic in
+    dedup_and_flag_chains (Places has no chain field). cuisine is derived from
+    primaryType for the sampling buckets. `website` is transient (not persisted in
+    the lean schema) -- surfaced in the report; a future column could seed scraping.
+    """
+    name = (place.get("displayName") or {}).get("text", "").strip()
+    if not name:
+        return None
+    if place.get("businessStatus") not in (None, "OPERATIONAL"):
+        return None                                   # drop closed / temporarily closed
+    city = _locality(place) or cfg["city"]
+    loc = place.get("location") or {}
+    ptype = place.get("primaryType") or ""
+    if ptype.endswith("_restaurant"):
+        cuisine = [ptype[: -len("_restaurant")]]
+    elif ptype in ("cafe", "bakery", "bar", "meal_takeaway", "meal_delivery"):
+        cuisine = [ptype]
+    else:
+        cuisine = []
+    return {
+        "restaurant_id": restaurant_id_for(name, city),
+        "name": name,
+        "city": city,
+        "source": "places",
+        "is_chain": False,
+        # transient-only (not persisted):
+        "lat": loc.get("latitude"),
+        "lng": loc.get("longitude"),
+        "cuisine": cuisine,
+        "price_tier": 0,
+        "website": place.get("websiteUri"),
+    }
+
+
+def harvest_places(region_keys: list[str], args) -> tuple[list, dict, list]:
+    """Google Places (New) source: Text Search per region, tiled by cuisine to beat
+    the 60-per-query cap, deduped by place id within the region. Same
+    (rows_with_region, counts, failed) contract as harvest_osm. Reads
+    GOOGLE_PLACES_API_KEY from the environment and --places-tiles off `args`.
+    """
+    api_key = os.environ.get("GOOGLE_PLACES_API_KEY", "").strip()
+    if not api_key:
+        sys.exit("--source places needs GOOGLE_PLACES_API_KEY (repo-root .env)")
+    n_tiles = max(0, getattr(args, "places_tiles", 8))
+    tiles = [""] + PLACES_TILES[:n_tiles]             # "" = the generic query
+    rows_with_region: list = []
+    region_fetch_counts: dict = {}
+    failed_regions: list = []
+    for i, rkey in enumerate(region_keys):
+        if i > 0:
+            time.sleep(SLEEP_BETWEEN_REGIONS_S)
+        cfg = REGIONS[rkey]
+        seen_ids: set = set()
+        kept = 0
+        try:
+            for tile in tiles:
+                q = (f"{tile} restaurants in {cfg['city']}, {cfg['region']}" if tile
+                     else f"restaurants in {cfg['city']}, {cfg['region']}")
+                token = None
+                for _page in range(PLACES_MAX_PAGES):
+                    j = _places_search(q, api_key, token)
+                    for place in j.get("places", []):
+                        pid = place.get("id")
+                        if pid and pid in seen_ids:
+                            continue
+                        if pid:
+                            seen_ids.add(pid)
+                        row = place_to_row(place, cfg)
+                        if row is not None:
+                            rows_with_region.append((row, rkey))
+                            kept += 1
+                    token = j.get("nextPageToken")
+                    if not token:
+                        break
+                    time.sleep(2)                     # page token needs a moment to activate
+        except requests.RequestException as exc:
+            print(f"[{rkey}] places fetch failed: {exc}; skipping region")
+            failed_regions.append(rkey)
+            continue
+        region_fetch_counts[rkey] = kept
+        n_web = sum(1 for r, rk in rows_with_region if rk == rkey and r.get("website"))
+        print(f"[{rkey}] kept {kept} restaurant rows ({len(tiles)} tiles; {n_web} w/ own website)")
+    return rows_with_region, region_fetch_counts, failed_regions
+
+
+# Source seam: name -> harvester(region_keys, args). Add a source by implementing
+# the same (rows_with_region, region_fetch_counts, failed_regions) return contract.
+SOURCES = {"osm": harvest_osm, "places": harvest_places}
 
 
 # ---------------------------------------------------------------------------
@@ -416,13 +557,17 @@ def parse_fractions(text: str) -> dict[str, float]:
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--source", choices=sorted(SOURCES), default="osm",
-                        help="harvest source (default osm; the only one implemented)")
+                        help="harvest source: osm (Overpass) or places (Google Places New). Default osm.")
     parser.add_argument(
         "--regions", nargs="+", metavar="NAME", default=None,
         help=f"subset of regions to harvest (default: all). Available: {', '.join(REGIONS)}",
     )
     parser.add_argument("--target", type=int, default=3500, help="stratified-sample size (default 3500)")
-    parser.add_argument("--endpoint", default=DEFAULT_ENDPOINT, help="Overpass API endpoint (point at a mirror if throttled)")
+    parser.add_argument("--endpoint", default=DEFAULT_ENDPOINT, help="Overpass API endpoint (--source osm; point at a mirror if throttled)")
+    parser.add_argument("--places-tiles", type=int, default=8,
+                        help="--source places: number of cuisine tiles per city beyond the generic "
+                             "query, to beat the 60/query cap (0 = generic only; more = more coverage "
+                             "+ more API cost). Default 8.")
     parser.add_argument("--enrich-places", action="store_true", help="enrich (transient) price_tier via Google Places (needs GOOGLE_PLACES_API_KEY)")
     parser.add_argument("--db", type=Path, default=REPO_ROOT / "data" / "corpus.sqlite",
                         help="corpus.sqlite path (default data/corpus.sqlite)")
@@ -450,7 +595,7 @@ def main():
 
     # 1. Harvest via the selected source seam.
     harvester = SOURCES[args.source]
-    rows_with_region, region_fetch_counts, failed_regions = harvester(region_keys, args.endpoint)
+    rows_with_region, region_fetch_counts, failed_regions = harvester(region_keys, args)
     if not rows_with_region:
         sys.exit("no rows harvested from any region; aborting")
     print(f"\nharvested {len(rows_with_region)} rows from {len(region_fetch_counts)} region(s)"
