@@ -1,20 +1,22 @@
-"""Unit tests for scripts/analyze_queries.py (Phase 2 WS-E).
+"""Unit tests for scripts/analysis/analyze_queries.py (v2: mine corpus.sqlite traces).
 
-No network anywhere: synthetic traces (contract 1.5 shapes) are written to a
-pytest tmp_path traces dir and mined exactly like the real data/traces/.
+No network anywhere. The pure functions (templatize / domain_of / is_delivery /
+extract_calls) are UNCHANGED from v1 and tested directly on synthetic trace dicts.
+The aggregate report is now mined from an in-DB corpus fixture (traces written via
+corpus.write_trace, read back via analyze_queries.load_traces) instead of a
+data/traces/*.json directory -- that is the only v2 change (input SOURCE = the DB).
 
 Run: uv run python -m pytest tests/test_analyze_queries.py -q
 """
 
-import json
 import sys
 from pathlib import Path
 
-# The tool lives in scripts/ and its imports in src/ (flat imports, no
-# packages) -- same convention as the entry scripts.
 REPO_ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(REPO_ROOT / "scripts"))
+# Flat-import, script-run convention (see CLAUDE.md): shared modules in src/, the
+# script under test in scripts/analysis/ (the v2 location -- NOT scripts/).
 sys.path.insert(0, str(REPO_ROOT / "src"))
+sys.path.insert(0, str(REPO_ROOT / "scripts" / "analysis"))
 
 from analyze_queries import (  # noqa: E402
     analyze,
@@ -24,13 +26,13 @@ from analyze_queries import (  # noqa: E402
     load_traces,
     templatize,
 )
+from corpus import open_corpus, restaurant_id_for  # noqa: E402
 
 
-def make_trace(name, city, *, queries=(), scrapes=(), found=True,
-               model="claude-sonnet-5"):
-    """A minimal contract-1.5 trace. `scrapes` rows are (url, mode, result)
-    triples rendered as paired tool_use/tool_result blocks, like the real
-    Claude loop records them."""
+def _messages(name, city, queries, scrapes):
+    """The Anthropic content-block message list a teacher loop records: a user
+    episode-input turn, an assistant tool_use turn, and a user tool_result turn.
+    `scrapes` rows are (url, mode, result) triples (mode=None omits the arg)."""
     content, results = [], []
     for i, q in enumerate(queries):
         content.append({"type": "tool_use", "id": f"q{i}", "name": "web_search",
@@ -45,21 +47,50 @@ def make_trace(name, city, *, queries=(), scrapes=(), found=True,
                         "input": block_input})
         results.append({"type": "tool_result", "tool_use_id": f"s{i}",
                         "content": result})
+    return [
+        {"role": "user", "content": f"{name}, {city}"},
+        {"role": "assistant", "content": content},
+        {"role": "user", "content": results},
+    ]
+
+
+def make_trace(name, city, *, queries=(), scrapes=(), found=True,
+               model="claude-sonnet-5"):
+    """A minimal contract-1.5 trace dict (as extract_calls consumes it)."""
     return {
         "restaurant_id": "deadbeef",
         "restaurant_name": name,
+        "city": city,
         "episode_input": f"{name}, {city}",
         "model": model,
-        "messages": [
-            {"role": "user", "content": f"{name}, {city}"},
-            {"role": "assistant", "content": content},
-            {"role": "user", "content": results},
-        ],
+        "messages": _messages(name, city, queries, scrapes),
         "queries": list(queries),
         "urls": [s[0] for s in scrapes],
         "final_json": {"found": found, "menu": []},
         "schema_valid": True,
     }
+
+
+def _add_trace(cx, name, city, *, queries=(), scrapes=(), found=True,
+               model="claude-sonnet-5", split="sft"):
+    """Upsert a restaurant and write one teacher trace for it into the corpus."""
+    cx.upsert_restaurants([{"name": name, "city": city, "source": "osm", "split": split}])
+    rid = restaurant_id_for(name, city)
+    cx.write_trace({
+        "restaurant_id": rid,
+        "model": model,
+        "prompt_variant": "teacher",
+        "dietary_restrictions": None,
+        "found": found,
+        "schema_valid": True,
+        "final_json": {"found": found, "menu": []},
+        "messages": _messages(name, city, queries, scrapes),
+        "queries": list(queries),
+        "urls": [s[0] for s in scrapes],
+        "cache_version": 1,
+        "captured_at": "2026-07-18T00:00:00Z",
+    })
+    return rid
 
 
 # ---------------------------------------------------------------------------
@@ -101,7 +132,7 @@ class TestTemplatize:
 
 
 # ---------------------------------------------------------------------------
-# Delivery-domain flagging + the aggregate report over synthetic traces
+# Delivery-domain flagging + the aggregate report over an in-DB corpus
 # ---------------------------------------------------------------------------
 class TestDeliveryFlagging:
     def test_is_delivery_matches_subdomains(self):
@@ -111,27 +142,24 @@ class TestDeliveryFlagging:
         assert not is_delivery(domain_of("https://ssamjangbbq.com/menu"))
         assert not is_delivery(domain_of("https://web.archive.org/web/x"))
 
-    def test_aggregates_over_traces_dir(self, tmp_path):
-        traces_dir = tmp_path / "traces"
-        traces_dir.mkdir()
-        t1 = make_trace("Ssamjang", "Atlanta",
-                        queries=["Ssamjang Atlanta menu"],
-                        scrapes=[("https://ssamjangbbq.com/menu", "direct", "menu md"),
-                                 ("https://ssamjangbbq.com/menu", "browser", "menu md")],
-                        found=True)
-        t2 = make_trace("Joe's Pizza", "New York",
-                        queries=["joes pizza new york menu"],
-                        scrapes=[("https://www.doordash.com/store/joes", None,
-                                  "(scrape failed: bot wall)"),
-                                 ("https://web.archive.org/web/joespizza", "browser",
-                                  "archived menu")],
-                        found=False)
-        (traces_dir / "t1.json").write_text(json.dumps(t1), encoding="utf-8")
-        (traces_dir / "t2.json").write_text(json.dumps(t2), encoding="utf-8")
-        (traces_dir / "torn.json").write_text("{not json", encoding="utf-8")
+    def test_aggregates_over_corpus(self, tmp_path):
+        corpus = tmp_path / "corpus.sqlite"
+        with open_corpus(corpus) as cx:
+            _add_trace(cx, "Ssamjang", "Atlanta",
+                       queries=["Ssamjang Atlanta menu"],
+                       scrapes=[("https://ssamjangbbq.com/menu", "direct", "menu md"),
+                                ("https://ssamjangbbq.com/menu", "browser", "menu md")],
+                       found=True)
+            _add_trace(cx, "Joe's Pizza", "New York",
+                       queries=["joes pizza new york menu"],
+                       scrapes=[("https://www.doordash.com/store/joes", None,
+                                 "(scrape failed: bot wall)"),
+                                ("https://web.archive.org/web/joespizza", "browser",
+                                 "archived menu")],
+                       found=False)
 
-        traces, skipped = load_traces(traces_dir, model=None)
-        assert len(traces) == 2 and skipped == 1
+        traces = load_traces(corpus, model=None, split=None)
+        assert len(traces) == 2
         agg = analyze(traces)
 
         templates = {r["template"]: r["count"] for r in agg["query_templates"]}
@@ -159,13 +187,11 @@ class TestDeliveryFlagging:
             {"domain": "doordash.com", "count": 1}]
 
     def test_model_filter(self, tmp_path):
-        traces_dir = tmp_path / "traces"
-        traces_dir.mkdir()
-        t1 = make_trace("A", "B", queries=["A menu"], model="claude-sonnet-5")
-        t2 = make_trace("A", "B", queries=["A menu"], model="claude-sonnet-4-6")
-        (traces_dir / "a.json").write_text(json.dumps(t1), encoding="utf-8")
-        (traces_dir / "b.json").write_text(json.dumps(t2), encoding="utf-8")
-        traces, _ = load_traces(traces_dir, model="claude-sonnet-5")
+        corpus = tmp_path / "corpus.sqlite"
+        with open_corpus(corpus) as cx:
+            _add_trace(cx, "Alpha", "Austin", queries=["Alpha menu"], model="claude-sonnet-5")
+            _add_trace(cx, "Beta", "Boston", queries=["Beta menu"], model="claude-sonnet-4-6")
+        traces = load_traces(corpus, model="claude-sonnet-5", split=None)
         assert [t["model"] for t in traces] == ["claude-sonnet-5"]
 
 

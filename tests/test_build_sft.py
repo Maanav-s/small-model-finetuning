@@ -1,26 +1,37 @@
-"""Tests for scripts/build_sft.py (WS-I: traces -> student-rendered SFT dataset).
+"""Tests for scripts/datasets/build_sft.py (v2: corpus.sqlite sft traces -> SFT dataset).
 
 Pure-logic unit tests (no tokenizer) cover the found=false ratio-guard math, the
-tool-result slim+cap mapping by tool name, reject-list filtering, and the
-extract_json-based final-answer cleaning. A light integration test loads the
-gated Gemma tokenizer and round-trips one tiny synthetic trace; it is skipped
-cleanly when the gated weights/tokenizer aren't available, so CI without them
-still passes.
+tool-result slim+cap mapping by tool name, and the extract_json-based final-answer
+cleaning -- all UNCHANGED from v1 (the student re-render pipeline is identical; only
+the INPUT SOURCE moved to the DB). A small in-DB integration test drives main() over
+a temp corpus.sqlite with a FAKE tokenizer to prove the v2 change: traces come from
+`iter_traces(split="sft", include_rejected=False)`, so a rejected trace (marked via
+corpus.set_rejected) and an eval-split trace are both excluded -- no reject_list.txt,
+no data/traces files. A separate integration test loads the gated Gemma tokenizer and
+round-trips one synthetic trace; it is skipped cleanly when the weights aren't there.
+
+The v1 reject-list-file tests (load_reject_set / is_rejected) are DROPPED: rejection
+is a DB field now (iter_traces filters it), so those functions no longer exist.
 
     uv run python -m pytest tests/test_build_sft.py -q
 """
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(REPO_ROOT / "scripts"))
+# Flat-import, script-run convention (see CLAUDE.md): shared modules in src/, the
+# script under test in scripts/datasets/ (the v2 location -- NOT scripts/).
+sys.path.insert(0, str(REPO_ROOT / "src"))
+sys.path.insert(0, str(REPO_ROOT / "scripts" / "datasets"))
 
 import build_sft as bs  # noqa: E402
+from corpus import open_corpus, restaurant_id_for  # noqa: E402
 from tools import MAX_TOOL_CHARS  # noqa: E402  (src/ is on the path via build_sft's import)
 
 
@@ -85,39 +96,6 @@ def test_tool_result_transform_idempotent():
     once = bs.transform_tool_result("scrape_url", md)
     twice = bs.transform_tool_result("scrape_url", once)
     assert once == twice
-
-
-# ---------------------------------------------------------------------------
-# reject-list filtering
-# ---------------------------------------------------------------------------
-def test_load_reject_set_strips_json_and_comments(tmp_path):
-    f = tmp_path / "reject.txt"
-    f.write_text(
-        "# a comment\n"
-        "abc123.json\n"
-        "def456\n"
-        "\n"
-        "  ghi789__vegetarian.json  \n",
-        encoding="utf-8",
-    )
-    reject = bs.load_reject_set(f)
-    assert reject == {"abc123", "def456", "ghi789__vegetarian"}
-
-
-def test_load_reject_set_none_is_empty():
-    assert bs.load_reject_set(None) == set()
-
-
-def test_is_rejected_matches_filename_and_rid():
-    reject = {"abc123", "zzz__vegan"}
-    # matched by restaurant_id
-    assert bs.is_rejected("abc123.json", "abc123", reject)
-    # matched by conditioned filename stem even if rid differs
-    assert bs.is_rejected("zzz__vegan.json", "zzz", reject)
-    # not on the list
-    assert not bs.is_rejected("other.json", "other", reject)
-    # empty reject set never rejects
-    assert not bs.is_rejected("abc123.json", "abc123", set())
 
 
 # ---------------------------------------------------------------------------
@@ -226,6 +204,97 @@ def test_build_gemma_messages_skips_unparseable_final():
     trace["messages"][-1]["content"] = [{"type": "text", "text": "no menu found, sorry"}]
     with pytest.raises(ValueError, match="did not parse"):
         bs.build_gemma_messages(trace)
+
+
+# ---------------------------------------------------------------------------
+# In-DB integration: main() reads sft-split, NON-rejected traces from corpus.sqlite
+# ---------------------------------------------------------------------------
+class _FakeTokenizer:
+    """A stand-in for the gated Gemma tokenizer so the DB-read path is testable
+    without the real weights. apply_chat_template renders every load-bearing piece
+    (system prompt content, tool-call names + string args, tool responses, and the
+    final answer VERBATIM) into one string, so build_sft.verify_round_trip passes;
+    tokenize=True returns a dummy input_ids list for token_length()."""
+
+    def apply_chat_template(self, messages, tools=None, add_generation_prompt=False,
+                            tokenize=False, return_dict=False):
+        parts = []
+        for m in messages:
+            content = m.get("content")
+            if isinstance(content, str):
+                parts.append(content)
+            for tc in m.get("tool_calls") or []:
+                fn = tc["function"]
+                parts.append(fn["name"])
+                for val in (fn.get("arguments") or {}).values():
+                    parts.append(str(val))
+            for tr in m.get("tool_responses") or []:
+                parts.append(str(tr.get("name", "")))
+                parts.append(str(tr.get("response", "")))
+        text = "\n".join(parts)
+        if tokenize:
+            ids = list(range(max(1, len(text.split()))))
+            return {"input_ids": ids} if return_dict else ids
+        return text
+
+
+_FINAL_JSON = ('{"found": true, "restaurant_name": "Joe\'s Pizza", "cuisine": "Pizza", '
+               '"menu": [{"section": "Pizza", "items": [{"name": "Margherita", '
+               '"description": null, "price": 10}]}], "source_url": "https://joespizza.com/menu"}')
+
+
+def _write_trace(cx, name, city, *, split, dietary=None):
+    """Upsert a restaurant into `split` and write one teacher trace for it."""
+    cx.upsert_restaurants([{"name": name, "city": city, "source": "osm", "split": split}])
+    rid = restaurant_id_for(name, city)
+    cx.write_trace({
+        "restaurant_id": rid,
+        "model": "claude-sonnet-5",
+        "prompt_variant": "teacher",
+        "dietary_restrictions": dietary,
+        "found": True,
+        "schema_valid": True,
+        "final_json": json.loads(_FINAL_JSON),
+        "messages": [
+            {"role": "user", "content": [{"type": "text", "text": f"{name}, {city}"}]},
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "name": "web_search",
+                 "input": {"query": f"{name} {city} menu"}, "id": "tu1"}]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "tu1",
+                 "content": f"1. {name} - https://joespizza.com/menu"}]},
+            {"role": "assistant", "content": [{"type": "text", "text": _FINAL_JSON}]},
+        ],
+        "queries": [f"{name} {city} menu"],
+        "urls": ["https://joespizza.com/menu"],
+        "cache_version": 1,
+        "captured_at": "2026-07-18T00:00:00Z",
+    })
+    return rid
+
+
+def test_main_reads_sft_split_and_excludes_rejected_and_eval(tmp_path, monkeypatch):
+    corpus = tmp_path / "corpus.sqlite"
+    with open_corpus(corpus) as cx:
+        keep_rid = _write_trace(cx, "Keep Cafe", "Austin", split="sft")
+        rej_rid = _write_trace(cx, "Reject Diner", "Boston", split="sft")
+        _write_trace(cx, "Eval Grill", "Chicago", split="eval")   # wrong split -> excluded
+        cx.set_rejected(rej_rid, True, "wrong city")               # rejected -> excluded
+
+    out = tmp_path / "sft" / "gemma-4-e4b-it" / "train.jsonl"
+    monkeypatch.setattr(bs, "load_tokenizer", lambda: _FakeTokenizer())
+    monkeypatch.setattr(sys, "argv", ["build_sft.py", "--corpus", str(corpus), "--out", str(out)])
+    bs.main()
+
+    rows = [json.loads(line) for line in out.read_text(encoding="utf-8").splitlines()]
+    # Only the one sft, non-rejected trace survives.
+    assert [r["restaurant_id"] for r in rows] == [keep_rid]
+    assert rej_rid not in {r["restaurant_id"] for r in rows}
+    assert rows[0]["found"] is True
+    assert rows[0]["meta"]["prompt_variant"] == "student"
+    # provenance sidecar records the single kept example
+    meta = json.loads((out.with_name(out.name + ".meta.json")).read_text(encoding="utf-8"))
+    assert meta["n_examples"] == 1
 
 
 # ---------------------------------------------------------------------------

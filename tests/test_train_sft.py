@@ -1,4 +1,4 @@
-"""Unit tests for the pure-logic helpers in scripts/train_sft.py.
+"""Unit tests for the pure-logic helpers in scripts/train/train_sft.py.
 
 These cover the length-filtering / drop logic, the effective-batch math, the
 tool-response-opener trim, and the percentile helper -- all GPU/model-free so they
@@ -10,7 +10,7 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT / "scripts"))
+sys.path.insert(0, str(ROOT / "scripts" / "train"))
 sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(ROOT / "src" / "gemma"))
 
