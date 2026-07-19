@@ -36,6 +36,7 @@ import json
 import re
 import sqlite3
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Iterator
 
@@ -90,6 +91,7 @@ CREATE TABLE IF NOT EXISTS traces (
   parse_error          TEXT,
   rejected             INTEGER NOT NULL DEFAULT 0,
   reject_reason        TEXT,
+  reviewed_at          TEXT,        -- NULL = not yet human-reviewed (viz/review.py)
   captured_at          TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_traces_rid    ON traces(restaurant_id);
@@ -158,9 +160,17 @@ class Corpus:
         self._conn.execute("PRAGMA synchronous=NORMAL")
         self._conn.execute("PRAGMA foreign_keys=ON")
         self._conn.executescript(_SCHEMA)
+        self._migrate()
         if self.get_meta("schema_version") is None:
             self.set_meta("schema_version", str(SCHEMA_VERSION))
         self._conn.commit()
+
+    def _migrate(self) -> None:
+        """Additive schema migrations for DBs created by an earlier build. New
+        columns default to NULL, so a plain ADD COLUMN is safe + backward-compatible."""
+        cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(traces)")}
+        if "reviewed_at" not in cols:
+            self._conn.execute("ALTER TABLE traces ADD COLUMN reviewed_at TEXT")
 
     # -- meta ---------------------------------------------------------------
     def set_meta(self, key: str, value: str) -> None:
@@ -344,6 +354,7 @@ class Corpus:
             "parse_error": trace.get("parse_error"),
             "rejected": _to_bool_int(trace.get("rejected", 0)) or 0,
             "reject_reason": trace.get("reject_reason"),
+            "reviewed_at": trace.get("reviewed_at"),
             "captured_at": trace["captured_at"],
         }
         cols = ", ".join(payload)
@@ -425,6 +436,39 @@ class Corpus:
             (1 if rejected else 0, reason, trace_id),
         )
         self._conn.commit()
+
+    def set_review_decision(
+        self, trace_id: str, decision: str, reason: str | None = None
+    ) -> None:
+        """Record a human review decision (viz/review.py). `decision` is 'keep' |
+        'reject' | 'undecided'. keep/reject stamp `reviewed_at` (now) and set
+        `rejected`; 'undecided' clears both (un-reviews the trace)."""
+        if decision not in ("keep", "reject", "undecided"):
+            raise ValueError(f"decision must be keep|reject|undecided, got {decision!r}")
+        if decision == "undecided":
+            self._conn.execute(
+                "UPDATE traces SET rejected=0, reject_reason=NULL, reviewed_at=NULL WHERE trace_id=?",
+                (trace_id,),
+            )
+        else:
+            self._conn.execute(
+                "UPDATE traces SET rejected=?, reject_reason=?, reviewed_at=? WHERE trace_id=?",
+                (1 if decision == "reject" else 0, reason,
+                 datetime.now(timezone.utc).isoformat(), trace_id),
+            )
+        self._conn.commit()
+
+    def review_counts(self) -> dict[str, int]:
+        """{'reviewed', 'unreviewed', 'kept', 'rejected'} over all traces -- the
+        review-progress summary the UI shows."""
+        row = self._conn.execute(
+            "SELECT "
+            "SUM(reviewed_at IS NOT NULL) AS reviewed, "
+            "SUM(reviewed_at IS NULL) AS unreviewed, "
+            "SUM(reviewed_at IS NOT NULL AND rejected=0) AS kept, "
+            "SUM(rejected=1) AS rejected FROM traces"
+        ).fetchone()
+        return {k: int(row[k] or 0) for k in ("reviewed", "unreviewed", "kept", "rejected")}
 
     def trace_count(self, *, include_rejected: bool = True) -> int:
         q = "SELECT COUNT(*) AS n FROM traces"

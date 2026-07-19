@@ -186,6 +186,53 @@ def test_set_grounding(tmp_path):
         assert t["grounding"] == 0.83 and t["unmatched_items"] == ["Mystery Dish"]
 
 
+def test_review_decision_and_counts(tmp_path):
+    with open_corpus(tmp_path / "c.sqlite") as cx:
+        cx.upsert_restaurants([{**r, "split": "sft"} for r in _restaurants()])
+        rids = [r["restaurant_id"] for r in cx.iter_restaurants()]
+        for rid in rids:
+            cx.write_trace(_trace(rid))
+        # all start unreviewed
+        assert cx.review_counts() == {"reviewed": 0, "unreviewed": 4, "kept": 0, "rejected": 0}
+        cx.set_review_decision(rids[0], "reject", "wrong city")
+        cx.set_review_decision(rids[1], "keep")
+        t0 = cx.get_trace(rids[0])
+        assert t0["rejected"] is True and t0["reviewed_at"] and t0["reject_reason"] == "wrong city"
+        assert cx.get_trace(rids[1])["rejected"] is False and cx.get_trace(rids[1])["reviewed_at"]
+        assert cx.review_counts() == {"reviewed": 2, "unreviewed": 2, "kept": 1, "rejected": 1}
+        # rejected traces are dropped from the default iter (build_sft path)
+        assert rids[0] not in {t["trace_id"] for t in cx.iter_traces(split="sft")}
+        # undecided un-reviews
+        cx.set_review_decision(rids[0], "undecided")
+        t0 = cx.get_trace(rids[0])
+        assert t0["rejected"] is False and t0["reviewed_at"] is None
+        with pytest.raises(ValueError):
+            cx.set_review_decision(rids[0], "bogus")
+
+
+def test_reviewed_at_migration_on_old_db(tmp_path):
+    # Simulate a corpus.sqlite created before the reviewed_at column existed.
+    import sqlite3
+    p = tmp_path / "old.sqlite"
+    con = sqlite3.connect(p)
+    # The original v2 traces schema (has trace_source; the only column added since
+    # is reviewed_at), so the idx_traces_source index still builds on open.
+    con.executescript(
+        "CREATE TABLE restaurants (restaurant_id TEXT PRIMARY KEY, name TEXT, city TEXT, "
+        "source TEXT, is_chain INTEGER, split TEXT);"
+        "CREATE TABLE traces (trace_id TEXT PRIMARY KEY, restaurant_id TEXT, model TEXT, "
+        "trace_source TEXT DEFAULT 'teacher', prompt_variant TEXT, found INTEGER, "
+        "schema_valid INTEGER, final_json TEXT, messages TEXT, rejected INTEGER DEFAULT 0, "
+        "reject_reason TEXT, captured_at TEXT);"
+    )
+    con.commit()
+    con.close()
+    # Opening it should ADD the reviewed_at column, not crash.
+    with open_corpus(p) as cx:
+        cols = {r["name"] for r in cx._conn.execute("PRAGMA table_info(traces)")}
+        assert "reviewed_at" in cols
+
+
 def test_open_corpus_create_false_missing(tmp_path):
     with pytest.raises(FileNotFoundError):
         Corpus(tmp_path / "nope.sqlite", create=False)
