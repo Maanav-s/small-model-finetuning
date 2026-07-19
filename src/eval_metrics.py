@@ -3,7 +3,7 @@
 Pure, deterministic, zero-network functions over already-parsed menu dicts (the
 `final_json` of a trace, contract 1.5 in notes/phase2_plan.md). This module is
 the scoring contract the same way schema.py is the shape contract: the eval CLI
-(scripts/eval_menu.py) and the Phase 3 GRPO reward both compose these per-episode
+(scripts/eval/eval.py) and the Phase 3 GRPO reward both compose these per-episode
 terms, so nothing here does I/O and everything stays importable (plan WS-G:
 "keep the scoring functions importable, not buried in `__main__`").
 
@@ -242,13 +242,17 @@ def self_report(candidate_json) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Abstention vs the WS-F findability label
+# Abstention vs the (DB-derived) findability signal
 # ---------------------------------------------------------------------------
 def abstention_outcome(candidate_json, findable: bool) -> str:
-    """Grade the candidate's found/not-found call against the labels.jsonl
-    `findable` label: one of correct_find | correct_abstain | false_abstain
-    (gave up on a findable menu) | false_find (claimed an unfindable one --
-    the hallucination-risk bucket). Invalid candidates count as abstentions."""
+    """Grade the candidate's found/not-found call against the `findable` signal:
+    one of correct_find | correct_abstain | false_abstain (gave up on a findable
+    menu) | false_find (claimed an unfindable one -- the hallucination-risk
+    bucket). Invalid candidates count as abstentions.
+
+    `findable` is now DERIVED, not read from a labels.jsonl file (retired in the v2
+    rebuild): the eval CLI passes findable = (the teacher's eval reference trace
+    found a menu). This function is agnostic to where the bool came from."""
     cand_found = bool(isinstance(candidate_json, dict) and candidate_json.get("found"))
     if findable:
         return "correct_find" if cand_found else "false_abstain"
