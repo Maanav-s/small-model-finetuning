@@ -1,326 +1,300 @@
-"""Tests for the trace-review app (viz/review.py).
+"""Tests for the trace-review app (viz/review.py), v2: corpus.sqlite backed.
 
-No network, no model, no torch -- the app only reads/writes JSON under DATA_DIR.
-Each test points DATA_DIR at a tmp dir (monkeypatch) and drives the app through
-fastapi.testclient.TestClient.
+No network, no model, no torch -- the app only reads/writes a corpus.sqlite via
+src/corpus.py. Each test builds a temp DB (open_corpus + upsert_restaurants +
+write_trace), points the app at it (monkeypatch review.DB_PATH), and drives the
+endpoints through fastapi.testclient.TestClient.
+
+v1 -> v2 differences these tests bake in:
+  * a trace is addressed by its **trace_id** (no '.json' filename);
+  * grounding + unmatched_items are trace FIELDS, not a grounding.json index;
+  * keep/reject persists to the DB (traces.rejected / reviewed_at), not files;
+  * the reject_list.txt export is retired (no /api/review/export);
+  * the progress aggregate is GLOBAL (corpus.review_counts), not scope-local.
+
+    uv run python -m pytest tests/test_review.py -q
 """
 
 from __future__ import annotations
 
-import json
+import sys
 from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
 
-import viz.review as review
+# corpus.py lives in src/ (flat-import convention). Importing viz.review also puts
+# src/ on the path, but add it up front so the fixture's `from corpus import ...`
+# never depends on import order.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+
+import viz.review as review  # noqa: E402
+from corpus import open_corpus  # noqa: E402
 
 
-def _write(path: Path, obj) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(obj), encoding="utf-8")
+# --- fixture builders ---------------------------------------------------------
 
-
-def _trace(name, found, *, items=0, schema_valid=True):
-    menu = [{"section": "Mains", "items": [
+def _menu(items: int) -> list:
+    return [{"section": "Mains", "items": [
         {"name": f"Dish {i}", "description": "", "price": "$1"} for i in range(items)]}] if items else []
-    return {
-        "restaurant_id": name.replace(".json", ""),
-        "restaurant_name": name.replace(".json", "").title(),
-        "episode_input": f"{name}, Seattle",
-        "dietary_restrictions": None,
+
+
+def _messages(text: str = "R" * 2000, *, url: str | None = None, tool: str = "web_search") -> list:
+    """An Anthropic-block trace body with one tool_use + its tool_result."""
+    tu = {"type": "tool_use", "id": "tu_1", "name": tool,
+          "input": ({"url": url} if url else {"query": "q"})}
+    return [
+        {"role": "user", "content": [{"type": "text", "text": "hello"}]},
+        {"role": "assistant", "content": [tu]},
+        {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "tu_1",
+             "content": [{"type": "text", "text": text}]}]},
+    ]
+
+
+def _add_restaurant(cx, rid: str, *, split: str = "sft") -> None:
+    # Explicit restaurant_id -> human-readable trace_ids ("aaa", "acme__vegan").
+    cx.upsert_restaurants([{
+        "restaurant_id": rid, "name": rid.replace("_", " ").title(),
+        "city": "Seattle", "source": "osm", "split": split,
+    }])
+
+
+def _add_trace(cx, rid: str, *, found: bool, items: int = 0, dietary=None,
+               grounding=None, unmatched=None, messages=None, source_url=None) -> str:
+    """Write one teacher trace for restaurant `rid`. trace_id is derived from
+    rid + dietary (free -> '<rid>', conditioned -> '<rid>__<slug>')."""
+    fj = {"found": found, "menu": _menu(items), "notes": "the note",
+          "source_url": source_url if found else None}
+    return cx.write_trace({
+        "restaurant_id": rid,
+        "model": "claude-sonnet-5",
+        "prompt_variant": "teacher",
+        "dietary_restrictions": dietary,
+        "found": found,
+        "schema_valid": True,
+        "grounding": grounding,
+        "unmatched_items": unmatched,
+        "final_json": fj,
+        "messages": messages if messages is not None else _messages(),
         "queries": ["q1"],
         "urls": ["https://example.com"],
-        "final_json": {"found": found, "menu": menu,
-                       "notes": "the note", "source_url": None if not found else "https://x.com"},
-        "schema_valid": schema_valid,
-        "messages": [
-            {"role": "user", "content": [{"type": "text", "text": name}]},
-            {"role": "assistant", "content": [
-                {"type": "tool_use", "name": "web_search", "input": {"query": "q"}}]},
-            {"role": "user", "content": [
-                {"type": "tool_result", "content": [{"type": "text", "text": "R" * 2000}]}]},
-        ],
-    }
-
-
-def _ground_entry(trace, *, grounding=None, siblings=None, unmatched=None):
-    """A grounding.json entry mirroring scripts/audit_grounding.py's output shape.
-
-    Most fields derive from the trace; `grounding`, `siblings`, and `unmatched`
-    are set explicitly so a test can pin the value the list/sibling panel reads.
-    """
-    fj = trace.get("final_json") or {}
-    n_items = sum(len(s.get("items") or []) for s in (fj.get("menu") or []))
-    return {
-        "restaurant_id": trace["restaurant_id"],
-        "restaurant_name": trace["restaurant_name"],
-        "episode_input": trace["episode_input"],
-        "restrictions": trace.get("dietary_restrictions"),
-        "found": bool(fj.get("found")),
-        "schema_valid": bool(trace.get("schema_valid")),
-        "n_items": n_items,
-        "grounding": grounding,
-        "unmatched_items": unmatched or [],
-        "source_url": fj.get("source_url"),
-        "siblings": siblings or [],
-    }
+        "captured_at": "2026-07-18T00:00:00Z",
+    })
 
 
 @pytest.fixture
-def client(tmp_path, monkeypatch):
-    data = tmp_path / "data"
-    monkeypatch.setattr(review, "DATA_DIR", data)
-    # two not-found + one found (only visible in scope=all)
-    aaa = _trace("aaa.json", found=False)
-    bbb = _trace("bbb.json", found=False)
-    ccc = _trace("ccc.json", found=True, items=3)
-    _write(data / "traces" / "aaa.json", aaa)
-    _write(data / "traces" / "bbb.json", bbb)
-    _write(data / "traces" / "ccc.json", ccc)
-    _write(data / "review" / "grounding.json", {
-        "aaa.json": _ground_entry(aaa),
-        "bbb.json": _ground_entry(bbb),
-        "ccc.json": _ground_entry(ccc, grounding=1.0),
-    })
+def db_path(tmp_path):
+    return tmp_path / "corpus.sqlite"
+
+
+@pytest.fixture
+def client(db_path, monkeypatch):
+    # two not-found + one found (found only visible in scope=all), distinct
+    # restaurants (no siblings).
+    with open_corpus(db_path) as cx:
+        for rid in ("aaa", "bbb"):
+            _add_restaurant(cx, rid)
+            _add_trace(cx, rid, found=False)
+        _add_restaurant(cx, "ccc")
+        _add_trace(cx, "ccc", found=True, items=3, grounding=1.0, source_url="https://x.com")
+    monkeypatch.setattr(review, "DB_PATH", db_path)
     return TestClient(review.app)
 
 
+# --- list + detail ------------------------------------------------------------
+
 def test_list_notfound_scope_excludes_found(client):
     d = client.get("/api/review/traces?scope=notfound").json()
-    names = [t["filename"] for t in d["traces"]]
-    assert names == ["aaa.json", "bbb.json"]  # not-found only, ccc excluded
-    assert all("suggestion" not in t for t in d["traces"])  # triage feature is gone
+    ids = [t["trace_id"] for t in d["traces"]]
+    assert ids == ["aaa", "bbb"]  # not-found only, ccc excluded
     assert all(t["decision"] is None for t in d["traces"])
     assert all(t["grounding"] is None for t in d["traces"])  # not-found have no menu
-    assert d["aggregate"] == {"total": 2, "kept": 0, "rejected": 0, "undecided": 2}
+    # aggregate is GLOBAL (all 3 traces), not scope-local
+    assert d["aggregate"] == {"total": 3, "kept": 0, "rejected": 0, "undecided": 3}
 
 
 def test_list_all_scope_includes_found_with_grounding(client):
     d = client.get("/api/review/traces?scope=all").json()
-    names = [t["filename"] for t in d["traces"]]
-    # not-found first (aaa,bbb), then found (ccc)
-    assert names == ["aaa.json", "bbb.json", "ccc.json"]
+    ids = [t["trace_id"] for t in d["traces"]]
+    # not-found first (aaa, bbb), then found (ccc)
+    assert ids == ["aaa", "bbb", "ccc"]
     assert d["traces"][-1]["found"] is True
     assert d["traces"][-1]["n_items"] == 3
-    assert d["traces"][-1]["grounding"] == 1.0  # from grounding.json
+    assert d["traces"][-1]["grounding"] == 1.0  # from the stored field
 
 
-def test_list_falls_back_when_no_grounding_file(client, tmp_path):
-    # Delete the precomputed index: the app still lists traces (grounding = null).
-    (tmp_path / "data" / "review" / "grounding.json").unlink()
-    d = client.get("/api/review/traces?scope=all").json()
-    names = [t["filename"] for t in d["traces"]]
-    assert names == ["aaa.json", "bbb.json", "ccc.json"]
-    assert all(t["grounding"] is None for t in d["traces"])
-
-
-def test_trace_detail_no_triage_has_grounding_and_conversation(client):
-    d = client.get("/api/review/trace/aaa.json").json()
+def test_trace_detail_has_grounding_and_conversation(client):
+    d = client.get("/api/review/trace/aaa").json()
     assert d["ok"] is True
-    assert "triage" not in d                     # triage feature removed
+    assert d["trace_id"] == "aaa"
     assert d["grounding"] is None                # not-found: no menu to ground
     assert d["notes"] == "the note"
+    assert d["episode_input"] == "Aaa, Seattle"  # joined name + city
     # tool result preview truncated to 800 chars
     tr = [t for t in d["conversation"] if t["tool_results"]][0]["tool_results"][0]
     assert len(tr["preview"]) == 800
     assert tr["truncated"] is True
 
 
-def test_decision_persists_and_updates_aggregate(client, tmp_path):
-    r = client.post("/api/review/decision", json={"filename": "aaa.json", "decision": "reject"})
+def test_missing_trace_returns_error(client):
+    assert client.get("/api/review/trace/nope").json()["ok"] is False
+    assert client.post("/api/review/decision",
+                       json={"trace_id": "nope", "decision": "keep"}).json()["ok"] is False
+
+
+# --- decisions (persist to the DB) --------------------------------------------
+
+def test_decision_persists_and_updates_aggregate(client, db_path):
+    r = client.post("/api/review/decision", json={"trace_id": "aaa", "decision": "reject"})
     d = r.json()
     assert d["ok"] and d["decision"] == "reject"
-    assert d["aggregate"]["rejected"] == 1 and d["aggregate"]["undecided"] == 1
-    # persisted to decisions.json
-    decisions = json.loads((tmp_path / "data" / "review" / "decisions.json").read_text())
-    assert decisions["aaa.json"]["decision"] == "reject"
-    assert "at" in decisions["aaa.json"]
+    assert d["aggregate"]["rejected"] == 1 and d["aggregate"]["undecided"] == 2
+    # persisted via set_review_decision: re-read shows rejected + a reviewed_at stamp
+    with open_corpus(db_path, create=False) as cx:
+        t = cx.get_trace("aaa")
+    assert t["rejected"] is True and t["reviewed_at"] is not None
 
 
-def test_undo_clears_decision(client, tmp_path):
-    client.post("/api/review/decision", json={"filename": "aaa.json", "decision": "keep"})
-    r = client.post("/api/review/decision", json={"filename": "aaa.json", "decision": "undo"})
+def test_reject_reason_is_stored(client, db_path):
+    client.post("/api/review/decision",
+                json={"trace_id": "aaa", "decision": "reject", "reason": "wrong city"})
+    with open_corpus(db_path, create=False) as cx:
+        assert cx.get_trace("aaa")["reject_reason"] == "wrong city"
+
+
+def test_undo_clears_decision(client, db_path):
+    client.post("/api/review/decision", json={"trace_id": "aaa", "decision": "keep"})
+    r = client.post("/api/review/decision", json={"trace_id": "aaa", "decision": "undo"})
     d = r.json()
     assert d["decision"] is None
     assert d["aggregate"]["kept"] == 0
-    decisions = json.loads((tmp_path / "data" / "review" / "decisions.json").read_text())
-    assert "aaa.json" not in decisions
+    with open_corpus(db_path, create=False) as cx:
+        t = cx.get_trace("aaa")
+    assert t["reviewed_at"] is None and t["rejected"] is False
 
 
 def test_invalid_decision_rejected(client):
-    r = client.post("/api/review/decision", json={"filename": "aaa.json", "decision": "maybe"})
+    r = client.post("/api/review/decision", json={"trace_id": "aaa", "decision": "maybe"})
     assert r.json()["ok"] is False
 
 
-def test_export_writes_reject_list_only_rejects(client, tmp_path):
-    client.post("/api/review/decision", json={"filename": "aaa.json", "decision": "reject"})
-    client.post("/api/review/decision", json={"filename": "bbb.json", "decision": "keep"})
-    d = client.post("/api/review/export").json()
-    assert d["ok"] and d["count"] == 1
-    text = Path(d["path"]).read_text()
-    lines = text.splitlines()
-    assert lines[0].startswith("# generated") and "1 rejects" in lines[0]
-    assert "aaa.json" in lines
-    assert "bbb.json" not in text  # kept traces excluded
+def test_no_export_endpoint(client):
+    # the reject_list.txt export is retired -- rejection is the DB field now.
+    assert client.post("/api/review/export").status_code == 404
+    assert client.get("/api/review/export").status_code == 404
 
 
-def test_missing_trace_returns_error(client):
-    assert client.get("/api/review/trace/nope.json").json()["ok"] is False
-    assert client.post("/api/review/decision",
-                       json={"filename": "nope.json", "decision": "keep"}).json()["ok"] is False
-
-
-# --- sibling-evidence panel ---------------------------------------------------
+# --- sibling-evidence panel (siblings = other slices of the same restaurant) --
 
 @pytest.fixture
-def sib_client(tmp_path, monkeypatch):
-    """Two not-found traces, each vouched by a found sibling: one well-grounded
-    (0.9), one weakly-grounded (0.25). The sibling map + grounding come from
-    grounding.json (scripts/audit_grounding.py output).
-    """
-    data = tmp_path / "data"
-    monkeypatch.setattr(review, "DATA_DIR", data)
-    nf_good = _trace("nf_good.json", found=False)
-    nf_bad = _trace("nf_bad.json", found=False)
-    sib_good = _trace("sib_good.json", found=True, items=3)
-    sib_bad = _trace("sib_bad.json", found=True, items=3)
-    for t in (nf_good, nf_bad, sib_good, sib_bad):
-        # distinct restaurant_ids by default; the sibling map is explicit below.
-        _write(data / "traces" / (t["restaurant_id"] + ".json"), t)
-    _write(data / "review" / "grounding.json", {
-        "nf_good.json": _ground_entry(nf_good, siblings=["sib_good.json"]),
-        "nf_bad.json": _ground_entry(nf_bad, siblings=["sib_bad.json"]),
-        "sib_good.json": _ground_entry(sib_good, grounding=0.9),
-        "sib_bad.json": _ground_entry(sib_bad, grounding=0.25, unmatched=["Dish 0", "Dish 1"]),
-    })
+def sib_client(db_path, monkeypatch):
+    """Two not-found slices, each vouched by a found sibling of the SAME restaurant:
+    one well-grounded (0.9), one weakly-grounded (0.25). The sibling link is the
+    shared restaurant_id (corpus.siblings), not an explicit map."""
+    with open_corpus(db_path) as cx:
+        _add_restaurant(cx, "good")
+        _add_trace(cx, "good", found=True, items=3, grounding=0.9,
+                   source_url="https://good.example.com")            # trace_id "good"
+        _add_trace(cx, "good", found=False, dietary=["keto"])         # trace_id "good__keto"
+        _add_restaurant(cx, "bad")
+        _add_trace(cx, "bad", found=True, items=3, grounding=0.25,
+                   unmatched=["Dish 0", "Dish 1"],
+                   source_url="https://bad.example.com")             # trace_id "bad"
+        _add_trace(cx, "bad", found=False, dietary=["keto"])          # trace_id "bad__keto"
+    monkeypatch.setattr(review, "DB_PATH", db_path)
     return TestClient(review.app)
 
 
 def test_sibling_panel_shows_menu_and_grounding(sib_client):
-    d = sib_client.get("/api/review/trace/nf_good.json").json()
+    d = sib_client.get("/api/review/trace/good__keto").json()
     assert d["ok"] is True
     assert "siblings" in d and len(d["siblings"]) == 1
     sib = d["siblings"][0]
-    assert sib["sibling_file"] == "sib_good.json"
+    assert sib["sibling_trace_id"] == "good"
     assert sib["grounding"] == 0.9
     # the sibling trace's menu is inlined (sections -> items)
     names = [it["name"] for sec in sib["menu"] for it in sec["items"]]
     assert names == ["Dish 0", "Dish 1", "Dish 2"]
 
 
-@pytest.fixture
-def pair_client(tmp_path, monkeypatch):
-    """One restaurant with three slices sharing a restaurant_id: a found free slice,
-    a found vegan slice, and a not-found slice. Every slice lists the other two as
-    siblings (audit_grounding.py now emits siblings for EVERY trace)."""
-    data = tmp_path / "data"
-    monkeypatch.setattr(review, "DATA_DIR", data)
-
-    def _slice(fn, found, restr, items):
-        t = _trace(fn, found=found, items=items)
-        t["restaurant_id"] = "acme"          # shared id -> siblings of each other
-        t["restaurant_name"] = "Acme"
-        t["dietary_restrictions"] = restr
-        return t
-
-    free = _slice("acme.json", True, None, 3)
-    vegan = _slice("acme__vegan.json", True, ["vegan"], 1)
-    nf = _slice("acme__nf.json", False, ["keto"], 0)
-    for fn, t in [("acme.json", free), ("acme__vegan.json", vegan), ("acme__nf.json", nf)]:
-        _write(data / "traces" / fn, t)
-    _write(data / "review" / "grounding.json", {
-        "acme.json": _ground_entry(free, grounding=1.0, siblings=["acme__nf.json", "acme__vegan.json"]),
-        "acme__vegan.json": _ground_entry(vegan, grounding=1.0, siblings=["acme.json", "acme__nf.json"]),
-        "acme__nf.json": _ground_entry(nf, siblings=["acme.json", "acme__vegan.json"]),
-    })
-    return TestClient(review.app)
-
-
-def test_found_trace_shows_its_siblings(pair_client):
-    # a FOUND trace now surfaces its sibling slices too (not just not-found traces)
-    d = pair_client.get("/api/review/trace/acme.json").json()
-    assert d["ok"] is True and d["found"] is True
-    sibs = {s["sibling_file"]: s for s in d["siblings"]}
-    assert set(sibs) == {"acme__vegan.json", "acme__nf.json"}
-    # found sibling sorts before the not-found one
-    assert d["siblings"][0]["found"] is True
-    assert d["siblings"][-1]["sibling_file"] == "acme__nf.json"
-    # the not-found sibling reports found=False and no grounding
-    assert sibs["acme__nf.json"]["found"] is False
-    assert sibs["acme__nf.json"]["grounding"] is None
-
-
 def test_weakly_grounded_sibling_reports_unmatched(sib_client):
-    d = sib_client.get("/api/review/trace/nf_bad.json").json()
+    d = sib_client.get("/api/review/trace/bad__keto").json()
     sib = d["siblings"][0]
-    assert sib["sibling_file"] == "sib_bad.json"
+    assert sib["sibling_trace_id"] == "bad"
     assert sib["grounding"] == 0.25
     assert sib["unmatched_items"] == ["Dish 0", "Dish 1"]
 
 
-def _trace_with_scrape(name, *, found, menu, scrape_url, scrape_text):
-    """A trace whose single scrape tool_result carries `scrape_text` (so item-name
-    matching / full-text expansion have real content to work against)."""
-    return {
-        "restaurant_id": name.replace(".json", ""),
-        "restaurant_name": name.replace(".json", "").title(),
-        "episode_input": f"{name}, Seattle",
-        "dietary_restrictions": None,
-        "queries": ["q1"],
-        "urls": [scrape_url],
-        "final_json": {"found": found, "menu": menu, "notes": "n",
-                       "source_url": scrape_url if found else None},
-        "schema_valid": True,
-        "messages": [
-            {"role": "user", "content": [{"type": "text", "text": name}]},
-            {"role": "assistant", "content": [
-                {"type": "tool_use", "id": "tu_1", "name": "scrape_url",
-                 "input": {"url": scrape_url}}]},
-            {"role": "user", "content": [
-                {"type": "tool_result", "tool_use_id": "tu_1",
-                 "content": [{"type": "text", "text": scrape_text}]}]},
-        ],
-    }
+@pytest.fixture
+def pair_client(db_path, monkeypatch):
+    """One restaurant with three slices: a found free slice, a found vegan slice,
+    and a not-found keto slice. Every slice lists the other two as siblings."""
+    with open_corpus(db_path) as cx:
+        _add_restaurant(cx, "acme")
+        _add_trace(cx, "acme", found=True, items=3, grounding=1.0,
+                   source_url="https://acme.example.com")             # trace_id "acme"
+        _add_trace(cx, "acme", found=True, items=1, dietary=["vegan"], grounding=1.0)  # acme__vegan
+        _add_trace(cx, "acme", found=False, dietary=["keto"])         # trace_id "acme__keto"
+    monkeypatch.setattr(review, "DB_PATH", db_path)
+    return TestClient(review.app)
+
+
+def test_found_trace_shows_its_siblings(pair_client):
+    # a FOUND trace surfaces its sibling slices too (not just not-found traces)
+    d = pair_client.get("/api/review/trace/acme").json()
+    assert d["ok"] is True and d["found"] is True
+    sibs = {s["sibling_trace_id"]: s for s in d["siblings"]}
+    assert set(sibs) == {"acme__vegan", "acme__keto"}
+    # found sibling sorts before the not-found one
+    assert d["siblings"][0]["found"] is True
+    assert d["siblings"][-1]["sibling_trace_id"] == "acme__keto"
+    # the not-found sibling reports found=False and no grounding
+    assert sibs["acme__keto"]["found"] is False
+    assert sibs["acme__keto"]["grounding"] is None
+
+
+# --- per-item "where in the scrape" highlight (shared grounding.normalize) -----
+
+_SCRAPE = ("Welcome to Seoul Kitchen. Our famous Galbi Set is grilled short rib "
+           "served with banchan. The Kimchi Jjigae is a spicy stew. " + "x" * 3000)
+_SCRAPE_URL = "https://seoulkitchen.example.com/menu"
 
 
 @pytest.fixture
-def match_client(tmp_path, monkeypatch):
-    """A not-found trace vouched by a found sibling whose scrape text contains SOME
-    of its menu item names (so we can assert per-item matched/context/source_hint
-    and the primary/found trace's live %-grounded)."""
-    data = tmp_path / "data"
-    monkeypatch.setattr(review, "DATA_DIR", data)
-    scrape = ("Welcome to Seoul Kitchen. Our famous Galbi Set is grilled short rib "
-              "served with banchan. The Kimchi Jjigae is a spicy stew. " + "x" * 3000)
+def match_client(db_path, monkeypatch):
+    """A not-found keto slice vouched by a found free slice whose scrape text
+    contains SOME of its menu item names (so we can assert per-item matched/context/
+    source_hint and the found trace's stored %-grounded)."""
     menu = [{"section": "Mains", "items": [
         {"name": "Galbi Set", "description": "", "price": "$30"},
         {"name": "Kimchi Jjigae", "description": "", "price": "$16"},
         {"name": "Phantom Dish", "description": "", "price": "$9"},
     ]}]
-    nf = _trace("nf.json", found=False)
-    sib = _trace_with_scrape("sib.json", found=True, menu=menu,
-                             scrape_url="https://seoulkitchen.example.com/menu",
-                             scrape_text=scrape)
-    _write(data / "traces" / "nf.json", nf)
-    _write(data / "traces" / "sib.json", sib)
-    _write(data / "review" / "grounding.json", {
-        "nf.json": _ground_entry(nf, siblings=["sib.json"]),
-        "sib.json": _ground_entry(sib, grounding=0.667, unmatched=["Phantom Dish"]),
-    })
+    with open_corpus(db_path) as cx:
+        _add_restaurant(cx, "seoul")
+        cx.write_trace({
+            "restaurant_id": "seoul", "model": "claude-sonnet-5", "prompt_variant": "teacher",
+            "dietary_restrictions": None, "found": True, "schema_valid": True,
+            "grounding": 0.667, "unmatched_items": ["Phantom Dish"],
+            "final_json": {"found": True, "menu": menu, "notes": "n", "source_url": _SCRAPE_URL},
+            "messages": _messages(_SCRAPE, url=_SCRAPE_URL, tool="scrape_url"),
+            "queries": ["q1"], "urls": [_SCRAPE_URL], "captured_at": "2026-07-18T00:00:00Z",
+        })
+        _add_trace(cx, "seoul", found=False, dietary=["keto"])        # trace_id "seoul__keto"
+    monkeypatch.setattr(review, "DB_PATH", db_path)
     return TestClient(review.app)
 
 
-def test_found_trace_detail_grounding_is_computed_live(match_client):
-    # sib.json: 2 of its 3 menu items (Galbi Set, Kimchi Jjigae) appear in the
-    # scrape, Phantom Dish does not -> live grounding 2/3.
-    d = match_client.get("/api/review/trace/sib.json").json()
+def test_found_trace_detail_grounding_read_from_field(match_client):
+    # grounding is a stored field now (2 of 3 items grounded -> 0.667).
+    d = match_client.get("/api/review/trace/seoul").json()
     assert d["ok"] is True
-    assert abs(d["grounding"] - 2 / 3) < 0.01
+    assert d["grounding"] == 0.667
 
 
 def test_sibling_items_carry_matched_and_context(match_client):
-    d = match_client.get("/api/review/trace/nf.json").json()
+    d = match_client.get("/api/review/trace/seoul__keto").json()
     assert d["ok"] is True
     items = d["siblings"][0]["items"]
     by_name = {it["name"]: it for it in items}
@@ -329,7 +303,7 @@ def test_sibling_items_carry_matched_and_context(match_client):
     assert galbi["matched"] is True
     assert galbi["context"] is not None
     assert "〈Galbi Set〉" in galbi["context"]
-    assert galbi["source_hint"] == "https://seoulkitchen.example.com/menu"
+    assert galbi["source_hint"] == _SCRAPE_URL
     assert by_name["Kimchi Jjigae"]["matched"] is True
     # unmatched item: matched False, no context
     phantom = by_name["Phantom Dish"]
@@ -338,7 +312,7 @@ def test_sibling_items_carry_matched_and_context(match_client):
 
 
 def test_full_tool_result_endpoint_returns_untruncated(match_client):
-    d = match_client.get("/api/review/trace/sib.json").json()
+    d = match_client.get("/api/review/trace/seoul").json()
     # locate the tool-result block's (turn, idx) address from the compact conversation
     tr = None
     for t in d["conversation"]:
@@ -347,65 +321,52 @@ def test_full_tool_result_endpoint_returns_untruncated(match_client):
             break
     assert tr is not None and tr["truncated"] is True and tr["full_len"] > 800
     full = match_client.get(
-        f"/api/review/toolresult/sib.json?turn={tr['turn']}&idx={tr['idx']}").json()
+        f"/api/review/toolresult/seoul?turn={tr['turn']}&idx={tr['idx']}").json()
     assert full["ok"] is True
     assert full["full_len"] == tr["full_len"]
     assert len(full["text"]) == tr["full_len"] > 800
     assert full["text"].startswith("Welcome to Seoul Kitchen")
 
 
-def test_full_tool_result_endpoint_path_traversal_guarded(match_client):
-    # a filename with a path separator is rejected by _load_trace's guard, same as
-    # the other endpoints -- returns {ok: False}, never reads outside traces/.
+def test_full_tool_result_endpoint_bogus_id_and_range_guarded(match_client):
+    # A bogus trace_id simply misses in the DB (no filesystem, so no traversal risk)
+    # -> {ok: False}, never a 500.
     assert match_client.get(
-        "/api/review/toolresult/nope%5C..%5Csecret.json?turn=0&idx=0").json()["ok"] is False
+        "/api/review/toolresult/nope%5C..%5Csecret?turn=0&idx=0").json()["ok"] is False
     assert match_client.get(
-        "/api/review/toolresult/missing.json?turn=0&idx=0").json()["ok"] is False
+        "/api/review/toolresult/missing?turn=0&idx=0").json()["ok"] is False
     # out-of-range turn/idx are rejected, not 500s
     assert match_client.get(
-        "/api/review/toolresult/sib.json?turn=99&idx=0").json()["ok"] is False
+        "/api/review/toolresult/seoul?turn=99&idx=0").json()["ok"] is False
     assert match_client.get(
-        "/api/review/toolresult/sib.json?turn=2&idx=99").json()["ok"] is False
+        "/api/review/toolresult/seoul?turn=2&idx=99").json()["ok"] is False
 
 
-# --- rejecting a sibling directly from the evidence panel ---------------------
+# --- deciding a sibling directly from the evidence panel ----------------------
 
-def test_sibling_reject_persists_and_shows_in_detail(sib_client, tmp_path):
-    # POST a reject for the SIBLING's filename; it persists under that key and is
+def test_sibling_reject_persists_and_shows_in_detail(sib_client, db_path):
+    # POST a reject for the SIBLING's trace_id; it persists in the DB and is
     # surfaced as the sibling's `decision` in the not-found's detail.siblings.
     r = sib_client.post("/api/review/decision",
-                        json={"filename": "sib_good.json", "decision": "reject"})
+                        json={"trace_id": "good", "decision": "reject"})
     assert r.json()["ok"] and r.json()["decision"] == "reject"
-    decisions = json.loads((tmp_path / "data" / "review" / "decisions.json").read_text())
-    assert decisions["sib_good.json"]["decision"] == "reject"
-    d = sib_client.get("/api/review/trace/nf_good.json").json()
-    assert d["siblings"][0]["sibling_file"] == "sib_good.json"
+    with open_corpus(db_path, create=False) as cx:
+        assert cx.get_trace("good")["rejected"] is True
+    d = sib_client.get("/api/review/trace/good__keto").json()
+    assert d["siblings"][0]["sibling_trace_id"] == "good"
     assert d["siblings"][0]["decision"] == "reject"
 
 
-def test_export_includes_rejected_sibling_out_of_scope(sib_client, tmp_path):
-    # sib_good is found=true (NOT in the not-found scope), but a reject on it must
-    # still be written to reject_list.txt (export iterates the decisions map).
-    sib_client.post("/api/review/decision",
-                    json={"filename": "sib_good.json", "decision": "reject"})
-    d = sib_client.post("/api/review/export").json()
-    assert d["ok"] and d["count"] == 1
-    text = Path(d["path"]).read_text()
-    assert "sib_good.json" in text.splitlines()
-    # and it truly is out of the not-found scope
-    lst = sib_client.get("/api/review/traces?scope=notfound").json()
-    assert "sib_good.json" not in [t["filename"] for t in lst["traces"]]
-
-
-def test_sibling_reject_leaves_notfound_aggregate_unchanged(sib_client):
-    # rejecting an out-of-scope sibling must not corrupt the not-found progress.
+def test_decision_updates_global_review_counts(sib_client):
+    # the progress aggregate now reflects corpus.review_counts() over ALL traces,
+    # so a decision on any trace (in or out of the current scope) moves it.
     before = sib_client.get("/api/review/traces?scope=notfound").json()["aggregate"]
+    assert before == {"total": 4, "kept": 0, "rejected": 0, "undecided": 4}
     r = sib_client.post("/api/review/decision",
-                        json={"filename": "sib_good.json", "decision": "reject"})
-    # the write's returned aggregate is over the not-found scope, unchanged
-    assert r.json()["aggregate"] == before
-    after = sib_client.get("/api/review/traces?scope=notfound").json()["aggregate"]
-    assert after == before == {"total": 2, "kept": 0, "rejected": 0, "undecided": 2}
+                        json={"trace_id": "good", "decision": "reject"})
+    assert r.json()["aggregate"] == {"total": 4, "kept": 0, "rejected": 1, "undecided": 3}
+    after = sib_client.get("/api/review/traces?scope=all").json()["aggregate"]
+    assert after == {"total": 4, "kept": 0, "rejected": 1, "undecided": 3}
 
 
 def test_app_imports_without_gpu_stack():
@@ -413,7 +374,8 @@ def test_app_imports_without_gpu_stack():
     # shared pytest process is polluted by sibling test files (test_build_sft /
     # test_eval_split import transformers), which would make this fail for reasons
     # unrelated to viz.review. A fresh subprocess actually tests the claim: that
-    # importing viz.review pulls in none of the GPU/model stack.
+    # importing viz.review pulls in none of the GPU/model stack (corpus + grounding
+    # are stdlib-only).
     import subprocess
     import sys
 

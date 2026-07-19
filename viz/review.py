@@ -1,29 +1,37 @@
-"""Local trace REVIEW tool for the menu-extraction corpus.
+"""Local trace REVIEW tool for the menu-extraction corpus (v2: corpus.sqlite).
 
 A tiny, read-mostly FastAPI app for reviewing menu-extraction traces one at a
-time and marking each **keep** (accept) or **reject**. The rejects become the
-reject-list consumed by scripts/build_sft.py (`--reject-list`), which drops those
-traces from the SFT dataset.
+time and marking each **keep** (accept) or **reject**. In v2 the rejection is a
+DB field (`traces.rejected`), read straight back by scripts/datasets/build_sft.py
+(`iter_traces(split='sft', include_rejected=False)`) -- there is no reject-list
+file to export anymore.
 
 Unlike viz/server.py, this app loads **no model, no torch, no anthropic, no
-tools, no network** -- it only reads/writes small JSON files under `data/`. Keep
-it that way: importing it must never pull in the GPU stack.
+tools, no network** -- it only reads/writes the small `corpus.sqlite` via
+`src/corpus.py`. Keep it that way: importing it must never pull in the GPU stack
+(corpus + grounding are stdlib-only).
 
-It reuses viz/server.py's conventions only where they apply here: FileResponse
-for the static page and the `_REPO` pathing. (The `src/` flat-import sys.path
-dance is intentionally omitted -- this app imports nothing from `src/`.)
+The data source moved from the v1 loose files (`data/traces/*.json` +
+`data/review/grounding.json` + `data/review/decisions.json` +
+`data/review/reject_list.txt`) to the single v2 `corpus.sqlite`:
+  - a trace is addressed by its **trace_id** ('<rid>' / '<rid>__<diet-slug>'),
+    NOT a filename -- the '.json' is gone;
+  - grounding + unmatched_items are trace FIELDS (computed at capture time);
+  - the sibling map is a query (`Corpus.siblings`);
+  - keep/reject is `Corpus.set_review_decision` (stamps reviewed_at + rejected);
+  - the per-item "where in the scrape" highlight uses the SAME normalizer
+    (`grounding.normalize`) that produced the stored `grounding` field, so the
+    two can never drift.
 
-Data files (all under DATA_DIR, default <repo>/data):
-  - traces/*.json          the traces (contract 1.5); read-only here.
-  - review/grounding.json  per-trace %-grounded + the not-found->found sibling map,
-                           precomputed by scripts/audit_grounding.py; read-only here.
-  - review/decisions.json  the reviewer's keep/reject choices (this app writes it).
-  - review/reject_list.txt the exported reject list (this app writes it).
+SQLite/threading: `Corpus` wraps ONE sqlite connection (check_same_thread=True),
+and FastAPI runs sync endpoints in a threadpool -- so we do NOT share a Corpus
+across requests. Each handler opens a SHORT-LIVED `with open_corpus(DB_PATH)` of
+its own (opening sqlite is cheap; WAL mode makes concurrent read/write fine).
 
-DATA_DIR is a module global so tests can point it at a tmp dir
-(`monkeypatch.setattr(viz.review, "DATA_DIR", tmp)`); it also honours the
-REVIEW_DATA_DIR env var. Every path is derived from DATA_DIR at call time, so a
-monkeypatch after import takes effect.
+DB_PATH is a module global so tests can point it at a tmp DB
+(`monkeypatch.setattr(viz.review, "DB_PATH", tmp)`); it also honours the
+CORPUS_DB env var. It is read lazily inside each handler, so a monkeypatch after
+import takes effect.
 
 Run from the repo root:
     uv run uvicorn viz.review:app --host 127.0.0.1 --port 8001
@@ -31,22 +39,29 @@ Run from the repo root:
 
 from __future__ import annotations
 
-import json
 import os
 import re
-from datetime import datetime, timezone
+import sys
 from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
+# corpus.py + grounding.py live in src/ and use flat imports; put src/ on the path
+# the same way the other entry modules do (see CLAUDE.md). Both are stdlib-only, so
+# importing them keeps the "no GPU stack" promise this app relies on.
 _REPO = Path(__file__).resolve().parent.parent
+_SRC = _REPO / "src"
 _STATIC = Path(__file__).resolve().parent / "static"
+sys.path.insert(0, str(_SRC))
 
-# Overridable root for all data files. Tests monkeypatch this; ops can set
-# REVIEW_DATA_DIR. Everything below reads DATA_DIR lazily via the _*_dir helpers.
-DATA_DIR = Path(os.environ.get("REVIEW_DATA_DIR", _REPO / "data"))
+from corpus import open_corpus  # noqa: E402
+import grounding  # noqa: E402
+
+# Overridable corpus DB path. Tests monkeypatch this; ops can set CORPUS_DB.
+# Read lazily inside each handler so a monkeypatch after import takes effect.
+DB_PATH = Path(os.environ.get("CORPUS_DB", str(_REPO / "data" / "corpus.sqlite")))
 
 # How many chars of each tool result to surface in the compact conversation view.
 TOOL_RESULT_PREVIEW_CHARS = 800
@@ -68,66 +83,6 @@ _MATCH_CLOSE = "〉"  # 〉
 SIBLING_MENU_MAX_ITEMS = 300
 
 
-# --- path helpers (read DATA_DIR at call time so monkeypatching works) --------
-
-def _traces_dir() -> Path:
-    return DATA_DIR / "traces"
-
-
-def _review_dir() -> Path:
-    return DATA_DIR / "review"
-
-
-def _decisions_path() -> Path:
-    return _review_dir() / "decisions.json"
-
-
-def _reject_list_path() -> Path:
-    return _review_dir() / "reject_list.txt"
-
-
-def _grounding_path() -> Path:
-    return _review_dir() / "grounding.json"
-
-
-def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
-
-
-# --- small JSON IO ------------------------------------------------------------
-
-def _read_json(path: Path, default):
-    try:
-        with open(path, encoding="utf-8") as f:
-            return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return default
-
-
-def _atomic_write_json(path: Path, obj) -> None:
-    """Write JSON atomically (tmp + os.replace) so a crash can't truncate the file."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(obj, f, indent=2, ensure_ascii=False)
-    os.replace(tmp, path)
-
-
-def _load_decisions() -> dict:
-    d = _read_json(_decisions_path(), {})
-    return d if isinstance(d, dict) else {}
-
-
-def _load_grounding() -> dict:
-    """Per-trace grounding + sibling map from scripts/audit_grounding.py, or {}.
-
-    Purely additive: an empty map means "no precomputed grounding", and the app
-    degrades to loading traces directly (grounding shown as null, no siblings).
-    """
-    d = _read_json(_grounding_path(), {})
-    return d if isinstance(d, dict) else {}
-
-
 # --- trace helpers ------------------------------------------------------------
 
 def _n_items(final_json: dict) -> int:
@@ -142,64 +97,44 @@ def _n_items(final_json: dict) -> int:
     return total
 
 
-def _load_trace(filename: str) -> dict | None:
-    """Load one trace by filename. Returns None if missing or path-unsafe."""
-    # Guard against traversal: only a bare filename in traces/ is allowed.
-    if "/" in filename or "\\" in filename or filename in ("", ".", ".."):
-        return None
-    path = _traces_dir() / filename
-    if not path.is_file():
-        return None
-    return _read_json(path, None)
+def _decision_of(trace: dict) -> str | None:
+    """Map a trace's DB review state to the UI's keep|reject|None vocabulary.
 
-
-def _trace_grounding(trace: dict) -> float | None:
-    """Live %-grounded for a trace: fraction of its own menu item names that appear
-    in its own scraped/searched text. None when the trace has no menu items.
-
-    Uses the SAME matcher as the sibling panel (_match_menu_items) so the primary
-    trace's % and its (would-be) per-item breakdown always agree, and agrees with
-    scripts/audit_grounding.py's precomputed value for the list.
+    unreviewed (reviewed_at is None) -> None; reviewed & rejected -> 'reject';
+    reviewed & not rejected -> 'keep'. Mirrors corpus.set_review_decision's writes.
     """
-    fj = trace.get("final_json") or {}
-    matches = _match_menu_items(fj.get("menu"), _sibling_tool_segments(trace))
-    if not matches:
+    if trace.get("reviewed_at") is None:
         return None
-    matched = sum(1 for m in matches if m["matched"])
-    return round(matched / len(matches), 3)
+    return "reject" if trace.get("rejected") else "keep"
 
 
-def _summary_from_grounding(filename: str, g: dict, decisions: dict) -> dict:
-    """A nav/list summary built purely from a grounding.json entry (no trace load)."""
-    dec = decisions.get(filename)
-    return {
-        "filename": filename,
-        "restaurant_name": g.get("restaurant_name") or "",
-        "episode_input": g.get("episode_input") or "",
-        "dietary_restrictions": g.get("restrictions"),
-        "found": bool(g.get("found")),
-        "schema_valid": bool(g.get("schema_valid")),
-        "n_items": int(g.get("n_items") or 0),
-        "grounding": g.get("grounding"),
-        "decision": (dec or {}).get("decision"),
-    }
-
-
-def _summary_from_trace(filename: str, trace: dict, decisions: dict) -> dict:
-    """Fallback nav/list summary when grounding.json is absent (loads the trace)."""
+def _summary(trace: dict) -> dict:
+    """A nav/list summary built purely from a trace dict (which now always carries
+    grounding as a field, so there is no separate index to consult)."""
     fj = trace.get("final_json") or {}
-    dec = decisions.get(filename)
     return {
-        "filename": filename,
+        "trace_id": trace["trace_id"],
         "restaurant_name": trace.get("restaurant_name") or fj.get("restaurant_name") or "",
         "episode_input": trace.get("episode_input") or "",
         "dietary_restrictions": trace.get("dietary_restrictions"),
-        "found": bool(fj.get("found")),
+        "found": bool(trace.get("found")),
         "schema_valid": bool(trace.get("schema_valid")),
         "n_items": _n_items(fj),
-        "grounding": None,
-        "decision": (dec or {}).get("decision"),
+        "grounding": trace.get("grounding"),
+        "decision": _decision_of(trace),
     }
+
+
+def _aggregate(counts: dict) -> dict:
+    """The header's progress aggregate, from corpus.review_counts() -- GLOBAL over
+    every trace (not the current scope). Shape is kept stable for the frontend:
+    total / kept / rejected / undecided."""
+    kept = int(counts.get("kept", 0) or 0)
+    rejected = int(counts.get("rejected", 0) or 0)
+    unreviewed = int(counts.get("unreviewed", 0) or 0)
+    reviewed = int(counts.get("reviewed", 0) or 0)
+    return {"total": reviewed + unreviewed, "kept": kept,
+            "rejected": rejected, "undecided": unreviewed}
 
 
 def _trim_menu(menu) -> list:
@@ -216,61 +151,6 @@ def _trim_menu(menu) -> list:
         remaining -= len(items)
         out.append({"section": section.get("section") or "", "items": items})
     return out
-
-
-def _siblings_for(filename: str, grounding_map: dict, decisions: dict) -> list:
-    """Sibling entries for a trace: the other slices of the same restaurant (free +
-    dietary-conditioned, from grounding.json's sibling map), each with its
-    found/%-grounded state and its rendered menu (loaded from its trace file) so
-    the reviewer can compare slices and cross-check identity.
-
-    Each entry carries the sibling's own stored `decision` (keep|reject|None) so
-    the panel can render its state on load -- a sibling is itself a real trace
-    file, so it uses the same decisions.json keyed by its filename.
-    """
-    sib_files = (grounding_map.get(filename) or {}).get("siblings") or []
-    out: list = []
-    for sib_file in sib_files:
-        if not isinstance(sib_file, str):
-            continue
-        g = grounding_map.get(sib_file) or {}
-        sib_trace = _load_trace(sib_file)
-        sib_fj = (sib_trace or {}).get("final_json") or {}
-        trimmed = _trim_menu(sib_fj.get("menu"))
-        segments = _sibling_tool_segments(sib_trace) if sib_trace else []
-        out.append({
-            "sibling_file": sib_file,
-            "restaurant_name": g.get("restaurant_name") or (sib_trace or {}).get("restaurant_name"),
-            "restrictions": g.get("restrictions"),
-            "found": bool(g.get("found") if g else sib_fj.get("found")),
-            "grounding": g.get("grounding"),
-            "n_items": g.get("n_items"),
-            "source_url": g.get("source_url") or sib_fj.get("source_url"),
-            "unmatched_items": g.get("unmatched_items") or [],
-            "menu": trimmed,
-            # The sibling's own keep/reject/None state (shown as a badge + controls).
-            "decision": (decisions.get(sib_file) or {}).get("decision"),
-            # Per-item: did this item's name appear in the sibling's scraped text,
-            # and if so a ±context window with the match marked (the "where").
-            "items": _match_menu_items(trimmed, segments),
-        })
-    # Found slices first, then most-suspicious (lowest grounding) among them; the
-    # abstained (not-found) siblings sort to the end.
-    out.sort(key=lambda s: (not s.get("found"),
-                            s.get("grounding") if isinstance(s.get("grounding"), (int, float)) else 1.0))
-    return out
-
-
-def _aggregate(summaries: list[dict]) -> dict:
-    kept = sum(1 for s in summaries if s["decision"] == "keep")
-    rejected = sum(1 for s in summaries if s["decision"] == "reject")
-    total = len(summaries)
-    return {
-        "total": total,
-        "kept": kept,
-        "rejected": rejected,
-        "undecided": total - kept - rejected,
-    }
 
 
 def _tool_result_text(block: dict) -> str:
@@ -294,7 +174,8 @@ def _sibling_tool_segments(trace: dict) -> list[tuple[str, str | None]]:
 
     source_url is the URL of the `scrape_url` call the result answers (resolved via
     tool_use_id -> that tool_use's `input.url`), or None for a search result. Used
-    to tell the reviewer WHICH scrape a matched item came from.
+    to tell the reviewer WHICH scrape a matched item came from -- provenance the
+    shared grounding scorer doesn't track, so this stays a review-local helper.
     """
     messages = trace.get("messages") or []
     id_to_url: dict[str, str | None] = {}
@@ -323,24 +204,27 @@ def _sibling_tool_segments(trace: dict) -> list[tuple[str, str | None]]:
 
 
 def _match_menu_items(menu: list, segments: list) -> list[dict]:
-    """Per menu item: does its name appear in the concatenated tool text, and where.
+    """Per menu item: does its name appear in the tool text, and where.
 
-    Mirrors scripts/audit_grounding.py's match EXACTLY (lowercase, collapse runs of
-    whitespace to one space, strip, case-insensitive substring). For a match,
-    `context` is a ±SIBLING_CONTEXT_CHARS window around the FIRST occurrence with
-    the matched span wrapped in _MATCH_OPEN/_MATCH_CLOSE and whitespace collapsed to
-    one line; `source_hint` is the scrape URL whose result contains the match.
+    The match test uses `grounding.normalize` -- the SAME normalizer
+    scripts/corpus/build_corpus.py feeds through `grounding.score` to compute the
+    stored `grounding` field -- so a per-item "found in scrape" here can never
+    disagree with the aggregate the row already carries. Each segment's whitespace
+    is collapsed exactly as `grounding.score` collapses its haystack; original case
+    is kept for the display window (lowercasing is length-preserving, so an offset
+    into the lowercased copy maps back into the original-case one).
+
+    For a match, `context` is a ±SIBLING_CONTEXT_CHARS window around the first
+    occurrence with the matched span wrapped in _MATCH_OPEN/_MATCH_CLOSE;
+    `source_hint` is the scrape URL whose result contains the match.
 
     Returns [{name, matched: bool, context: str|None, source_hint: str|None}].
     """
-    raw = "\n".join(seg for seg, _ in segments)
-    low = raw.lower()  # positions align with `raw`: "\n" join char lowercases to itself
-    # Segment offset spans (incl. the 1-char "\n" join), for source_hint lookup.
-    spans: list[tuple[int, int, str | None]] = []
-    pos = 0
-    for seg, url in segments:
-        spans.append((pos, pos + len(seg), url))
-        pos += len(seg) + 1
+    # (collapsed original-case, collapsed lowercased, url) per segment.
+    prepared = []
+    for raw, url in segments:
+        collapsed = re.sub(r"\s+", " ", raw)
+        prepared.append((collapsed, collapsed.lower(), url))
 
     out: list[dict] = []
     for section in menu or []:
@@ -350,28 +234,73 @@ def _match_menu_items(menu: list, segments: list) -> list[dict]:
             name = (it.get("name") or "").strip() if isinstance(it, dict) else ""
             if not name:
                 continue
-            core = re.sub(r"\s+", " ", name.lower()).strip()
-            idx = low.find(core) if core else -1
-            if idx < 0:
+            core = grounding.normalize(name)
+            hit = None
+            for collapsed, low, url in prepared:
+                idx = low.find(core) if core else -1
+                if idx >= 0:
+                    hit = (collapsed, idx, url)
+                    break
+            if hit is None:
                 out.append({"name": name, "matched": False,
                             "context": None, "source_hint": None})
                 continue
+            collapsed, idx, url = hit
             start = max(0, idx - SIBLING_CONTEXT_CHARS)
-            end = min(len(raw), idx + len(core) + SIBLING_CONTEXT_CHARS)
-            snippet = (raw[start:idx] + _MATCH_OPEN + raw[idx:idx + len(core)]
-                       + _MATCH_CLOSE + raw[idx + len(core):end])
-            snippet = re.sub(r"\s+", " ", snippet).strip()
+            end = min(len(collapsed), idx + len(core) + SIBLING_CONTEXT_CHARS)
+            snippet = (collapsed[start:idx] + _MATCH_OPEN
+                       + collapsed[idx:idx + len(core)] + _MATCH_CLOSE
+                       + collapsed[idx + len(core):end]).strip()
             if start > 0:
                 snippet = "…" + snippet
-            if end < len(raw):
+            if end < len(collapsed):
                 snippet = snippet + "…"
-            hint = None
-            for s0, s1, url in spans:
-                if s0 <= idx < s1:
-                    hint = url
-                    break
             out.append({"name": name, "matched": True,
-                        "context": snippet, "source_hint": hint})
+                        "context": snippet, "source_hint": url})
+    return out
+
+
+def _siblings_for(cx, trace: dict) -> list:
+    """Sibling entries for a trace: the other slices of the same restaurant (free +
+    dietary-conditioned, via `Corpus.siblings`), each with its found/%-grounded
+    state and its rendered menu so the reviewer can compare slices and cross-check
+    identity.
+
+    Each entry carries the sibling's own stored `decision` (keep|reject|None) so
+    the panel can render its state on load. Loads must happen while `cx` is open.
+    """
+    rid = trace.get("restaurant_id")
+    tid = trace["trace_id"]
+    if not rid:
+        return []
+    out: list = []
+    for sib_id in cx.siblings(rid, exclude=tid):
+        sib = cx.get_trace(sib_id)
+        if sib is None:
+            continue
+        sib_fj = sib.get("final_json") or {}
+        trimmed = _trim_menu(sib_fj.get("menu"))
+        segments = _sibling_tool_segments(sib)
+        out.append({
+            "sibling_trace_id": sib_id,
+            "restaurant_name": sib.get("restaurant_name"),
+            "restrictions": sib.get("dietary_restrictions"),
+            "found": bool(sib.get("found")),
+            "grounding": sib.get("grounding"),
+            "n_items": _n_items(sib_fj),
+            "source_url": sib_fj.get("source_url"),
+            "unmatched_items": sib.get("unmatched_items") or [],
+            "menu": trimmed,
+            # The sibling's own keep/reject/None state (shown as a badge + controls).
+            "decision": _decision_of(sib),
+            # Per-item: did this item's name appear in the sibling's scraped text,
+            # and if so a ±context window with the match marked (the "where").
+            "items": _match_menu_items(trimmed, segments),
+        })
+    # Found slices first, then most-suspicious (lowest grounding) among them; the
+    # abstained (not-found) siblings sort to the end.
+    out.sort(key=lambda s: (not s.get("found"),
+                            s.get("grounding") if isinstance(s.get("grounding"), (int, float)) else 1.0))
     return out
 
 
@@ -417,7 +346,7 @@ def _compact_conversation(messages: list) -> list[dict]:
     tool calls or truncated tool-result previews -- enough to see what the agent
     did and saw without dumping 75k-char scraped pages. Each tool-result preview
     carries its `turn`/`idx` address so the page can fetch the full text on demand
-    (GET /api/review/toolresult/{filename}?turn=&idx=).
+    (GET /api/review/toolresult/{trace_id}?turn=&idx=).
     """
     out: list[dict] = []
     for ti, turn in enumerate(_walk_turns(messages)):
@@ -446,9 +375,11 @@ app = FastAPI(title="Trace Review")
 
 
 class DecisionRequest(BaseModel):
-    filename: str
-    # "keep" | "reject" to set; None or "undo" to clear.
+    trace_id: str
+    # "keep" | "reject" to set; None or "undo" to clear (un-review the trace).
     decision: str | None = None
+    # Optional free-text reason, stored as reject_reason on a reject.
+    reason: str | None = None
 
 
 @app.get("/")
@@ -458,73 +389,52 @@ def index() -> FileResponse:
 
 @app.get("/api/review/traces")
 def list_traces(scope: str = "notfound") -> dict:
-    """Ordered summaries for the nav + an aggregate.
+    """Ordered summaries for the nav + a GLOBAL review-progress aggregate.
 
     scope=notfound (default): only found=false traces -- the review task.
-    scope=all: every trace under traces/.
-    Sorted not-found first, then by filename. Each summary carries the trace's
-    %-grounded stat (from grounding.json) when available.
+    scope=all: every trace in the corpus (rejected traces included, so a review
+    decision is never hidden). Sorted not-found first, then by trace_id. Each
+    summary carries the trace's own %-grounded field.
     """
     scope = (scope or "notfound").lower()
-    decisions = _load_decisions()
-    grounding_map = _load_grounding()
+    with open_corpus(DB_PATH) as cx:
+        traces = list(cx.iter_traces(include_rejected=True))
+        counts = cx.review_counts()
 
-    summaries: list[dict] = []
-    if grounding_map:
-        # Fast path: build entirely from the precomputed index -- no trace loads.
-        for filename in sorted(grounding_map.keys()):
-            g = grounding_map[filename]
-            if not isinstance(g, dict):
-                continue
-            if scope != "all" and bool(g.get("found")):
-                continue
-            summaries.append(_summary_from_grounding(filename, g, decisions))
-    else:
-        # Fallback: no grounding.json yet -- glob and load traces directly.
-        for filename in sorted(p.name for p in _traces_dir().glob("*.json")):
-            trace = _load_trace(filename)
-            if trace is None:
-                continue
-            found = bool((trace.get("final_json") or {}).get("found"))
-            if scope != "all" and found:
-                continue
-            summaries.append(_summary_from_trace(filename, trace, decisions))
-
-    # Not-found first, then filename (stable within each group).
-    summaries.sort(key=lambda s: (s["found"], s["filename"]))
-
-    return {"scope": scope, "traces": summaries, "aggregate": _aggregate(summaries)}
+    summaries = [_summary(t) for t in traces if scope == "all" or not t.get("found")]
+    # Not-found first, then trace_id (stable within each group).
+    summaries.sort(key=lambda s: (s["found"], s["trace_id"]))
+    return {"scope": scope, "traces": summaries, "aggregate": _aggregate(counts)}
 
 
-@app.get("/api/review/trace/{filename}")
-def get_trace(filename: str) -> dict:
-    trace = _load_trace(filename)
-    if trace is None:
-        return {"ok": False, "error": f"Trace not found: {filename!r}"}
-    decisions = _load_decisions()
-    grounding_map = _load_grounding()
+@app.get("/api/review/trace/{trace_id}")
+def get_trace(trace_id: str) -> dict:
+    with open_corpus(DB_PATH) as cx:
+        trace = cx.get_trace(trace_id)
+        if trace is None:
+            return {"ok": False, "error": f"Trace not found: {trace_id!r}"}
+        siblings = _siblings_for(cx, trace)
+
     fj = trace.get("final_json") or {}
-    dec = decisions.get(filename)
-    siblings = _siblings_for(filename, grounding_map, decisions)
-
     resp = {
         "ok": True,
-        "filename": filename,
+        "trace_id": trace["trace_id"],
         "restaurant_name": trace.get("restaurant_name") or fj.get("restaurant_name") or "",
         "episode_input": trace.get("episode_input") or "",
         "dietary_restrictions": trace.get("dietary_restrictions"),
-        "found": bool(fj.get("found")),
+        "found": bool(trace.get("found")),
         "schema_valid": bool(trace.get("schema_valid")),
         "n_items": _n_items(fj),
-        # %-grounded for THIS trace: how much of its own menu is in what it scraped.
-        "grounding": _trace_grounding(trace),
+        # %-grounded for THIS trace: how much of its own menu is in what it scraped
+        # (a stored field, computed at capture time by build_corpus).
+        "grounding": trace.get("grounding"),
         "final_json": fj,
         "menu": fj.get("menu") or [],
         "notes": fj.get("notes"),
         "source_url": fj.get("source_url"),
         "queries": trace.get("queries") or [],
         "urls": trace.get("urls") or [],
-        "decision": (dec or {}).get("decision"),
+        "decision": _decision_of(trace),
         "conversation": _compact_conversation(trace.get("messages") or []),
     }
     if siblings:
@@ -532,17 +442,18 @@ def get_trace(filename: str) -> dict:
     return resp
 
 
-@app.get("/api/review/toolresult/{filename}")
-def get_tool_result(filename: str, turn: int = 0, idx: int = 0) -> dict:
+@app.get("/api/review/toolresult/{trace_id}")
+def get_tool_result(trace_id: str, turn: int = 0, idx: int = 0) -> dict:
     """Full (untruncated, capped at TOOL_RESULT_MAX_CHARS) text of one tool_result.
 
     Addressed by (turn, idx) into the same _walk_turns ordering the compact
     conversation exposes, so the page can expand a preview on demand while default
-    payloads stay small. Path traversal is guarded by _load_trace (bare filename).
+    payloads stay small. A bogus trace_id simply misses in the DB -> {ok: False}.
     """
-    trace = _load_trace(filename)
+    with open_corpus(DB_PATH) as cx:
+        trace = cx.get_trace(trace_id)
     if trace is None:
-        return {"ok": False, "error": f"Trace not found: {filename!r}"}
+        return {"ok": False, "error": f"Trace not found: {trace_id!r}"}
     turns = _walk_turns(trace.get("messages") or [])
     if turn < 0 or turn >= len(turns):
         return {"ok": False, "error": f"turn {turn} out of range (0..{len(turns) - 1})"}
@@ -552,7 +463,7 @@ def get_tool_result(filename: str, turn: int = 0, idx: int = 0) -> dict:
     raw = results[idx]["text"]
     return {
         "ok": True,
-        "filename": filename,
+        "trace_id": trace_id,
         "turn": turn,
         "idx": idx,
         "text": raw[:TOOL_RESULT_MAX_CHARS],
@@ -561,57 +472,25 @@ def get_tool_result(filename: str, turn: int = 0, idx: int = 0) -> dict:
     }
 
 
-def _scope_aggregate(scope: str) -> dict:
-    """Aggregate over the current scope, for the response of a decision write."""
-    return list_traces(scope=scope)["aggregate"]
-
-
 @app.post("/api/review/decision")
-def post_decision(req: DecisionRequest, scope: str = "notfound") -> dict:
-    filename = req.filename
-    if _load_trace(filename) is None:
-        return {"ok": False, "error": f"Trace not found: {filename!r}"}
-
-    decisions = _load_decisions()
+def post_decision(req: DecisionRequest) -> dict:
+    """Record a keep/reject/undo decision straight into corpus.sqlite and return the
+    refreshed GLOBAL aggregate. 'undo' (or null/empty) un-reviews the trace."""
     choice = req.decision
     if choice in (None, "undo", "", "null"):
-        decisions.pop(filename, None)
-        new_decision = None
-    elif choice in ("keep", "reject"):
-        decisions[filename] = {"decision": choice, "at": _now_iso()}
-        new_decision = choice
+        corpus_decision, new_decision = "undecided", None
+    elif choice == "keep":
+        corpus_decision, new_decision = "keep", "keep"
+    elif choice == "reject":
+        corpus_decision, new_decision = "reject", "reject"
     else:
         return {"ok": False, "error": f"Invalid decision: {choice!r} (want keep|reject|undo)"}
 
-    _atomic_write_json(_decisions_path(), decisions)
-    return {"ok": True, "filename": filename, "decision": new_decision,
-            "aggregate": _scope_aggregate(scope)}
+    with open_corpus(DB_PATH) as cx:
+        if not cx.has_trace(req.trace_id):
+            return {"ok": False, "error": f"Trace not found: {req.trace_id!r}"}
+        cx.set_review_decision(req.trace_id, corpus_decision, req.reason)
+        counts = cx.review_counts()
 
-
-def _write_reject_list() -> dict:
-    # Iterate the WHOLE decisions map (not a scope's traces): a rejected sibling is
-    # a found=true trace outside the not-found review scope, but its filename must
-    # still land in reject_list.txt so build_sft.py drops it.
-    decisions = _load_decisions()
-    rejects = sorted(fn for fn, d in decisions.items()
-                     if isinstance(d, dict) and d.get("decision") == "reject")
-    path = _reject_list_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    header = f"# generated {_now_iso()} — {len(rejects)} rejects\n"
-    body = "".join(fn + "\n" for fn in rejects)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    with open(tmp, "w", encoding="utf-8") as f:
-        f.write(header)
-        f.write(body)
-    os.replace(tmp, path)
-    return {"ok": True, "path": str(path), "count": len(rejects), "rejects": rejects}
-
-
-@app.post("/api/review/export")
-def post_export() -> dict:
-    return _write_reject_list()
-
-
-@app.get("/api/review/export")
-def get_export() -> dict:
-    return _write_reject_list()
+    return {"ok": True, "trace_id": req.trace_id, "decision": new_decision,
+            "aggregate": _aggregate(counts)}

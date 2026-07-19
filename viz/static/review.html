@@ -132,7 +132,6 @@
       <option value="all">all</option>
     </select>
   </label>
-  <button id="export">Export reject-list</button>
 </header>
 
 <div class="layout">
@@ -157,7 +156,7 @@ async function loadList() {
   state.list = d.traces; state.agg = d.aggregate;
   if (state.idx >= state.list.length) state.idx = Math.max(0, state.list.length - 1);
   renderNav(); renderProgress();
-  if (state.list.length) loadDetail(state.list[state.idx].filename);
+  if (state.list.length) loadDetail(state.list[state.idx].trace_id);
   else $("#main").innerHTML = "<p class='hint'>No traces in this scope.</p>";
 }
 
@@ -175,28 +174,28 @@ function renderNav() {
       ? `<span class="nav-g ${groundingClass(t.grounding)}" title="${Math.round(t.grounding*100)}% of the menu is grounded in the scrape">${Math.round(t.grounding*100)}%</span>` : "";
     return `<div class="navitem ${i === state.idx ? "active" : ""}" data-i="${i}">
       <span class="dot ${cls}"></span>
-      <span class="nm" title="${esc(t.restaurant_name)}">${esc(t.restaurant_name || t.filename)}</span>
+      <span class="nm" title="${esc(t.restaurant_name)}">${esc(t.restaurant_name || t.trace_id)}</span>
       ${g}
       ${t.found ? "" : "<span class='hint'>✗</span>"}
     </div>`;
   }).join("");
   nav.querySelectorAll(".navitem").forEach(el =>
-    el.onclick = () => { state.idx = +el.dataset.i; loadDetail(state.list[state.idx].filename); renderNav(); });
+    el.onclick = () => { state.idx = +el.dataset.i; loadDetail(state.list[state.idx].trace_id); renderNav(); });
   const active = nav.querySelector(".navitem.active");
   if (active) active.scrollIntoView({ block: "nearest" });
 }
 
-async function loadDetail(filename) {
+async function loadDetail(traceId) {
   state.viewingSibling = null;           // normal nav is always a primary (queue) trace
-  const r = await fetch(`/api/review/trace/${encodeURIComponent(filename)}`);
+  const r = await fetch(`/api/review/trace/${encodeURIComponent(traceId)}`);
   state.detail = await r.json();
   renderDetail();
 }
 
 // Read-only detour: load a sibling's FULL trace into the same detail view even
 // though it isn't in the current nav scope. "backTo" is the queue trace to return to.
-async function openSibling(filename, backTo) {
-  const r = await fetch(`/api/review/trace/${encodeURIComponent(filename)}`);
+async function openSibling(traceId, backTo) {
+  const r = await fetch(`/api/review/trace/${encodeURIComponent(traceId)}`);
   state.detail = await r.json();
   state.viewingSibling = { backTo };
   renderDetail();
@@ -269,11 +268,11 @@ function siblingsHtml(siblings) {
     const kept = s.decision === "keep";
     const decidedBadge = rejected ? `<span class="sib-decided reject">rejected</span>`
       : kept ? `<span class="sib-decided keep">kept</span>` : "";
-    const sf = esc(s.sibling_file);
+    const sf = esc(s.sibling_trace_id);
     return `<details class="sibling-panel${rejected ? " sib-rejected" : ""}"${open}>
       <summary>
         <span class="sibling-head">
-          <span class="rname">${esc(s.restaurant_name || s.sibling_file || "sibling")}</span>
+          <span class="rname">${esc(s.restaurant_name || s.sibling_trace_id || "sibling")}</span>
           ${decidedBadge}
           <span class="pill">${esc(restr)}</span>
           ${groundingBadge}
@@ -284,10 +283,10 @@ function siblingsHtml(siblings) {
       <div class="sibling-actions">
         <button class="open-sib" data-open-sib="${sf}">Open full trace →</button>
         <span class="sib-actlabel">this sibling:</span>
-        <button class="sib-reject${rejected ? " on" : ""}" data-sib-decide="reject" data-sib-file="${sf}"
+        <button class="sib-reject${rejected ? " on" : ""}" data-sib-decide="reject" data-sib-trace="${sf}"
           title="Drop this sibling from SFT — wrong restaurant / bad menu">Reject sibling (wrong restaurant / bad menu)</button>
-        <button class="sib-keep${kept ? " on" : ""}" data-sib-decide="keep" data-sib-file="${sf}">Keep sibling</button>
-        <button data-sib-decide="undo" data-sib-file="${sf}">Undo</button>
+        <button class="sib-keep${kept ? " on" : ""}" data-sib-decide="keep" data-sib-trace="${sf}">Keep sibling</button>
+        <button data-sib-decide="undo" data-sib-trace="${sf}">Undo</button>
       </div>
       ${um.length ? `<div class="unmatched-note">${um.length} item(s) not found literally in the scraped text (the hallucination tell):</div>` : ""}
       ${(s.items && s.items.length) ? siblingItemsHtml(s.items) : siblingMenuHtml(s.menu, um)}
@@ -332,7 +331,7 @@ function renderDetail() {
         ${g !== null ? `<span class="grounding ${groundingClass(g)}" title="fraction of this menu's items found literally in what the agent scraped/searched">${Math.round(g*100)}% grounded</span>` : ""}
         <span class="badge">schema ${d.schema_valid ? "valid" : "INVALID"}</span>
         ${dietStr ? `<span class="badge diet">diet: ${esc(dietStr)}</span>` : ""}
-        <span class="badge">${esc(d.filename)}</span>
+        <span class="badge">${esc(d.trace_id)}</span>
       </div>
       ${d.notes ? `<h3 class="sec">notes (teacher's reason)</h3><div class="notes">${esc(d.notes)}</div>` : ""}
       ${d.source_url ? `<h3 class="sec">source</h3><a href="${esc(d.source_url)}" target="_blank" rel="noopener">${esc(d.source_url)}</a>` : ""}
@@ -367,18 +366,18 @@ function renderDetail() {
 
   // Open a sibling's full trace (read-only detour); back returns to this trace.
   $("#main").querySelectorAll("[data-open-sib]").forEach(el =>
-    el.onclick = () => openSibling(el.dataset.openSib, d.filename));
+    el.onclick = () => openSibling(el.dataset.openSib, d.trace_id));
 
   // Keep/Reject/Undo a SIBLING directly from its evidence panel. Acts on the
-  // sibling's own filename (a real found=true trace), separate from the primary
-  // not-found trace's decision.
+  // sibling's own trace_id (another slice of the same restaurant), separate from
+  // the primary trace's decision.
   $("#main").querySelectorAll("[data-sib-decide]").forEach(el =>
-    el.onclick = () => decideSibling(el.dataset.sibFile, el.dataset.sibDecide));
+    el.onclick = () => decideSibling(el.dataset.sibTrace, el.dataset.sibDecide));
 
   // Expand a truncated tool-result preview to its full text (fetched on demand).
   $("#main").querySelectorAll(".tr-full").forEach(btn => btn.onclick = async () => {
     const { turn, idx } = btn.dataset;
-    const r = await fetch(`/api/review/toolresult/${encodeURIComponent(d.filename)}?turn=${turn}&idx=${idx}`);
+    const r = await fetch(`/api/review/toolresult/${encodeURIComponent(d.trace_id)}?turn=${turn}&idx=${idx}`);
     const full = await r.json();
     if (!full.ok) { toast(full.error || "error"); return; }
     const box = btn.closest(".tool-result");
@@ -394,9 +393,9 @@ async function decide(decision) {
   if (state.viewingSibling) return;   // read-only detour: no deciding on a sibling
   const cur = state.list[state.idx];
   if (!cur) return;
-  const r = await fetch(`/api/review/decision?scope=${state.scope}`, {
+  const r = await fetch(`/api/review/decision`, {
     method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ filename: cur.filename, decision }),
+    body: JSON.stringify({ trace_id: cur.trace_id, decision }),
   });
   const d = await r.json();
   if (!d.ok) { toast(d.error || "error"); return; }
@@ -406,21 +405,20 @@ async function decide(decision) {
   advanceToNextUndecided();
 }
 
-// Decide on a SIBLING (found=true trace) from its evidence panel. Posts the
-// sibling's filename to the same endpoint; then reloads the current detail so the
-// panel badge AND the primary's effective suggestion (which may withdraw the
-// sibling_found reject) refresh. The not-found aggregate is unaffected because the
-// sibling is out of the not-found scope.
-async function decideSibling(file, decision) {
-  const r = await fetch(`/api/review/decision?scope=${state.scope}`, {
+// Decide on a SIBLING (another slice of the same restaurant) from its evidence
+// panel. Posts the sibling's trace_id to the same endpoint, then reloads the
+// current detail so the panel badge refreshes. The returned aggregate is the
+// global review progress, so the header stays in sync too.
+async function decideSibling(traceId, decision) {
+  const r = await fetch(`/api/review/decision`, {
     method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ filename: file, decision }),
+    body: JSON.stringify({ trace_id: traceId, decision }),
   });
   const d = await r.json();
   if (!d.ok) { toast(d.error || "error"); return; }
   state.agg = d.aggregate;
   toast(decision === "undo" ? "Sibling decision cleared" : `Sibling ${decision}ed`);
-  const cur = state.detail && state.detail.filename;
+  const cur = state.detail && state.detail.trace_id;
   if (cur) await loadDetail(cur);
   renderNav(); renderProgress();
 }
@@ -429,7 +427,7 @@ function advanceToNextUndecided() {
   const n = state.list.length;
   for (let k = 1; k <= n; k++) {
     const j = (state.idx + k) % n;
-    if (!state.list[j].decision) { state.idx = j; loadDetail(state.list[j].filename); renderNav(); return; }
+    if (!state.list[j].decision) { state.idx = j; loadDetail(state.list[j].trace_id); renderNav(); return; }
   }
   // none left undecided: just go to next
   go(1);
@@ -438,7 +436,7 @@ function advanceToNextUndecided() {
 function go(delta) {
   const n = state.list.length; if (!n) return;
   state.idx = (state.idx + delta + n) % n;
-  loadDetail(state.list[state.idx].filename); renderNav();
+  loadDetail(state.list[state.idx].trace_id); renderNav();
 }
 
 document.addEventListener("keydown", (e) => {
@@ -451,11 +449,6 @@ document.addEventListener("keydown", (e) => {
 });
 
 $("#scope").onchange = (e) => { state.scope = e.target.value; state.idx = 0; loadList(); };
-$("#export").onclick = async () => {
-  const r = await fetch("/api/review/export", { method: "POST" });
-  const d = await r.json();
-  toast(d.ok ? `Wrote ${d.count} rejects → ${d.path}` : (d.error || "export failed"));
-};
 
 loadList();
 </script>
