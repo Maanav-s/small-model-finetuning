@@ -40,8 +40,9 @@ Requires BRAVE_API_KEY (repo-root .env); scrape runs locally, no key.
 import argparse
 import re
 import sys
+import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import CancelledError, ThreadPoolExecutor, as_completed
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -194,7 +195,7 @@ def _scrape(scrape_fn, url: str, mode: str, sleep_s: float) -> str:
 
 
 def warm_one(row: dict, search_fn, scrape_fn, queries: list[str], urls_per_query: int,
-             sleep_s: float, warm_both: bool) -> dict:
+             sleep_s: float, warm_both: bool, stop: threading.Event | None = None) -> dict:
     """Warm one restaurant across every query template.
 
     For each rendered query: 1 cached search + up to urls_per_query direct scrapes.
@@ -202,6 +203,10 @@ def warm_one(row: dict, search_fn, scrape_fn, queries: list[str], urls_per_query
     OR the direct result is thin/failed (WARM_BROWSER_IF_UNDER). URLs seen under an
     earlier template are not re-scraped (the cache would hit anyway; skipping keeps
     the counters honest). Returns a summary dict; the caller aggregates.
+
+    `stop` is a cooperative-cancel flag: the loops check it between scrapes so a
+    Ctrl+C (main sets it) makes an in-flight restaurant bail promptly instead of
+    running its full query x URL grid.
     """
     rendered = render_queries(queries, row)
     n_direct = n_browser = scrape_errors = 0
@@ -209,12 +214,16 @@ def warm_one(row: dict, search_fn, scrape_fn, queries: list[str], urls_per_query
     seen_urls: set[str] = set()
 
     for query in rendered:
+        if stop is not None and stop.is_set():
+            break
         response = search_fn(query)  # cached: hit is free, miss fetches+stores
         urls, skipped = extract_urls(response, urls_per_query)
         n_skipped += len(skipped)
         if not urls and not skipped:
             n_no_results += 1
         for url in urls:
+            if stop is not None and stop.is_set():
+                break
             if url in seen_urls:
                 continue  # already warmed under an earlier template this restaurant
             seen_urls.add(url)
@@ -300,36 +309,55 @@ def main():
     scrape_fn = cache.wrap("scrape", build_scrape(), key_fn=norm_scrape,
                            status_fn=scrape_status, provider="local")
 
+    stop = threading.Event()
     t_start = time.monotonic()
     results, failures = [], []
     consecutive_failures = 0
+    interrupted = False
     with ThreadPoolExecutor(max_workers=args.workers) as pool:
         futures = {
             pool.submit(warm_one, row, search_fn, scrape_fn, queries,
-                        args.urls_per_query, args.sleep, warm_both): row
+                        args.urls_per_query, args.sleep, warm_both, stop): row
             for row in selection
         }
-        for i, fut in enumerate(as_completed(futures), 1):
-            row = futures[fut]
-            try:
-                summary = fut.result()
-            except Exception as exc:  # noqa: BLE001 - one bad restaurant must not kill the run
-                failures.append((row["restaurant_id"], row["name"], repr(exc)))
-                consecutive_failures += 1
-                print(f"[{i}/{len(selection)}] FAILED {row['name']!r}: {exc!r}")
-                if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
-                    print(f"aborting: {consecutive_failures} consecutive failures")
-                    for f in futures:
-                        f.cancel()
-                    break
-                continue
-            consecutive_failures = 0
-            results.append(summary)
-            print(f"[{i}/{len(selection)}] {summary['name']!r}: urls={summary['urls']} "
-                  f"(direct={summary['scrape_direct']} browser={summary['scrape_browser']}) "
-                  f"skipped={summary['urls_skipped']} scrape_errors={summary['scrape_errors']}"
-                  f"{'  (some searches had no results)' if summary['no_results'] else ''}")
+        try:
+            for i, fut in enumerate(as_completed(futures), 1):
+                row = futures[fut]
+                try:
+                    summary = fut.result()
+                except CancelledError:
+                    continue  # a KeyboardInterrupt cancelled this still-queued restaurant
+                except Exception as exc:  # noqa: BLE001 - one bad restaurant must not kill the run
+                    failures.append((row["restaurant_id"], row["name"], repr(exc)))
+                    consecutive_failures += 1
+                    print(f"[{i}/{len(selection)}] FAILED {row['name']!r}: {exc!r}")
+                    if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                        print(f"aborting: {consecutive_failures} consecutive failures")
+                        stop.set()
+                        for f in futures:
+                            f.cancel()
+                        break
+                    continue
+                consecutive_failures = 0
+                results.append(summary)
+                print(f"[{i}/{len(selection)}] {summary['name']!r}: urls={summary['urls']} "
+                      f"(direct={summary['scrape_direct']} browser={summary['scrape_browser']}) "
+                      f"skipped={summary['urls_skipped']} scrape_errors={summary['scrape_errors']}"
+                      f"{'  (some searches had no results)' if summary['no_results'] else ''}")
+        except KeyboardInterrupt:
+            # The `with`-exit is shutdown(wait=True), which does NOT cancel queued work
+            # -- it drains the whole backlog first (and workers never see the Ctrl+C). So
+            # cancel the queue ourselves and set `stop` so the <= workers in-flight tasks
+            # bail between scrapes; the wait then blocks only on those. The cleanup below
+            # (summary, cache.close, close_pool) still runs.
+            interrupted = True
+            stop.set()
+            cancelled = sum(1 for f in futures if f.cancel())
+            print(f"\ninterrupted: cancelled {cancelled} queued restaurants; waiting for "
+                  f"<= {args.workers} in-flight scrape(s) to finish...", flush=True)
 
+    if interrupted:
+        print("(interrupted -- partial warm; the cache is idempotent, just re-run to resume)")
     elapsed = time.monotonic() - t_start
     stats = cache.stats()
     print("\n===== cache warm summary =====")
