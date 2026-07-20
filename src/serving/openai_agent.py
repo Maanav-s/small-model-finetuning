@@ -42,6 +42,15 @@ from prompts import BUDGET_FINALIZE_INSTRUCTION  # noqa: E402
 MAX_TOOL_CALLS = 8      # tool-call budget per episode (matches the other loops)
 MAX_TOKENS = 16384      # the full menu JSON can be long
 
+# Output-budget clamp (see run_episode). The whole trajectory accumulates in ONE
+# chat prompt, so a tool-heavy episode can approach the served context window and
+# `prompt + max_tokens` would 400. The student's completions path pre-counts its
+# own rendered prompt (build_gemma_completions); the chat path can't (the server
+# applies the template + tool schema), so we OVER-estimate the prompt and clamp,
+# with an overflow-400 catch as the hard backstop.
+_CTX_MARGIN = 1024          # tokens kept free beyond the estimate
+_MIN_OUTPUT_TOKENS = 512    # always request at least this; a non-fitting 400 is caught
+
 # Python annotation -> JSON Schema type, for converting the tool callables.
 _JSON_TYPES = {str: "string", int: "integer", float: "number", bool: "boolean"}
 
@@ -78,12 +87,21 @@ def to_openai_tools(tools: list) -> list[dict]:
     return out
 
 
-def build_client(base_url: str, api_key: str = "EMPTY"):
+def build_client(base_url: str, api_key: str = "EMPTY",
+                 timeout: float = 300.0, max_retries: int = 1):
     """Construct an OpenAI client pointed at a (local vLLM) server. Lazy import so
-    the module stays dependency-free until a client is actually needed."""
+    the module stays dependency-free until a client is actually needed.
+
+    `timeout` bounds a SINGLE request's wall-clock (default 5 min); `max_retries`
+    the retries after it. This is the wall-time guard the token clamp cannot be: a
+    degenerate/runaway generation (measured ~12 tok/s grinding a length-capped output
+    for ~22 min on one restaurant) now fails its worker in minutes instead of pinning
+    it, and build_corpus just records a failed episode (idempotent -> a later run
+    retries it). Legitimate generations finish well under the timeout (the 32-episode
+    build averaged well under a minute of model time per episode)."""
     from openai import OpenAI
 
-    return OpenAI(base_url=base_url, api_key=api_key)
+    return OpenAI(base_url=base_url, api_key=api_key, timeout=timeout, max_retries=max_retries)
 
 
 # Gemma student stop marker: generation stops right after a tool call so the model
@@ -185,6 +203,35 @@ def _assistant_message(msg) -> dict:
     return out
 
 
+def _estimate_prompt_tokens(messages: list[dict], oai_tools: list) -> int:
+    """Conservative (over-)estimate of the server-side prompt token count from raw
+    character length. Dividing by 3 deliberately UNDER-counts chars-per-token (the
+    real ratio is ~3.3-4), so the derived output clamp errs toward staying inside
+    the window; the leftover risk is caught by _is_context_overflow."""
+    chars = 0
+    for m in messages:
+        content = m.get("content")
+        if isinstance(content, str):
+            chars += len(content)
+        elif isinstance(content, list):
+            for part in content:
+                chars += len(part.get("text", "")) if isinstance(part, dict) else len(str(part))
+        for tc in m.get("tool_calls") or []:
+            fn = tc.get("function", {}) if isinstance(tc, dict) else {}
+            chars += len(fn.get("name", "")) + len(fn.get("arguments", "") or "")
+    if oai_tools:
+        chars += len(json.dumps(oai_tools))
+    return chars // 3 + 512  # +512 for chat-template / role scaffolding
+
+
+def _is_context_overflow(exc: Exception) -> bool:
+    """True only for a context-length 400 (prompt+output exceeds max_model_len); any
+    other API error must propagate rather than be silently finalized."""
+    s = str(exc).lower()
+    return ("maximum context length" in s or "context_length_exceeded" in s
+            or "reduce the length" in s or "input_tokens" in s)
+
+
 def run_episode(
     client,
     model: str,
@@ -204,26 +251,64 @@ def run_episode(
     final (out-of-budget) turn, tools are dropped and BUDGET_FINALIZE_INSTRUCTION
     is injected so the model commits to JSON from what it gathered (a partial menu
     beats an empty reply -- matches the Gemma/Claude loops).
+
+    Context safety: each call's max_tokens is clamped to the room left in the served
+    window (_output_budget), and if a call still 400s on length the loop finalizes
+    early from what it has instead of raising -- so a tool-heavy episode degrades to
+    a partial menu rather than a lost trace (the failure mode that cost ~14% of the
+    first vLLM-teacher build; see notes/experiments.md 2026-07-19).
     """
     oai_tools = to_openai_tools(tools)
     messages: list[dict] = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": restaurant_name},
     ]
+    # Clamp each call's output budget to what's left in the context window (the
+    # trajectory grows in one prompt). Detected once; None -> no clamp (unknown window).
+    max_model_len = _detect_max_model_len(client, model)
+
+    def _output_budget(active_tools: list) -> int:
+        if not max_model_len:
+            return max_tokens
+        room = max_model_len - _estimate_prompt_tokens(messages, active_tools) - _CTX_MARGIN
+        return max(_MIN_OUTPUT_TOKENS, min(max_tokens, room))
+
+    def _complete(active_tools: list | None):
+        return client.chat.completions.create(
+            model=model,
+            messages=messages,
+            max_tokens=_output_budget(active_tools or []),
+            temperature=0.0,
+            tools=active_tools,
+            tool_choice="auto" if active_tools else None,
+        )
 
     for step in range(max_tool_calls + 1):
         out_of_budget = step == max_tool_calls
         if out_of_budget:
             messages.append({"role": "user", "content": BUDGET_FINALIZE_INSTRUCTION})
 
-        resp = client.chat.completions.create(
-            model=model,
-            messages=messages,
-            max_tokens=max_tokens,
-            temperature=0.0,
-            tools=None if out_of_budget else oai_tools,
-            tool_choice=None if out_of_budget else "auto",
-        )
+        try:
+            resp = _complete(None if out_of_budget else oai_tools)
+        except Exception as exc:  # noqa: BLE001 -- only a context 400 is handled; others re-raise
+            if not _is_context_overflow(exc):
+                raise
+            # Context too full for a normal turn: finalize gracefully. Drop tools,
+            # tell the model to emit JSON from what it already gathered, retry with a
+            # clamped budget. A partial menu beats a crashed episode (same intent as
+            # the out-of-budget path and the student's completions clamp).
+            if not (messages and messages[-1].get("content") == BUDGET_FINALIZE_INSTRUCTION):
+                messages.append({"role": "user", "content": BUDGET_FINALIZE_INSTRUCTION})
+            try:
+                resp = _complete(None)
+            except Exception as exc2:  # noqa: BLE001
+                if not _is_context_overflow(exc2):
+                    raise
+                return "", messages  # prompt alone overflows -> yield empty, never crash
+            content = (resp.choices[0].message.content or "").strip()
+            messages.append({"role": "assistant", "content": content})
+            return content, messages
+
         msg = resp.choices[0].message
 
         if not getattr(msg, "tool_calls", None):

@@ -13,6 +13,61 @@ Conventions:
 
 ---
 
+## 2026-07-19 — first vLLM-teacher corpus build (50 sft) + context-overflow fix
+
+Ran the 235B teacher over 50 sft restaurants (4×H100, free episodes) to calibrate cache
+warming. **32 completed** (100% schema-valid, 93.8% found, mean 3.9 tool calls, 40.5 items)
++ 11 pre-existing; **7 failed on context-length 400s**.
+
+**Tool-call calibration** (44 sft traces via `analyze_queries.py`): the Qwen teacher issues
+**1.09 queries/episode** (vs the v1 Claude teacher's 2.94) — one `{name} {city} menu` (81% of
+queries) and it commits. 2.7 scrapes/ep, 78% direct / 22% browser, 18.5% delivery-aggregator
+(already covered by `warm_cache` `SKIP_DOMAINS`). Implication: the warm needs **fewer query
+templates** than the v1 distribution implied; `{name} {city} menu` + ~3 tail templates ≈ 95%.
+
+**Bug #10 — context overflow, not a window-size problem.** Each of the 7 failures accumulated
+**81,921+ input tokens**: `openai_agent.run_episode` always requested 16384 output tokens with
+no clamp, and `MAX_TOOL_CHARS=75000` ≈ 19K tokens per scrape, so a few big delivery/PDF scrapes
+blew the window (even at 98304 — clamping output alone would have saved all 7). Three-layer fix:
+(1) `MAX_TOOL_CHARS` 75000 → **24000** (bounds per-result growth; typical menus still fit whole);
+(2) `serve_teacher.sh --max-model-len` 40960 → **131072** (headroom); (3) `run_episode` now
+**clamps `max_tokens` to the remaining window and finalizes gracefully on an overflow 400**
+(partial menu, not a lost trace) — the chat-path analogue of the student's
+`build_gemma_completions` clamp. Unit-tested (`tests/test_openai_agent.py`, 4 new cases); to be
+validated on the next build. The 32 traces are kept (idempotent build resumes past them).
+
+## 2026-07-19 — self-hosted vLLM teacher works end-to-end: Qwen3-235B-FP8 on 4×H100
+
+Stood up the v2 **self-hosted teacher** (replacing the Sonnet API) on vLLM/RunPod. Staged: validated the
+whole tool-call path on **Qwen3-30B-A3B-Instruct-2507** (1×A100-80GB, ~$1.39/hr) first, then the real
+teacher **`Qwen/Qwen3-235B-A22B-Instruct-2507-FP8`** on **4×H100-80GB** (TP=4, ~$11.96/hr). vLLM 0.25.1,
+driver 580/CUDA 13 via `runpod_create.py`'s `allowedCudaVersions`.
+
+**Repo side needed zero changes** — `build_corpus.py --teacher vllm --teacher-base-url <url> --teacher-model
+teacher` already drives `openai_agent.run_episode`. This was purely a serving job. New artifacts:
+[scripts/infra/serve_teacher.sh](../scripts/infra/serve_teacher.sh) (the recipe) +
+[scripts/infra/smoke_teacher.py](../scripts/infra/smoke_teacher.py) (one-episode PASS/FAIL gate, exit 0/1).
+
+**Serve flags that matter:** `--enable-auto-tool-choice --tool-call-parser hermes` (Qwen3 = Hermes tool
+format), **no** `--reasoning-parser` (Instruct-2507 has no `<think>`), `--enforce-eager` (scrape-bound →
+skip compile/graphs, less VRAM), `--max-model-len 40960`, `--gpu-memory-utilization 0.90`. TP=4 divides
+the model's 4 KV heads cleanly.
+
+**Bug #9 — block-scale FP8 backend, silent until first request.** vLLM 0.25.1 defaults Qwen3-FP8's dense
+block-scale GEMM to FlashInfer, but the `runpod/pytorch` image has no FlashInfer cubin
+(`VLLM_HAS_FLASHINFER_CUBIN=False`), no `nvcc`, no `deep_gemm`. Result: `/v1/models` returns HEALTHY, then
+the **first real inference crashes the engine** — `RuntimeError: Assertion failed: !cubin.empty() ||
+isPathValid(path_)` (`fp8_blockscale_gemm_sm90`), GPUs free to 0, port dies → client sees `Connection
+refused`. **Fix:** `export VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER=0 VLLM_USE_DEEP_GEMM=0` → dense FP8 → compiled-in
+**CUTLASS**, MoE → **Triton** (`ptxas`+`ninja` present). Lesson: a green `/v1/models` is not "it serves"; the
+smoke (a real inference) is the gate.
+
+**Results (self-report, `Pagliacci, Seattle`, schema-valid both):** 30B → 3 tool turns, 7 sections / 48
+items; 235B → 4 tool turns (search → direct → direct → browser-escalate on its own), 8 sections / 51 items.
+235B download ~150 s (~1.5 GB/s, unauthenticated HF fine); cached relaunch ready in ~80 s. Pods torn down
+after validation (ephemeral; recipe is the artifact). Relaunch for the corpus build is one `runpod_create.py`
++ `serve_teacher.sh`.
+
 ## 2026-07-16 — GRPO round 1 aborted: sync tools serialize every scrape (bug #8)
 
 First real GRPO run (H200 141 GB, `--cache-policy live`, G=8, `max_completion_length` 16384,

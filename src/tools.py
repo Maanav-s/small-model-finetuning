@@ -34,12 +34,18 @@ from prompts import build_system_prompt
 # ---------------------------------------------------------------------------
 # Shared output bound
 # ---------------------------------------------------------------------------
-# Hard cap on a single tool result before it enters the message history, as a
-# backstop against a pathologically huge page. Generation forces SDPA's O(seq)
-# mem-efficient kernel (see generate_turn in agent.py), so a full menu page fits
-# comfortably; a blind char cap can still clip the tail of a very long menu, so a
-# hit is warned about (below) -- never silent.
-MAX_TOOL_CHARS = 75000
+# Hard cap on a single tool result before it enters the message history. Sized to
+# bound CONTEXT GROWTH: the vLLM teacher accumulates EVERY tool result in one
+# prompt, so at ~3.3 chars/token a 24K-char cap is ~7K tokens and even a full
+# tool-call budget of scrapes stays inside the served window. An uncapped 75K-char
+# page was ~19K tokens, and a few of those overflowed the context (the corpus
+# build's context-length 400s -- see notes/experiments.md 2026-07-19). A typical
+# menu page still fits intact (Pagliacci's full order page was ~16K chars); a blind
+# char cap can clip the tail of an unusually long menu, so a hit is warned about
+# (below) -- never silent. Retunable without re-scraping (the cache stores the raw
+# uncapped response; see setup_tools). Paired with the output-budget clamp +
+# overflow-finalize in serving/openai_agent.run_episode as the safety net.
+MAX_TOOL_CHARS = 24000
 
 
 # ---------------------------------------------------------------------------
