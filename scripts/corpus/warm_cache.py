@@ -54,7 +54,13 @@ from dotenv import load_dotenv  # noqa: E402
 
 load_dotenv(REPO_ROOT / ".env")
 
-from backends import build_scrape, build_search, close_pool, has_search_key  # noqa: E402
+from backends import (  # noqa: E402
+    build_scrape,
+    build_search,
+    close_pool,
+    has_search_key,
+    is_infra_failure,
+)
 from cache import CANNED, Cache, norm_query, norm_scrape, scrape_status  # noqa: E402
 from corpus import VALID_SPLITS, open_corpus  # noqa: E402
 
@@ -85,6 +91,17 @@ NETWORK_CALL_MIN_S = 0.05
 # Abort if this many restaurants fail in a row -- a dead Brave key/network
 # should not grind through the whole selection (same pattern as build_corpus).
 MAX_CONSECUTIVE_FAILURES = 5
+
+# Infra-failure circuit breaker (see backends.is_infra_failure). MAX_CONSECUTIVE_
+# FAILURES above only counts warm_one *raising*, but a broken browser never raises:
+# scrape returns a sentinel string, warm_one returns a clean summary, and the guard
+# can never fire. That hole let a 100%-infra run grind on for six hours writing 2418
+# junk rows while printing healthy-looking progress. These two triggers close it --
+# the fraction catches a browser that was broken from the start, the consecutive
+# count catches one that dies mid-run.
+INFRA_ABORT_CONSECUTIVE = 5   # restaurants in a row whose every scrape failed on infra
+INFRA_ABORT_SAMPLE = 20       # only apply the fraction test once this many scrapes are in
+INFRA_ABORT_FRACTION = 0.8    # ... then abort above this infra share of all scrapes
 
 # One search result renders as "[i] title\n    url\n    desc" (backends.
 # _format_results); the URL is the line immediately after the [i] header.
@@ -209,9 +226,25 @@ def warm_one(row: dict, search_fn, scrape_fn, queries: list[str], urls_per_query
     running its full query x URL grid.
     """
     rendered = render_queries(queries, row)
-    n_direct = n_browser = scrape_errors = 0
+    n_direct = n_browser = 0
+    infra_errors = site_errors = 0
     n_urls = n_skipped = n_no_results = 0
     seen_urls: set[str] = set()
+
+    def count(result: str) -> bool:
+        """Tally one finished scrape by cause; True if it failed.
+
+        The infra/site split is the whole point: a site failure is the correct,
+        permanent answer for that URL, an infra failure means we never asked.
+        """
+        nonlocal infra_errors, site_errors
+        if scrape_status(result) != "error":
+            return False
+        if is_infra_failure(result):
+            infra_errors += 1
+        else:
+            site_errors += 1
+        return True
 
     for query in rendered:
         if stop is not None and stop.is_set():
@@ -230,21 +263,19 @@ def warm_one(row: dict, search_fn, scrape_fn, queries: list[str], urls_per_query
             n_urls += 1
             result = _scrape(scrape_fn, url, DIRECT_MODE, sleep_s)
             n_direct += 1
-            direct_failed = scrape_status(result) == "error"
-            if direct_failed:
-                scrape_errors += 1
+            direct_failed = count(result)
             if warm_both or direct_failed or len(result) < WARM_BROWSER_IF_UNDER:
                 bresult = _scrape(scrape_fn, url, BROWSER_MODE, sleep_s)
                 n_browser += 1
-                if scrape_status(bresult) == "error":
-                    scrape_errors += 1
+                count(bresult)
 
     return {
         "rid": row["restaurant_id"], "name": row["name"],
         "queries": len(rendered), "urls": n_urls, "urls_skipped": n_skipped,
         "no_results": n_no_results,
         "scrape_direct": n_direct, "scrape_browser": n_browser,
-        "scrape_errors": scrape_errors,
+        "scrape_calls": n_direct + n_browser,
+        "infra_errors": infra_errors, "site_errors": site_errors,
     }
 
 
@@ -314,6 +345,8 @@ def main():
     results, failures = [], []
     consecutive_failures = 0
     interrupted = False
+    infra_total = scrape_total = consecutive_infra = 0
+    aborted: str | None = None
     with ThreadPoolExecutor(max_workers=args.workers) as pool:
         futures = {
             pool.submit(warm_one, row, search_fn, scrape_fn, queries,
@@ -340,10 +373,39 @@ def main():
                     continue
                 consecutive_failures = 0
                 results.append(summary)
+                infra, site = summary["infra_errors"], summary["site_errors"]
                 print(f"[{i}/{len(selection)}] {summary['name']!r}: urls={summary['urls']} "
                       f"(direct={summary['scrape_direct']} browser={summary['scrape_browser']}) "
-                      f"skipped={summary['urls_skipped']} scrape_errors={summary['scrape_errors']}"
+                      f"skipped={summary['urls_skipped']} "
+                      f"errors={infra + site} (infra={infra} site={site})"
                       f"{'  (some searches had no results)' if summary['no_results'] else ''}")
+
+                # Circuit breaker: stop a run whose browser is broken. Site errors are
+                # expected and never trip this -- only infra ones, which mean the URLs
+                # were never fetched and every row being written is junk.
+                scrape_total += summary["scrape_calls"]
+                infra_total += infra
+                consecutive_infra = (
+                    consecutive_infra + 1 if infra and infra == summary["scrape_calls"] else 0
+                )
+                if consecutive_infra >= INFRA_ABORT_CONSECUTIVE:
+                    aborted = (f"{consecutive_infra} restaurants in a row had EVERY scrape "
+                               f"fail on a local browser error")
+                elif (scrape_total >= INFRA_ABORT_SAMPLE
+                      and infra_total / scrape_total > INFRA_ABORT_FRACTION):
+                    aborted = (f"{infra_total}/{scrape_total} scrapes "
+                               f"({100 * infra_total / scrape_total:.0f}%) failed on a local "
+                               f"browser error")
+                if aborted:
+                    print(f"\nABORTING: {aborted}.")
+                    print("  These are LOCAL failures, not site failures -- the URLs were never")
+                    print("  fetched, so the rows this run writes are junk. Fix the browser")
+                    print("  (`uv run playwright install chromium`), then re-run: already-warmed")
+                    print("  entries replay from the cache, so nothing good is lost.")
+                    stop.set()
+                    for f in futures:
+                        f.cancel()
+                    break
         except KeyboardInterrupt:
             # The `with`-exit is shutdown(wait=True), which does NOT cancel queued work
             # -- it drains the whole backlog first (and workers never see the Ctrl+C). So
@@ -367,16 +429,27 @@ def main():
     if results:
         n_direct = sum(r["scrape_direct"] for r in results)
         n_browser = sum(r["scrape_browser"] for r in results)
+        n_infra = sum(r["infra_errors"] for r in results)
+        n_site = sum(r["site_errors"] for r in results)
+        n_calls = n_direct + n_browser
         print(f"searches issued: {sum(r['queries'] for r in results)}  "
               f"urls planned: {sum(r['urls'] for r in results)}  "
               f"dead ends skipped: {sum(r['urls_skipped'] for r in results)}  "
               f"searches with no results: {sum(r['no_results'] for r in results)}")
-        print(f"scrape calls: {n_direct} direct + {n_browser} browser = {n_direct + n_browser} total; "
+        print(f"scrape calls: {n_direct} direct + {n_browser} browser = {n_calls} total; "
               f"{100 * n_browser / max(1, n_direct):.0f}% browser rate")
-        print(f"scrape calls returning a failure sentinel: "
-              f"{sum(r['scrape_errors'] for r in results)} (stored as 'error'; a re-run re-fetches them)")
+        print(f"failed scrapes: {n_infra + n_site}/{n_calls}")
+        print(f"  site={n_site}   the site refused us (timeout / bad cert / empty page). "
+              f"Expected, and the correct permanent answer for that URL.")
+        print(f"  infra={n_infra}   the LOCAL browser broke -- the URL was never fetched.")
+        if n_infra:
+            print(f"  WARNING: {100 * n_infra / max(1, n_calls):.0f}% of scrape calls failed "
+                  f"locally, so those rows are junk rather than findings. Fix the browser "
+                  f"and re-run to replace them.")
     print(f"cache: {stats['writes']} entries warmed (writes), {stats['hits']} already cached (hits), "
           f"{stats['misses']} misses")
+    if aborted:
+        print(f"\nRUN ABORTED: {aborted} -- the selection was NOT fully warmed.")
     for rid, name, err in failures:
         print(f"  FAILED {rid} {name!r}: {err}")
     cache.close()

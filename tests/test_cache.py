@@ -18,9 +18,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from cache import (  # noqa: E402
     CANNED,
+    MIN_CONTENT_CHARS,
+    MISS_POLICIES,
     Cache,
     CacheMiss,
-    MISS_POLICIES,
     norm_query,
     norm_scrape,
     norm_url,
@@ -180,7 +181,13 @@ class TestScrape:
             ("", "empty"),
             ("   \n ", "empty"),
             (None, "empty"),
-            ("# Menu\nPizza $12", "ok"),
+            # A bot-wall answers 200 with a token body rather than an error. It is
+            # non-empty, so it used to classify 'ok' and count as coverage --
+            # TripAdvisor does this in 15 characters. Too short to be a menu.
+            ("Access Denied", "empty"),
+            ("x" * (MIN_CONTENT_CHARS - 1), "empty"),
+            ("x" * MIN_CONTENT_CHARS, "ok"),
+            ("# Menu\n" + "- Margherita Pizza $12\n" * 12, "ok"),
         ],
     )
     def test_scrape_status_classification(self, response, status):

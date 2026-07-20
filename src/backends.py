@@ -40,6 +40,7 @@ from __future__ import annotations
 import atexit
 import os
 import threading
+import time
 
 import requests
 from bs4 import BeautifulSoup
@@ -229,6 +230,30 @@ def _scrape_error(url: str, mode: str, e: Exception) -> str:
     return f"(scrape failed for {url} in {mode!r} mode: {detail})"
 
 
+# Markers of an INFRASTRUCTURE failure: the local browser stack broke, so the URL
+# was never actually fetched. Distinct from a SITE failure (nav timeout, bad cert,
+# empty body), where we did ask and the site refused. The difference is not
+# cosmetic -- a site failure is a fact about the web and is the correct, permanent
+# outcome for that URL; an infra failure is a fact about THIS machine, and every
+# row it produces is a fabrication that will be re-fetched later. Anything that
+# bulk-populates the cache must count them apart: on 2026-07-20 a warm ran six
+# hours at a 49% error rate that was 100% infra (a Chromium launch failure), wrote
+# 2418 junk rows, and looked healthy the whole way because one undifferentiated
+# counter made it indistinguishable from aggregators being aggregators.
+_INFRA_FAILURE_MARKERS = (
+    "Executable doesn't exist",
+    "asyncio loop",
+    "BrowserType.launch",
+    "Target page, context or browser has been closed",
+)
+
+
+def is_infra_failure(response: str) -> bool:
+    """True if a scrape failure sentinel reflects a broken local browser stack
+    rather than the site refusing us. False for non-sentinel (successful) responses."""
+    return any(marker in (response or "") for marker in _INFRA_FAILURE_MARKERS)
+
+
 # Thread-local browser pool: a sync Playwright browser is bound to the thread that
 # created it, so each thread lazily launches its own Chromium and reuses it.
 # _POOL_REGISTRY tracks every (playwright, browser) started so atexit can
@@ -238,19 +263,72 @@ _POOL = threading.local()
 _POOL_REGISTRY: list = []
 _POOL_LOCK = threading.Lock()
 
+# Chromium launch is retried: observed failing with "Executable doesn't exist" for a
+# binary that is present and launches seconds later (transient lock, e.g. an AV scan
+# of the 203 MB executable). Total attempts, and the linear backoff between them.
+BROWSER_LAUNCH_ATTEMPTS = 3
+BROWSER_LAUNCH_BACKOFF_S = 1.0
+
+
+def _drop_thread_browser() -> None:
+    """Tear down and forget this thread's pooled browser (used when it has died).
+
+    A disconnected browser still has its playwright instance started; relaunching
+    without stopping that first would stack a second event loop on this thread.
+    """
+    pw = getattr(_POOL, "pw", None)
+    browser = getattr(_POOL, "browser", None)
+    _POOL.pw = None
+    _POOL.browser = None
+    if browser is not None:
+        try:
+            browser.close()
+        except Exception:  # noqa: BLE001 - already dead; nothing to salvage
+            pass
+    if pw is not None:
+        try:
+            pw.stop()
+        except Exception:  # noqa: BLE001
+            pass
+        with _POOL_LOCK:
+            _POOL_REGISTRY[:] = [(p, b) for p, b in _POOL_REGISTRY if p is not pw]
+
 
 def _pooled_browser():
     """Return this thread's Chromium, launching (and registering) it on first use."""
     browser = getattr(_POOL, "browser", None)
     if browser is not None and browser.is_connected():
         return browser
-    pw = sync_playwright().start()
-    browser = pw.chromium.launch(headless=True, args=LAUNCH_ARGS)
-    _POOL.pw = pw
-    _POOL.browser = browser
-    with _POOL_LOCK:
-        _POOL_REGISTRY.append((pw, browser))
-    return browser
+    _drop_thread_browser()  # a dead browser must be stopped before relaunching
+    for attempt in range(BROWSER_LAUNCH_ATTEMPTS):
+        pw = sync_playwright().start()
+        try:
+            browser = pw.chromium.launch(headless=True, args=LAUNCH_ARGS)
+        except BaseException as exc:
+            # launch() failed AFTER start() succeeded, so pw's event loop is already
+            # running in THIS thread. It is in neither _POOL nor _POOL_REGISTRY, so
+            # nothing else can ever stop it -- and every later sync_playwright().start()
+            # on this thread would raise "Sync API inside the asyncio loop". Without
+            # this stop(), ONE transient launch failure silently disables the browser
+            # path for the whole run: measured 2026-07-20, two worker threads each hit
+            # one launch failure and every subsequent scrape in that run failed.
+            try:
+                pw.stop()
+            except Exception:  # noqa: BLE001 - best effort; re-raising the cause matters more
+                pass
+            # Launch failures here are transient in practice: the binary is present
+            # and launches seconds later, but an AV scanner holding the 203 MB
+            # executable (or both workers launching at once on run start) surfaces as
+            # "Executable doesn't exist". Retry before giving the URL up.
+            if isinstance(exc, PlaywrightError) and attempt < BROWSER_LAUNCH_ATTEMPTS - 1:
+                time.sleep(BROWSER_LAUNCH_BACKOFF_S * (attempt + 1))
+                continue
+            raise
+        _POOL.pw = pw
+        _POOL.browser = browser
+        with _POOL_LOCK:
+            _POOL_REGISTRY.append((pw, browser))
+        return browser
 
 
 def _render_pooled(url: str, *, wait: bool, scroll: bool) -> str:

@@ -142,7 +142,8 @@ class TestWarmOne:
         # Direct cleared the bar on both URLs -> no browser escalation.
         assert scrape_calls == [("https://a.com/menu", "direct"), ("https://b.com", "direct")]
         assert summary["scrape_direct"] == 2 and summary["scrape_browser"] == 0
-        assert summary["urls"] == 2 and summary["scrape_errors"] == 0
+        assert summary["urls"] == 2
+        assert summary["infra_errors"] == 0 and summary["site_errors"] == 0
 
         # Idempotency: a second pass is all cache hits -- zero new backend calls.
         warm_cache.warm_one(row, search_fn, scrape_fn, QUERIES,
@@ -187,7 +188,31 @@ class TestWarmOne:
                                       urls_per_query=1, sleep_s=0, warm_both=False)
         # Direct errored -> escalate to browser; browser also errored -> both counted.
         assert summary["scrape_direct"] == 1 and summary["scrape_browser"] == 1
-        assert summary["scrape_errors"] == 2
+        assert summary["scrape_calls"] == 2
+        # A bare "x" reason matches no browser-stack marker -> site, not infra.
+        assert summary["site_errors"] == 2 and summary["infra_errors"] == 0
+
+    def test_infra_failures_counted_apart_from_site_failures(self):
+        """A dead LOCAL browser must not read as a site refusing us: the URL was
+        never fetched, so each row is a fabrication rather than a finding. Keeping
+        the two apart is what lets main() abort a run whose browser is broken --
+        one undifferentiated counter let a 100%-infra run write 2418 junk rows."""
+        cache = Cache(":memory:", miss_policy="live")
+        search_fn = cache.wrap(
+            "search", lambda q: brave_response("https://a.com"), key_fn=norm_query
+        )
+        scrape_fn = cache.wrap(
+            "scrape",
+            lambda url, mode="direct": (
+                f"(scrape failed for {url} in {mode!r} mode: BrowserType.launch: "
+                f"Executable doesn't exist at /nope/chrome-headless-shell.exe)"
+            ),
+            key_fn=norm_scrape, status_fn=scrape_status,
+        )
+        row = {"restaurant_id": "abc", "name": "A", "city": "B"}
+        summary = warm_cache.warm_one(row, search_fn, scrape_fn, QUERIES,
+                                      urls_per_query=1, sleep_s=0, warm_both=False)
+        assert summary["infra_errors"] == 2 and summary["site_errors"] == 0
 
     def test_modes_both_warms_browser_even_when_direct_is_full(self):
         cache = Cache(":memory:", miss_policy="live")

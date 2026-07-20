@@ -108,14 +108,30 @@ def _default_status(response: str) -> str:
 _SCRAPE_FAILURE_MARKERS = ("(scrape failed", "(page returned no content)", "(page not available)")
 
 
+# A bot-walled page usually answers 200 with a token body ("Access Denied", an empty
+# shell) rather than an error: too little to be a menu, but non-empty, so it used to
+# classify 'ok' and count as coverage. TripAdvisor returns FIFTEEN characters this
+# way, and an 'ok' row is a permanent hit under live -- so four of a restaurant's
+# top-3 URL slots could sit filled with nothing, invisibly. Below this many
+# characters a response is 'empty' instead. Deliberately NOT 'error': 'error'
+# re-fetches on every populate pass, and a site that stonewalls us will stonewall us
+# again -- this is a permanent negative result, not a transient one. The floor sits
+# well under the smallest real page observed (636 chars) and well over the bot-wall
+# bodies (15 chars).
+MIN_CONTENT_CHARS = 200
+
+
 def scrape_status(response: str) -> str:
     """Status for a scrape response: 'error' for the backend's failure sentinels,
-    else 'empty'/'ok'. Pass as `status_fn=scrape_status` when wrapping scrape."""
+    'empty' for nothing (or too little to be content), else 'ok'. Pass as
+    `status_fn=scrape_status` when wrapping scrape."""
     r = (response or "").strip()
     if not r:
         return "empty"
     if r.startswith(_SCRAPE_FAILURE_MARKERS):
         return "error"
+    if len(r) < MIN_CONTENT_CHARS:
+        return "empty"
     return "ok"
 
 
