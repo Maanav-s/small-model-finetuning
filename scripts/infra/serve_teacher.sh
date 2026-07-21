@@ -21,12 +21,25 @@
 #                               (No --reasoning-parser: the Instruct-2507 variants have
 #                               no <think> blocks. Add `--reasoning-parser deepseek_r1`
 #                               ONLY if you serve a *-Thinking-2507 variant instead.)
-#   --enforce-eager             this teacher is SCRAPE-bound, not compute-bound (the
-#                               single scrape-egress IP caps throughput), so we skip
-#                               torch.compile + CUDA-graph capture: faster startup and
-#                               ~10-20 GB less VRAM -- which matters for the tight
-#                               235 GB-FP8-on-320 GB (4xH100) fit. Drop it if you ever
-#                               need max decode throughput and have VRAM to spare.
+#   CUDA GRAPHS ARE ON (no --enforce-eager) -- measured 2026-07-21, worth ~10x.
+#                               This script used to pass --enforce-eager on the theory
+#                               that the teacher is "scrape-bound, not compute-bound".
+#                               That theory was wrong by an order of magnitude: eager
+#                               decode ran 9.5 tok/s/request, graphs run 94.0 -- and
+#                               aggregate went 151 -> 1172 tok/s at 16 concurrent,
+#                               2066 at 32. On a 1500-episode corpus build that is the
+#                               difference between ~6 h and well under an hour. Graph
+#                               capture costs 38 s and 3.93 GiB; it is not close.
+#   --compilation-config ...    ...but graphs only capture with the allreduce_rms
+#   --disable-custom-all-reduce fusion OFF. With it on, capture dies partway through
+#                               with `Cuda error custom_all_reduce.cuh:455 'an illegal
+#                               memory access was encountered'`, the engine exits, and
+#                               the GPUs stay pinned by orphaned VLLM:: workers until
+#                               killed. That crash is what made --enforce-eager look
+#                               load-bearing; it is really just this one fusion. The
+#                               two flags below were validated TOGETHER -- if you want
+#                               to know whether --disable-custom-all-reduce alone is
+#                               also needed, test it, do not assume.
 #   head_dim is a NON-ISSUE on vLLM (that saga is HF-only; see CLAUDE.md).
 #
 # BLOCK-SCALE FP8 BACKEND (the load-bearing env below -- validated 2026-07-19):
@@ -50,7 +63,11 @@ MAX_LEN="${3:-131072}"                   # 128K: headroom for tool-heavy episode
                                          # free VRAM, not from this cap, so raising it does
                                          # not pre-allocate; only very long sequences use the
                                          # tail. Lower it if a tighter GPU fit is KV-starved.
-GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.90}"     # raise toward 0.95 if KV-starved; lower if OOM on load
+GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.95}"     # 0.95 validated with graphs on 4xH100; lower if OOM on load.
+                                         # KV is the concurrency limit, not compute: at 0.95 the pool is
+                                         # 12.22 GiB/GPU = 272,704 tokens TOTAL, so episodes carrying big
+                                         # scraped contexts bound how many run at once. Watch the server's
+                                         # "GPU KV cache usage" line before raising --workers past ~16.
 SERVED_NAME="${SERVED_NAME:-teacher}"    # must match build_corpus --teacher-model / smoke --model
 VENV="${VENV:-/opt/vllm}"
 LOG="${LOG:-/workspace/vllm.log}"
@@ -73,7 +90,8 @@ nohup env PATH="$VENV/bin:$PATH" "$VENV/bin/vllm" serve "$MODEL" \
   --enable-auto-tool-choice --tool-call-parser hermes \
   --max-model-len "$MAX_LEN" \
   --gpu-memory-utilization "$GPU_MEM_UTIL" \
-  --enforce-eager \
+  --disable-custom-all-reduce \
+  --compilation-config '{"pass_config":{"fuse_allreduce_rms":false}}' \
   --host 0.0.0.0 --port 8000 </dev/null > "$LOG" 2>&1 &
 
 echo "serve launched pid $! -> $LOG"

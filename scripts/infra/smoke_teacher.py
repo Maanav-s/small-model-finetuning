@@ -43,11 +43,17 @@ def main() -> None:
                    help="served model name (vllm serve --served-model-name; default 'teacher')")
     p.add_argument("--restaurant", default=TEST_RESTAURANT, help=f"episode input (default {TEST_RESTAURANT!r})")
     p.add_argument("--dietary", default=None, help="optional dietary restriction to condition on (e.g. vegan)")
+    p.add_argument("--timeout", type=float, default=900.0,
+                   help="per-request wall-clock budget in seconds (default 900). The "
+                        "build_client default of 300 is too tight for a slow-decoding "
+                        "teacher: at a measured 9.5 tok/s the p90 episode needs ~425 s "
+                        "of generation, so 300 fails the smoke on SPEED and reads as a "
+                        "broken server. Raise this, do not mistake it for a serving bug.")
     args = p.parse_args()
 
     restrictions = [args.dietary] if args.dietary else None
     tools, registry, system_prompt = setup_tools(restrictions, "teacher", None)
-    client = build_client(args.base_url)
+    client = build_client(args.base_url, timeout=args.timeout)
 
     print(f"[smoke] {args.model} @ {args.base_url}  input={args.restaurant!r}"
           + (f"  dietary={args.dietary}" if args.dietary else ""))

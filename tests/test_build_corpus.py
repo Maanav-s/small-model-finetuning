@@ -57,7 +57,7 @@ class TestBrowserPreflight:
                             lambda: "BrowserType.launch: Executable doesn't exist at /nope")
         # Reaching either of these means the guard let the run through.
         monkeypatch.setattr(build_corpus, "setup_tools", _boom)
-        monkeypatch.setattr(build_corpus, "openai_build_client", lambda url: object())
+        monkeypatch.setattr(build_corpus, "openai_build_client", lambda url, **kw: object())
         monkeypatch.setattr(sys, "argv", _argv(corpus_path))
 
         with pytest.raises(SystemExit) as exc:
@@ -74,7 +74,7 @@ class TestBrowserPreflight:
         continue (here to a sentinel raised from the very next call)."""
         monkeypatch.setenv("BRAVE_API_KEY", "test-key")
         monkeypatch.setattr(build_corpus, "preflight_browser", lambda: None)
-        monkeypatch.setattr(build_corpus, "openai_build_client", lambda url: object())
+        monkeypatch.setattr(build_corpus, "openai_build_client", lambda url, **kw: object())
         monkeypatch.setattr(build_corpus, "setup_tools", _boom)
         monkeypatch.setattr(sys, "argv", _argv(corpus_path))
 
@@ -98,7 +98,7 @@ class TestBrowserPreflight:
         so demanding a browser there would block frozen/offline replay runs."""
         monkeypatch.setenv("BRAVE_API_KEY", "test-key")
         monkeypatch.setattr(build_corpus, "preflight_browser", _boom)
-        monkeypatch.setattr(build_corpus, "openai_build_client", lambda url: object())
+        monkeypatch.setattr(build_corpus, "openai_build_client", lambda url, **kw: object())
         monkeypatch.setattr(build_corpus, "setup_tools", _boom)
         monkeypatch.setattr(sys, "argv", _argv(corpus_path, "--cache-policy", "canned"))
 

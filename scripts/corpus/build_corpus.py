@@ -97,6 +97,14 @@ def parse_args():
                         help=f"vLLM OpenAI-compatible base URL (--teacher vllm; default {DEFAULT_VLLM_BASE_URL})")
     parser.add_argument("--teacher-model", default=None,
                         help="served model name for --teacher vllm (required in that mode)")
+    parser.add_argument("--teacher-timeout", type=float, default=900.0,
+                        help="per-request wall-clock budget in seconds for --teacher vllm "
+                             "(default 900). Sized from DECODE SPEED, not from patience: at "
+                             "the 9.5 tok/s measured for 235B-FP8 under --enforce-eager, the "
+                             "p90 episode (~4k generated tokens) needs ~425 s and the longest "
+                             "seen ~740 s. openai_agent.build_client defaults to 300, which "
+                             "would fail a tenth of the corpus as 'timeouts' that are really "
+                             "just a slow teacher. Lower it for a fast one.")
     parser.add_argument("--model", default=MODEL_ID,
                         help=f"Claude teacher model id for --teacher claude (default {MODEL_ID})")
     parser.add_argument("--workers", type=int, default=3,
@@ -334,7 +342,7 @@ def main():
                 sys.exit("--teacher vllm requires --teacher-model (the vLLM served model name)")
             if not os.environ.get("BRAVE_API_KEY"):
                 sys.exit("BRAVE_API_KEY is required (repo-root .env)")
-            client = openai_build_client(args.teacher_base_url)
+            client = openai_build_client(args.teacher_base_url, timeout=args.teacher_timeout)
         else:  # claude
             teacher_model = args.model
             if not os.environ.get("ANTHROPIC_API_KEY"):
