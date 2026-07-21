@@ -62,6 +62,7 @@ from dotenv import load_dotenv  # noqa: E402
 
 load_dotenv(REPO_ROOT / ".env")
 
+from backends import preflight_browser  # noqa: E402
 from cache import Cache  # noqa: E402
 from claude_agent import MODEL_ID, run_episode as claude_run_episode  # noqa: E402
 from corpus import open_corpus, trace_id_for  # noqa: E402
@@ -342,6 +343,18 @@ def main():
                 sys.exit("BRAVE_API_KEY is required (repo-root .env)")
             client = anthropic.Anthropic()
         cx.set_meta("teacher_model", teacher_model)
+
+        # Fail before the first episode, not after the last. A browser that cannot
+        # launch makes EVERY scrape an infra failure, and nothing downstream notices:
+        # scrape returns a sentinel rather than raising, so the episode "succeeds"
+        # with found=false and the MAX_CONSECUTIVE_FAILURES guard below -- which only
+        # counts episodes that RAISE -- can never fire. That is the hole that let a
+        # warm run grind six hours at 100% infra (2026-07-20); here the same hole
+        # bills a metered teacher pod the whole way. One launch turns it into an exit.
+        if args.cache_policy != "canned":  # canned replays only; it never launches a browser
+            browser_error = preflight_browser()
+            if browser_error:
+                sys.exit(f"browser preflight failed, refusing to start:\n  {browser_error}")
 
         cache = Cache(args.cache_path, miss_policy=args.cache_policy)
         # Tools/registry are restriction-independent; only the system prompt embeds
