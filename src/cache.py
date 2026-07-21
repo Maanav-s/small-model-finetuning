@@ -218,7 +218,8 @@ class Cache:
             self._conn.commit()
 
     # -- public API ---------------------------------------------------------
-    def wrap(self, namespace: str, fn, key_fn, *, provider: str | None = None, status_fn=None):
+    def wrap(self, namespace: str, fn, key_fn, *, provider: str | None = None, status_fn=None,
+             store_if=None):
         """Return a drop-in replacement for `fn` that reads/writes the cache.
 
         `fn` is a backend closure like backends.build_search()'s search(query) or
@@ -230,6 +231,11 @@ class Cache:
         tools.py at read time. `status_fn` classifies the response for negative
         caching (defaults to ok/empty; scrape_status also flags failure sentinels
         as 'error').
+
+        `store_if(response) -> bool` (optional) vetoes STORAGE while still returning
+        the response to the caller. Use it for responses that are not answers from
+        the network at all -- pass store_if=backends.is_cacheable on scrape so a
+        broken local browser cannot write rows for URLs it never fetched.
         """
         if namespace not in CANNED:
             raise ValueError(f"unknown namespace {namespace!r}; add a CANNED constant for it")
@@ -260,6 +266,13 @@ class Cache:
             # OUTSIDE the lock (two workers missing the same key both fetch and
             # both write -- benign, INSERT OR REPLACE; see notes/phase2_plan.md WS-C).
             response = fn(*args, **kwargs)
+            if store_if is not None and not store_if(response):
+                # Returned but NOT stored: this response says something about the
+                # local machine, not about the URL (see backends.is_cacheable).
+                # Writing it would record a finding that was never made, and under
+                # "canned" it would later replay as if the page had answered it.
+                # Leaving the key absent is self-healing -- the next pass re-fetches.
+                return response
             status = classify(response)
             self._set(namespace, key, {"args": args, "kwargs": kwargs}, response, provider, status)
             with self._lock:

@@ -22,6 +22,7 @@ sys.path.insert(0, str(REPO_ROOT / "src"))
 sys.path.insert(0, str(REPO_ROOT / "scripts" / "corpus"))
 
 import warm_cache  # noqa: E402
+from backends import is_cacheable  # noqa: E402
 from cache import Cache, norm_query, norm_scrape, scrape_status  # noqa: E402
 from corpus import open_corpus  # noqa: E402
 
@@ -192,11 +193,38 @@ class TestWarmOne:
         # A bare "x" reason matches no browser-stack marker -> site, not infra.
         assert summary["site_errors"] == 2 and summary["infra_errors"] == 0
 
-    def test_infra_failures_counted_apart_from_site_failures(self):
+    def test_infra_failure_counted_apart_and_does_not_escalate(self):
         """A dead LOCAL browser must not read as a site refusing us: the URL was
-        never fetched, so each row is a fabrication rather than a finding. Keeping
-        the two apart is what lets main() abort a run whose browser is broken --
-        one undifferentiated counter let a 100%-infra run write 2418 junk rows."""
+        never fetched, so a row for it would be a fabrication rather than a finding.
+        Keeping the two apart is what lets main() abort a run whose browser is
+        broken -- one undifferentiated counter let a 100%-infra run go 2418 rows.
+
+        And it must NOT escalate to "browser": the escalation target IS the broken
+        component ("direct" already falls back to a browser render internally), so
+        trying doubles both the wasted seconds and the failures."""
+        cache = Cache(":memory:", miss_policy="live")
+        scrape_calls = []
+
+        def fake_scrape(url, mode="direct"):
+            scrape_calls.append((url, mode))
+            return (f"(scrape failed for {url} in {mode!r} mode: BrowserType.launch: "
+                    f"Executable doesn't exist at /nope/chrome-headless-shell.exe)")
+
+        search_fn = cache.wrap(
+            "search", lambda q: brave_response("https://a.com"), key_fn=norm_query
+        )
+        scrape_fn = cache.wrap("scrape", fake_scrape, key_fn=norm_scrape,
+                               status_fn=scrape_status)
+        row = {"restaurant_id": "abc", "name": "A", "city": "B"}
+        summary = warm_cache.warm_one(row, search_fn, scrape_fn, QUERIES,
+                                      urls_per_query=1, sleep_s=0, warm_both=False)
+        assert scrape_calls == [("https://a.com", "direct")]  # no browser retry
+        assert summary["infra_errors"] == 1 and summary["site_errors"] == 0
+        assert summary["scrape_browser"] == 0
+
+    def test_infra_failures_are_not_cached(self):
+        """store_if=is_cacheable: the run leaves NOTHING behind for a URL it never
+        fetched, so a later pass re-fetches instead of replaying a local error."""
         cache = Cache(":memory:", miss_policy="live")
         search_fn = cache.wrap(
             "search", lambda q: brave_response("https://a.com"), key_fn=norm_query
@@ -207,12 +235,13 @@ class TestWarmOne:
                 f"(scrape failed for {url} in {mode!r} mode: BrowserType.launch: "
                 f"Executable doesn't exist at /nope/chrome-headless-shell.exe)"
             ),
-            key_fn=norm_scrape, status_fn=scrape_status,
+            key_fn=norm_scrape, status_fn=scrape_status, store_if=is_cacheable,
         )
         row = {"restaurant_id": "abc", "name": "A", "city": "B"}
-        summary = warm_cache.warm_one(row, search_fn, scrape_fn, QUERIES,
-                                      urls_per_query=1, sleep_s=0, warm_both=False)
-        assert summary["infra_errors"] == 2 and summary["site_errors"] == 0
+        warm_cache.warm_one(row, search_fn, scrape_fn, QUERIES,
+                            urls_per_query=1, sleep_s=0, warm_both=False)
+        assert cache._get("scrape", norm_scrape("https://a.com", "direct")) is None
+        assert cache.stats()["writes"] == 1  # the search row only
 
     def test_modes_both_warms_browser_even_when_direct_is_full(self):
         cache = Cache(":memory:", miss_policy="live")

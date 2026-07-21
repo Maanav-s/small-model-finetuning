@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import atexit
 import os
+import re
 import threading
 import time
 
@@ -218,6 +219,69 @@ def _render_on_page(page, url: str, *, wait: bool, scroll: bool) -> str:
     return page.content()
 
 
+# Playwright reports a browser it cannot USE as one that does not EXIST. Its gate
+# (registry executablePathOrDie -> canAccessFile) is:
+#
+#     function canAccessFile(file) {
+#       try { fs.accessSync(file); return true; } catch (e) { return false; }
+#     }
+#
+# so `Executable doesn't exist at <path>` means **accessSync THREW**, not that the
+# path is absent -- and on Windows that includes a transient sharing violation
+# while an AV scanner reads the 203 MB headless-shell binary. Verified 2026-07-20:
+# a run failed every launch for 90 s with that message while the file was present,
+# 203,034,112 bytes, readable, and launching normally 3 minutes later.
+#
+# The two causes need OPPOSITE handling -- a missing install is permanent (retry
+# is wasted), an unreadable one is transient (retry is the entire fix) -- and the
+# message alone cannot tell them apart. The path inside it can.
+_EXE_MISSING_RE = re.compile(r"Executable doesn't exist at (.+)")
+
+
+def _executable_present(message: str) -> bool | None:
+    """For an 'Executable doesn't exist' error: is the binary actually on disk?
+
+    Returns True (present -> the check failed transiently), False (genuinely
+    missing -> the install is broken), or None if this isn't that error at all.
+
+    os.path.exists() is NOT sufficient on its own: it swallows OSError exactly the
+    way canAccessFile swallows accessSync, so a momentarily locked binary reads as
+    absent to BOTH and a naive exists() turns a transient into a permanent verdict.
+    Measured 2026-07-20: a preflight reported "Chromium is not installed" for a
+    203,034,112-byte binary that stat'd, opened and launched fine seconds later.
+
+    So a non-stat'ing exe is only believed absent when its INSTALL DIRECTORY is
+    gone too -- Playwright drops an INSTALLATION_COMPLETE marker beside the browser
+    when the download finishes, and an intact tree means the file is there and
+    merely unreadable this instant.
+    """
+    match = _EXE_MISSING_RE.search(message or "")
+    if not match:
+        return None
+    exe = match.group(1).strip()
+    if os.path.exists(exe):
+        return True
+    browser_dir = os.path.dirname(exe)                 # .../chrome-headless-shell-win64
+    install_root = os.path.dirname(browser_dir)        # .../chromium_headless_shell-1228
+    if os.path.isdir(browser_dir) or os.path.exists(
+        os.path.join(install_root, "INSTALLATION_COMPLETE")
+    ):
+        return True  # install intact -> locked, not missing
+    return False
+
+
+INSTALL_HINT = "Chromium is not installed: run `uv run playwright install chromium`"
+
+# The install is fine and the binary is merely unreadable right now -- reinstalling
+# is a 203 MB no-op. On Windows this is typically an on-access AV/indexer scan of a
+# 203 MB executable; excluding the browser dir is the durable fix.
+LOCK_HINT = (
+    "the binary IS installed but could not be read just now (a scanner or indexer "
+    "holding it) -- do NOT reinstall. Retry; if it recurs, exclude the Playwright "
+    "browser directory from your antivirus."
+)
+
+
 def _scrape_error(url: str, mode: str, e: Exception) -> str:
     """Format a navigation/render failure as a readable, model-recoverable string.
 
@@ -226,7 +290,14 @@ def _scrape_error(url: str, mode: str, e: Exception) -> str:
     another URL or mode, exactly as it would on an empty page. Take only the first
     line -- Playwright appends a multi-line call log.
     """
-    detail = str(e).splitlines()[0] if str(e) else type(e).__name__
+    message = str(e)
+    detail = message.splitlines()[0] if message else type(e).__name__
+    # ... except that for a missing install, the line we'd drop is the ONLY
+    # actionable one (Playwright puts "run playwright install" in an ASCII box
+    # below the first line). Keeping [0] alone is what made a broken install read
+    # as an inexplicable transient for two days. Re-add it, still single-line.
+    if _executable_present(message) is False:
+        detail = f"{detail} -- {INSTALL_HINT}"
     return f"(scrape failed for {url} in {mode!r} mode: {detail})"
 
 
@@ -234,12 +305,13 @@ def _scrape_error(url: str, mode: str, e: Exception) -> str:
 # was never actually fetched. Distinct from a SITE failure (nav timeout, bad cert,
 # empty body), where we did ask and the site refused. The difference is not
 # cosmetic -- a site failure is a fact about the web and is the correct, permanent
-# outcome for that URL; an infra failure is a fact about THIS machine, and every
-# row it produces is a fabrication that will be re-fetched later. Anything that
-# bulk-populates the cache must count them apart: on 2026-07-20 a warm ran six
-# hours at a 49% error rate that was 100% infra (a Chromium launch failure), wrote
-# 2418 junk rows, and looked healthy the whole way because one undifferentiated
-# counter made it indistinguishable from aggregators being aggregators.
+# outcome for that URL; an infra failure is a fact about THIS machine, and any row
+# it produces is a fabrication. Anything that bulk-populates the cache must count
+# them apart: on 2026-07-20 a warm ran six hours at a 49% error rate that was 100%
+# infra, wrote 2418 junk rows, and looked healthy the whole way because one
+# undifferentiated counter made it indistinguishable from aggregators being
+# aggregators. (Post-mortem: 26 of those were a launch failure and 2413 were the
+# thread-poisoning CASCADE it triggered -- see _pooled_browser.)
 _INFRA_FAILURE_MARKERS = (
     "Executable doesn't exist",
     "asyncio loop",
@@ -254,6 +326,19 @@ def is_infra_failure(response: str) -> bool:
     return any(marker in (response or "") for marker in _INFRA_FAILURE_MARKERS)
 
 
+def is_cacheable(response: str) -> bool:
+    """False for responses that are artifacts of THIS machine, not answers from the web.
+
+    Pass as `store_if=is_cacheable` when wrapping scrape in a Cache. An infra
+    failure means the URL was never fetched, so storing one records a finding that
+    was never made -- and under miss_policy="canned" it would later be REPLAYED as
+    though the page had really answered that way. Not storing it costs nothing: the
+    caller still gets the sentinel (so it can count/abort), and the next pass simply
+    re-fetches a key that was never written.
+    """
+    return not is_infra_failure(response)
+
+
 # Thread-local browser pool: a sync Playwright browser is bound to the thread that
 # created it, so each thread lazily launches its own Chromium and reuses it.
 # _POOL_REGISTRY tracks every (playwright, browser) started so atexit can
@@ -263,9 +348,11 @@ _POOL = threading.local()
 _POOL_REGISTRY: list = []
 _POOL_LOCK = threading.Lock()
 
-# Chromium launch is retried: observed failing with "Executable doesn't exist" for a
-# binary that is present and launches seconds later (transient lock, e.g. an AV scan
-# of the 203 MB executable). Total attempts, and the linear backoff between them.
+# Chromium launch is retried, because "Executable doesn't exist" is also what
+# Playwright says when the binary is present but momentarily unreadable (see
+# _executable_present). Retries apply ONLY to that transient case -- a genuinely
+# absent binary fails immediately, since three attempts and a backoff cannot
+# install it and only multiply the wasted time per URL.
 BROWSER_LAUNCH_ATTEMPTS = 3
 BROWSER_LAUNCH_BACKOFF_S = 1.0
 
@@ -316,11 +403,13 @@ def _pooled_browser():
                 pw.stop()
             except Exception:  # noqa: BLE001 - best effort; re-raising the cause matters more
                 pass
-            # Launch failures here are transient in practice: the binary is present
-            # and launches seconds later, but an AV scanner holding the 203 MB
-            # executable (or both workers launching at once on run start) surfaces as
-            # "Executable doesn't exist". Retry before giving the URL up.
-            if isinstance(exc, PlaywrightError) and attempt < BROWSER_LAUNCH_ATTEMPTS - 1:
+            # Retry only what retrying can fix. `_executable_present(...) is False`
+            # means the binary really is absent -- no amount of backoff installs it,
+            # and retrying just triples the time each URL takes to fail. Anything
+            # else (including a present-but-unreadable binary) is worth another go.
+            permanent = _executable_present(str(exc)) is False
+            if (not permanent and isinstance(exc, PlaywrightError)
+                    and attempt < BROWSER_LAUNCH_ATTEMPTS - 1):
                 time.sleep(BROWSER_LAUNCH_BACKOFF_S * (attempt + 1))
                 continue
             raise
@@ -344,6 +433,31 @@ def _render_pooled(url: str, *, wait: bool, scroll: bool) -> str:
         return _render_on_page(page, url, wait=wait, scroll=scroll)
     finally:
         context.close()
+
+
+def preflight_browser() -> str | None:
+    """Launch this thread's browser now; return None on success or a one-line reason.
+
+    For bulk populators (warm_cache, build_corpus): a browser that cannot launch
+    turns EVERY scrape into an infra failure, and learning that on restaurant 1 is
+    the difference between exiting cleanly and grinding through a whole selection
+    producing nothing. Cheap to call -- the browser it launches is the pooled one
+    this thread would have launched on its first scrape anyway.
+    """
+    try:
+        _pooled_browser()
+        return None
+    except BaseException as exc:  # noqa: BLE001 - reported to the caller, not raised
+        message = str(exc)
+        detail = message.splitlines()[0] if message else type(exc).__name__
+        # Same message, opposite advice -- telling someone to reinstall a browser
+        # that IS installed sends them after a 203 MB red herring.
+        present = _executable_present(message)
+        if present is False:
+            detail = f"{detail}\n  {INSTALL_HINT}"
+        elif present is True:
+            detail = f"{detail}\n  {LOCK_HINT}"
+        return detail
 
 
 def close_pool() -> None:

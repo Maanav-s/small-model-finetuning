@@ -59,7 +59,9 @@ from backends import (  # noqa: E402
     build_search,
     close_pool,
     has_search_key,
+    is_cacheable,
     is_infra_failure,
+    preflight_browser,
 )
 from cache import CANNED, Cache, norm_query, norm_scrape, scrape_status  # noqa: E402
 from corpus import VALID_SPLITS, open_corpus  # noqa: E402
@@ -88,20 +90,17 @@ SKIP_EXTENSIONS = (".pdf", ".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg")
 # A cache hit returns in microseconds; anything slower did real network work.
 NETWORK_CALL_MIN_S = 0.05
 
-# Abort if this many restaurants fail in a row -- a dead Brave key/network
-# should not grind through the whole selection (same pattern as build_corpus).
+# Abort if this many restaurants RAISE in a row. warm_one only raises via search
+# (scrape returns sentinels instead), so this guards a dead Brave key/network --
+# same pattern as build_corpus.
 MAX_CONSECUTIVE_FAILURES = 5
 
-# Infra-failure circuit breaker (see backends.is_infra_failure). MAX_CONSECUTIVE_
-# FAILURES above only counts warm_one *raising*, but a broken browser never raises:
-# scrape returns a sentinel string, warm_one returns a clean summary, and the guard
-# can never fire. That hole let a 100%-infra run grind on for six hours writing 2418
-# junk rows while printing healthy-looking progress. These two triggers close it --
-# the fraction catches a browser that was broken from the start, the consecutive
-# count catches one that dies mid-run.
+# ... and this guards the browser, which never raises: scrape returns a sentinel
+# string, warm_one returns a clean summary, and the guard above can never fire.
+# That hole let a 100%-infra run grind on for six hours while printing healthy
+# progress. A browser that is broken FROM THE START is now caught earlier and more
+# cheaply by preflight_browser(), so this only has to catch one that dies mid-run.
 INFRA_ABORT_CONSECUTIVE = 5   # restaurants in a row whose every scrape failed on infra
-INFRA_ABORT_SAMPLE = 20       # only apply the fraction test once this many scrapes are in
-INFRA_ABORT_FRACTION = 0.8    # ... then abort above this infra share of all scrapes
 
 # One search result renders as "[i] title\n    url\n    desc" (backends.
 # _format_results); the URL is the line immediately after the [i] header.
@@ -203,10 +202,16 @@ def extract_urls(search_response: str, top_n: int) -> tuple[list[str], list[str]
 
 
 def _scrape(scrape_fn, url: str, mode: str, sleep_s: float) -> str:
-    """One cached scrape + a politeness sleep only if it actually hit the network."""
+    """One cached scrape + a politeness sleep only if it actually hit the network.
+
+    An infra failure is slow (a launch retry takes seconds) but contacted nobody,
+    so it must NOT trigger the sleep -- throttling ourselves out of politeness to a
+    server we never reached just makes a broken run take longer to detect.
+    """
     t0 = time.monotonic()
     result = scrape_fn(url, mode)  # cached; each (url, mode) is a distinct key
-    if sleep_s and time.monotonic() - t0 > NETWORK_CALL_MIN_S:
+    hit_network = time.monotonic() - t0 > NETWORK_CALL_MIN_S
+    if sleep_s and hit_network and not is_infra_failure(result):
         time.sleep(sleep_s)
     return result
 
@@ -231,20 +236,20 @@ def warm_one(row: dict, search_fn, scrape_fn, queries: list[str], urls_per_query
     n_urls = n_skipped = n_no_results = 0
     seen_urls: set[str] = set()
 
-    def count(result: str) -> bool:
-        """Tally one finished scrape by cause; True if it failed.
+    def count(result: str) -> str | None:
+        """Tally one finished scrape by cause: 'infra', 'site', or None if it worked.
 
         The infra/site split is the whole point: a site failure is the correct,
         permanent answer for that URL, an infra failure means we never asked.
         """
         nonlocal infra_errors, site_errors
         if scrape_status(result) != "error":
-            return False
+            return None
         if is_infra_failure(result):
             infra_errors += 1
-        else:
-            site_errors += 1
-        return True
+            return "infra"
+        site_errors += 1
+        return "site"
 
     for query in rendered:
         if stop is not None and stop.is_set():
@@ -263,8 +268,15 @@ def warm_one(row: dict, search_fn, scrape_fn, queries: list[str], urls_per_query
             n_urls += 1
             result = _scrape(scrape_fn, url, DIRECT_MODE, sleep_s)
             n_direct += 1
-            direct_failed = count(result)
-            if warm_both or direct_failed or len(result) < WARM_BROWSER_IF_UNDER:
+            cause = count(result)
+            if cause == "infra":
+                # The escalation target IS the broken component -- "direct" already
+                # falls back to a browser render internally, so it failing on infra
+                # means a "browser" call cannot do better. Trying anyway doubled
+                # both the wasted seconds and the junk rows in the 2026-07-20 run
+                # (every URL there has BOTH a direct and a browser failure row).
+                continue
+            if warm_both or cause == "site" or len(result) < WARM_BROWSER_IF_UNDER:
                 bresult = _scrape(scrape_fn, url, BROWSER_MODE, sleep_s)
                 n_browser += 1
                 count(bresult)
@@ -331,21 +343,30 @@ def main():
         return
     if not has_search_key():
         sys.exit("BRAVE_API_KEY is required (repo-root .env)")
+
+    # Fail before queueing work, not on restaurant 1 of 1000. A browser that can't
+    # launch makes EVERY scrape an infra failure, and the circuit breaker below can
+    # only notice that after some rows have already been attempted. One launch here
+    # turns the whole class of "the run was 100% infra" into a clean exit.
+    browser_error = preflight_browser()
+    if browser_error:
+        sys.exit(f"browser preflight failed, refusing to start:\n  {browser_error}")
+
     cache = Cache(args.cache_path, miss_policy="live")
 
     # Exactly the setup_tools wiring: cache wraps the RAW backend closures with
     # the same key fns the agent runs use, so agent-issued identical queries /
-    # url+mode pairs hit the rows warmed here.
+    # url+mode pairs hit the rows warmed here. store_if=is_cacheable keeps
+    # local-browser failures out of the DB entirely (they'd be fabricated rows).
     search_fn = cache.wrap("search", build_search(), key_fn=norm_query, provider="brave")
     scrape_fn = cache.wrap("scrape", build_scrape(), key_fn=norm_scrape,
-                           status_fn=scrape_status, provider="local")
+                           status_fn=scrape_status, provider="local", store_if=is_cacheable)
 
     stop = threading.Event()
     t_start = time.monotonic()
     results, failures = [], []
-    consecutive_failures = 0
+    consecutive_failures = consecutive_infra = 0
     interrupted = False
-    infra_total = scrape_total = consecutive_infra = 0
     aborted: str | None = None
     with ThreadPoolExecutor(max_workers=args.workers) as pool:
         futures = {
@@ -353,6 +374,20 @@ def main():
                         args.urls_per_query, args.sleep, warm_both, stop): row
             for row in selection
         }
+
+        def halt() -> int:
+            """Stop the run: cancel the queue, tell in-flight tasks to bail.
+
+            The `with`-exit is shutdown(wait=True), which does NOT cancel queued
+            work -- it drains the whole backlog first (and workers never see a
+            Ctrl+C). So cancel the queue ourselves and set `stop` so the <= workers
+            in-flight tasks bail between scrapes; the wait then blocks only on
+            those. Cleanup after the block (summary, cache.close, close_pool) still
+            runs either way. Returns how many queued restaurants were cancelled.
+            """
+            stop.set()
+            return sum(1 for f in futures if f.cancel())
+
         try:
             for i, fut in enumerate(as_completed(futures), 1):
                 row = futures[fut]
@@ -364,11 +399,12 @@ def main():
                     failures.append((row["restaurant_id"], row["name"], repr(exc)))
                     consecutive_failures += 1
                     print(f"[{i}/{len(selection)}] FAILED {row['name']!r}: {exc!r}")
+                    # warm_one only raises via SEARCH (scrape returns sentinels
+                    # instead), so this breaker guards Brave -- a dead key or a
+                    # network outage -- while the infra one below guards the browser.
                     if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
-                        print(f"aborting: {consecutive_failures} consecutive failures")
-                        stop.set()
-                        for f in futures:
-                            f.cancel()
+                        aborted = f"{consecutive_failures} consecutive restaurant failures (search)"
+                        halt()
                         break
                     continue
                 consecutive_failures = 0
@@ -380,42 +416,21 @@ def main():
                       f"errors={infra + site} (infra={infra} site={site})"
                       f"{'  (some searches had no results)' if summary['no_results'] else ''}")
 
-                # Circuit breaker: stop a run whose browser is broken. Site errors are
-                # expected and never trip this -- only infra ones, which mean the URLs
-                # were never fetched and every row being written is junk.
-                scrape_total += summary["scrape_calls"]
-                infra_total += infra
+                # Circuit breaker: stop a run whose browser broke MID-RUN (one that
+                # was broken from the start never gets here -- the preflight above
+                # exits first). Site errors are expected and never trip this; only
+                # infra ones, which mean the URLs were never fetched.
                 consecutive_infra = (
                     consecutive_infra + 1 if infra and infra == summary["scrape_calls"] else 0
                 )
                 if consecutive_infra >= INFRA_ABORT_CONSECUTIVE:
                     aborted = (f"{consecutive_infra} restaurants in a row had EVERY scrape "
                                f"fail on a local browser error")
-                elif (scrape_total >= INFRA_ABORT_SAMPLE
-                      and infra_total / scrape_total > INFRA_ABORT_FRACTION):
-                    aborted = (f"{infra_total}/{scrape_total} scrapes "
-                               f"({100 * infra_total / scrape_total:.0f}%) failed on a local "
-                               f"browser error")
-                if aborted:
-                    print(f"\nABORTING: {aborted}.")
-                    print("  These are LOCAL failures, not site failures -- the URLs were never")
-                    print("  fetched, so the rows this run writes are junk. Fix the browser")
-                    print("  (`uv run playwright install chromium`), then re-run: already-warmed")
-                    print("  entries replay from the cache, so nothing good is lost.")
-                    stop.set()
-                    for f in futures:
-                        f.cancel()
+                    halt()
                     break
         except KeyboardInterrupt:
-            # The `with`-exit is shutdown(wait=True), which does NOT cancel queued work
-            # -- it drains the whole backlog first (and workers never see the Ctrl+C). So
-            # cancel the queue ourselves and set `stop` so the <= workers in-flight tasks
-            # bail between scrapes; the wait then blocks only on those. The cleanup below
-            # (summary, cache.close, close_pool) still runs.
             interrupted = True
-            stop.set()
-            cancelled = sum(1 for f in futures if f.cancel())
-            print(f"\ninterrupted: cancelled {cancelled} queued restaurants; waiting for "
+            print(f"\ninterrupted: cancelled {halt()} queued restaurants; waiting for "
                   f"<= {args.workers} in-flight scrape(s) to finish...", flush=True)
 
     if interrupted:
@@ -441,11 +456,8 @@ def main():
         print(f"failed scrapes: {n_infra + n_site}/{n_calls}")
         print(f"  site={n_site}   the site refused us (timeout / bad cert / empty page). "
               f"Expected, and the correct permanent answer for that URL.")
-        print(f"  infra={n_infra}   the LOCAL browser broke -- the URL was never fetched.")
-        if n_infra:
-            print(f"  WARNING: {100 * n_infra / max(1, n_calls):.0f}% of scrape calls failed "
-                  f"locally, so those rows are junk rather than findings. Fix the browser "
-                  f"and re-run to replace them.")
+        print(f"  infra={n_infra}   the LOCAL browser broke -- the URL was never fetched, "
+              f"and nothing was cached for it (just re-run to retry those).")
     print(f"cache: {stats['writes']} entries warmed (writes), {stats['hits']} already cached (hits), "
           f"{stats['misses']} misses")
     if aborted:

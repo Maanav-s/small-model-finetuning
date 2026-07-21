@@ -27,7 +27,7 @@ import asyncio
 import functools
 import re
 
-from backends import build_scrape, build_search
+from backends import build_scrape, build_search, is_cacheable
 from cache import norm_query, norm_scrape, scrape_status
 from prompts import build_system_prompt
 
@@ -203,10 +203,12 @@ def setup_tools(dietary_restrictions=None, variant: str = "teacher", cache=None,
     if cache is not None:
         # scrape is 2-arg (url, mode); norm_scrape keys on BOTH so direct/browser
         # renders are distinct entries. scrape_status marks failure sentinels
-        # 'error' so transient Chromium timeouts aren't frozen into the corpus.
+        # 'error' so transient Chromium timeouts aren't frozen into the corpus, and
+        # is_cacheable drops local-browser failures before they're stored at all.
         search_fn = cache.wrap("search", search_fn, key_fn=norm_query, provider="brave")
         scrape_fn = cache.wrap(
-            "scrape", scrape_fn, key_fn=norm_scrape, status_fn=scrape_status, provider="local"
+            "scrape", scrape_fn, key_fn=norm_scrape, status_fn=scrape_status,
+            provider="local", store_if=is_cacheable,
         )
     tools, registry = build_model_tools(search_fn, scrape_fn, async_tools=async_tools)
     cached = f", cached ({cache.miss_policy}) at {cache.path}" if cache is not None else ""

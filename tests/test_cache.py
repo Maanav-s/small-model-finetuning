@@ -97,6 +97,54 @@ class TestLivePolicy:
         with pytest.raises(ValueError):
             cache.wrap("nonsense", CountingFn(), key_fn=norm_query)
 
+
+# ---------------------------------------------------------------------------
+# store_if: veto STORAGE without vetoing the return value. Used so a broken local
+# browser cannot write rows for URLs it never fetched (backends.is_cacheable).
+# ---------------------------------------------------------------------------
+class TestStoreIf:
+    INFRA = "(scrape failed for u in 'browser' mode: BrowserType.launch: no exe)"
+
+    def test_vetoed_response_is_returned_but_not_stored(self):
+        cache = Cache(":memory:", miss_policy="live")
+        fn = CountingFn(self.INFRA)
+        wrapped = cache.wrap("scrape", fn, key_fn=norm_scrape, status_fn=scrape_status,
+                             store_if=lambda r: "BrowserType.launch" not in r)
+
+        assert wrapped("https://a.test/menu") == self.INFRA  # caller still sees it
+        assert cache._get("scrape", norm_scrape("https://a.test/menu", "direct")) is None
+        assert cache.stats()["writes"] == 0
+
+    def test_vetoed_key_is_refetched_next_pass_self_healing(self):
+        """The whole point: an un-stored key is simply a miss next time, so a run
+        whose browser broke leaves NOTHING behind to clean up or overwrite."""
+        cache = Cache(":memory:", miss_policy="live")
+        responses = iter([self.INFRA, "# Real menu\n- Pad Thai $12"])
+        fn = CountingFn(lambda *a, **k: next(responses))
+        wrapped = cache.wrap("scrape", fn, key_fn=norm_scrape, status_fn=scrape_status,
+                             store_if=lambda r: "BrowserType.launch" not in r)
+
+        wrapped("https://a.test/menu")                      # infra -> not stored
+        assert wrapped("https://a.test/menu").startswith("# Real menu")  # refetched
+        assert fn.calls == 2
+        assert cache._get("scrape", norm_scrape("https://a.test/menu", "direct")) is not None
+
+    def test_allowed_response_stores_normally(self):
+        cache = Cache(":memory:", miss_policy="live")
+        fn = CountingFn("# Real menu\n- Pad Thai $12")
+        wrapped = cache.wrap("scrape", fn, key_fn=norm_scrape, status_fn=scrape_status,
+                             store_if=lambda r: "BrowserType.launch" not in r)
+        wrapped("https://a.test/menu")
+        wrapped("https://a.test/menu")
+        assert fn.calls == 1 and cache.stats()["writes"] == 1
+
+    def test_absent_store_if_stores_everything(self):
+        cache = Cache(":memory:", miss_policy="live")
+        wrapped = cache.wrap("scrape", CountingFn(self.INFRA), key_fn=norm_scrape,
+                             status_fn=scrape_status)
+        wrapped("https://a.test/menu")
+        assert cache.stats()["writes"] == 1  # back-compat: opt-in only
+
     def test_invalid_policy_rejected(self):
         assert set(MISS_POLICIES) == {"live", "canned", "error"}
         with pytest.raises(ValueError):
