@@ -390,42 +390,56 @@ def main():
                             args, cache, teacher_model): e
                 for e in todo
             }
-            for i, fut in enumerate(as_completed(futures), 1):
-                e = futures[fut]
-                row = e["row"]
-                try:
-                    trace = fut.result()
-                    # A trace with no extractable JSON has no training target and
-                    # cannot be stored -- traces.final_json is NOT NULL by design, so
-                    # a menu-less episode is a FAILED episode, not a row. Enforce that
-                    # here (with a legible reason) rather than letting the DB reject it
-                    # with a cryptic IntegrityError. The write is INSIDE this try for
-                    # the same reason: on 2026-07-21 an unguarded main-thread write of
-                    # exactly this None aborted a 2252-episode build after ~50 good
-                    # ones. Both paths are idempotent -- no row is written, so a re-run
-                    # retries the episode.
-                    if trace.get("final_json") is None:
-                        reason = trace.get("parse_error") or "no JSON in final turn"
-                        raise ValueError(f"teacher emitted no parseable menu JSON ({reason})")
-                    cx.write_trace(trace)  # MAIN-THREAD-ONLY write
-                except Exception as exc:  # noqa: BLE001 - one bad episode must not kill the run
-                    failures.append((row["restaurant_id"], row["name"], repr(exc)))
-                    consecutive_failures += 1
-                    print(f"[{i}/{len(todo)}] FAILED {row['name']!r}: {exc!r}")
-                    if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
-                        print(f"aborting: {consecutive_failures} consecutive failures")
-                        for f in futures:
-                            f.cancel()
-                        break
-                    continue
-                consecutive_failures = 0
-                summary = trace_summary(trace, row)
-                results.append(summary)
-                diet = "conditioned" if summary["conditioned"] else "free"
-                print(f"[{i}/{len(todo)}] {summary['name']!r} ({diet}): "
-                      f"schema_valid={summary['schema_valid']} found={summary['found']} "
-                      f"tool_calls={summary['tool_calls']} items={summary['items']} "
-                      f"grounding={trace['grounding']}")
+            # Every episode is submitted up front, and the pool's __exit__ is
+            # shutdown(wait=True) -- which runs every QUEUED future to completion
+            # rather than cancelling it. So ANY exit from this loop that leaves work
+            # queued (the consecutive-failure break, an unhandled crash, or Ctrl+C)
+            # would otherwise silently generate the whole remaining corpus and
+            # discard every result, because the thread that writes them is this loop.
+            # On 2026-07-21 a crash ~50 episodes in did exactly that: the pool ground
+            # through ~1861 more episodes over ~3h and threw them all away. The
+            # `finally` cancels the un-started backlog so shutdown() waits only on the
+            # <= workers already running. On a clean finish it cancels nothing.
+            try:
+                for i, fut in enumerate(as_completed(futures), 1):
+                    e = futures[fut]
+                    row = e["row"]
+                    try:
+                        trace = fut.result()
+                        # A trace with no extractable JSON has no training target and
+                        # cannot be stored -- traces.final_json is NOT NULL by design,
+                        # so a menu-less episode is a FAILED episode, not a row.
+                        # Enforce that here (with a legible reason) rather than letting
+                        # the DB reject it with a cryptic IntegrityError. The write is
+                        # INSIDE this try for the same reason: an unguarded main-thread
+                        # write of exactly this None aborted a 2252-episode build after
+                        # ~50 good ones. Both paths are idempotent -- no row is
+                        # written, so a re-run retries the episode.
+                        if trace.get("final_json") is None:
+                            reason = trace.get("parse_error") or "no JSON in final turn"
+                            raise ValueError(f"teacher emitted no parseable menu JSON ({reason})")
+                        cx.write_trace(trace)  # MAIN-THREAD-ONLY write
+                    except Exception as exc:  # noqa: BLE001 - one bad episode must not kill the run
+                        failures.append((row["restaurant_id"], row["name"], repr(exc)))
+                        consecutive_failures += 1
+                        print(f"[{i}/{len(todo)}] FAILED {row['name']!r}: {exc!r}")
+                        if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                            print(f"aborting: {consecutive_failures} consecutive failures")
+                            break  # the finally cancels the queued backlog
+                        continue
+                    consecutive_failures = 0
+                    summary = trace_summary(trace, row)
+                    results.append(summary)
+                    diet = "conditioned" if summary["conditioned"] else "free"
+                    print(f"[{i}/{len(todo)}] {summary['name']!r} ({diet}): "
+                          f"schema_valid={summary['schema_valid']} found={summary['found']} "
+                          f"tool_calls={summary['tool_calls']} items={summary['items']} "
+                          f"grounding={trace['grounding']}")
+            finally:
+                cancelled = sum(1 for f in futures if f.cancel())
+                if cancelled:
+                    print(f"cancelled {cancelled} queued episode(s) not yet started "
+                          f"(pool exits now instead of draining them)")
 
         print("\n===== corpus build summary =====")
         print(f"episodes completed: {len(results)}  failed: {len(failures)}  "

@@ -7,6 +7,8 @@ that runs against a metered teacher pod) silently did not call it.
 """
 
 import sys
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -154,6 +156,62 @@ class TestNoJsonEpisodeIsNotFatal:
         self._drive(monkeypatch, corpus_path, fake_run_one)
         with open_corpus(corpus_path) as cx:
             assert cx.trace_count() == 0
+
+
+class TestCrashCancelsTheBacklog:
+    """An UNHANDLED crash in the main loop must cancel the QUEUED episodes, not let
+    the pool drain them.
+
+    The per-episode try/except already turns a bad episode into a logged failure,
+    and the consecutive-failure breaker already cancels on abort. The gap the
+    2026-07-21 incident exposed was a crash the inner try does NOT catch -- there,
+    a write raising OUTSIDE it. That fell straight into the pool's __exit__ =
+    shutdown(wait=True), which runs every already-submitted future to completion,
+    so a crash ~50 episodes in generated ~1861 more over ~3h and discarded them all
+    (the writer thread was dead). The finally-cancel closes that gap. Here the
+    uncaught crash is trace_summary raising (it runs after the inner try); the rest
+    of the backlog must be cancelled, so run_one is not called for all of it.
+    """
+
+    def test_unhandled_crash_cancels_the_queue(self, monkeypatch, tmp_path):
+        p = tmp_path / "corpus.sqlite"
+        with open_corpus(p) as cx:
+            cx.upsert_restaurants([
+                {"name": f"R{i}", "city": "C", "source": "osm", "split": "sft"}
+                for i in range(60)
+            ])
+
+        calls = []
+        lock = threading.Lock()
+
+        def slow_run_one(client, episode, tools, registry, system_prompt, args, cache, teacher_model):
+            with lock:
+                calls.append(episode["row"]["restaurant_id"])
+            time.sleep(0.5)   # keep the backlog QUEUED so cancel() can still reach it
+            return _valid_trace(episode["row"]["restaurant_id"])
+
+        def boom_summary(trace, row):
+            raise RuntimeError("bug after the write")   # NOT caught by the per-episode try
+
+        monkeypatch.setenv("BRAVE_API_KEY", "test-key")
+        monkeypatch.setattr(build_corpus, "preflight_browser", lambda: None)
+        monkeypatch.setattr(build_corpus, "openai_build_client", lambda url, **kw: object())
+        monkeypatch.setattr(build_corpus, "setup_tools", lambda *a, **k: ([], {}, "prompt"))
+        monkeypatch.setattr(build_corpus, "run_one", slow_run_one)
+        monkeypatch.setattr(build_corpus, "trace_summary", boom_summary)
+        # workers=2 + a 0.5s episode: only ~2 are running when the crash hits on the
+        # first result, so the other ~58 are still queued and must be cancelled.
+        monkeypatch.setattr(sys, "argv", ["build_corpus.py", "--teacher", "vllm",
+                            "--teacher-model", "teacher", "--db", str(p),
+                            "--cache-path", str(tmp_path / "cache.sqlite"),
+                            "--limit", "60", "--conditioned-frac", "0", "--workers", "2"])
+
+        with pytest.raises(RuntimeError, match="bug after the write"):
+            build_corpus.main()
+
+        # Without the finally-cancel, shutdown(wait=True) drains all 60; with it,
+        # only the handful already running when the crash hit ever start.
+        assert len(calls) < 30, f"backlog drained: run_one ran {len(calls)}/60 times"
 
 
 def _no_json_trace(rid: str) -> dict:
