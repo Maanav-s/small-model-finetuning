@@ -214,6 +214,81 @@ class TestCrashCancelsTheBacklog:
         assert len(calls) < 30, f"backlog drained: run_one ran {len(calls)}/60 times"
 
 
+class TestSyncEvery:
+    """--sync-every N must checkpoint the corpus DB to S3 every N completed episodes
+    (plus a final push for the tail), and never touch S3 when it is off.
+
+    The push itself is mocked (no boto3, no network): what is under test is the
+    build's CADENCE and its fail-fast preflight, not corpus_sync's upload -- that
+    has its own tests. A FakeRemote stands in for the reachability preflight so
+    main() gets past it without a bucket.
+    """
+
+    class _FakeRemote:
+        """Stands in for corpus_sync.S3Remote's preflight head() -- object absent."""
+
+        def __init__(self, *a, **k):
+            pass
+
+        def head(self, rel):
+            return None
+
+    def _drive_with_sync(self, monkeypatch, corpus_path, pushes, *extra):
+        monkeypatch.setenv("BRAVE_API_KEY", "test-key")
+        monkeypatch.setenv("S3_BUCKET", "test-bucket")
+        monkeypatch.setattr(build_corpus, "preflight_browser", lambda: None)
+        monkeypatch.setattr(build_corpus, "openai_build_client", lambda url, **kw: object())
+        monkeypatch.setattr(build_corpus, "setup_tools", lambda *a, **k: ([], {}, "prompt"))
+        monkeypatch.setattr(build_corpus, "S3Remote", self._FakeRemote)  # preflight
+        monkeypatch.setattr(build_corpus, "push_corpus_snapshot",
+                            lambda db: pushes.append(str(db)))
+
+        def fake_run_one(client, episode, tools, registry, system_prompt, args, cache, teacher_model):
+            return _valid_trace(episode["row"]["restaurant_id"])
+
+        monkeypatch.setattr(build_corpus, "run_one", fake_run_one)
+        monkeypatch.setattr(sys, "argv", _argv(corpus_path, "--conditioned-frac", "0",
+                                               "--workers", "1", *extra))
+        build_corpus.main()
+
+    def test_pushes_on_interval_plus_final(self, monkeypatch, tmp_path):
+        p = tmp_path / "corpus.sqlite"
+        with open_corpus(p) as cx:
+            cx.upsert_restaurants([
+                {"name": f"R{i}", "city": "C", "source": "osm", "split": "sft"}
+                for i in range(4)
+            ])
+        pushes: list[str] = []
+        self._drive_with_sync(monkeypatch, p, pushes, "--limit", "4", "--sync-every", "2")
+        # Interval fires at 2 and 4 completed episodes, then one final tail push.
+        assert len(pushes) == 3
+        assert all(db == str(p) for db in pushes)
+
+    def test_off_by_default_never_pushes(self, monkeypatch, tmp_path):
+        p = tmp_path / "corpus.sqlite"
+        with open_corpus(p) as cx:
+            cx.upsert_restaurants([
+                {"name": f"R{i}", "city": "C", "source": "osm", "split": "sft"}
+                for i in range(3)
+            ])
+        pushes: list[str] = []
+        self._drive_with_sync(monkeypatch, p, pushes, "--limit", "3")  # no --sync-every
+        assert pushes == []
+
+    def test_missing_bucket_fails_fast_before_any_episode(self, monkeypatch, corpus_path):
+        """A --sync-every run with no S3_BUCKET must exit BEFORE spending on the
+        teacher, not discover the misconfig 500 episodes in."""
+        monkeypatch.delenv("S3_BUCKET", raising=False)
+        monkeypatch.setenv("BRAVE_API_KEY", "test-key")
+        monkeypatch.setattr(build_corpus, "preflight_browser", lambda: None)
+        monkeypatch.setattr(build_corpus, "openai_build_client", lambda url, **kw: object())
+        monkeypatch.setattr(build_corpus, "run_one", _boom)  # reaching an episode = failure
+        monkeypatch.setattr(sys, "argv", _argv(corpus_path, "--sync-every", "2"))
+        with pytest.raises(SystemExit) as exc:
+            build_corpus.main()
+        assert "S3_BUCKET" in str(exc.value)
+
+
 def _no_json_trace(rid: str) -> dict:
     """What run_one really returns when extract_json found nothing: a FULLY-formed
     trace whose only defect is final_json=None. Faithful on purpose -- with every

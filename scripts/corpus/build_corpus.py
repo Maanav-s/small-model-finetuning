@@ -50,11 +50,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-# Shared modules live in src/; the teacher loops in src/claude and src/serving
-# (flat-import, script-run convention -- see CLAUDE.md).
+# Shared modules live in src/; the teacher loops in src/claude and src/serving;
+# the S3 sync helper (for --sync-every) in scripts/infra (flat-import, script-run
+# convention -- see CLAUDE.md).
 sys.path.insert(0, str(REPO_ROOT / "src"))
 sys.path.insert(0, str(REPO_ROOT / "src" / "claude"))
 sys.path.insert(0, str(REPO_ROOT / "src" / "serving"))
+sys.path.insert(0, str(REPO_ROOT / "scripts" / "infra"))
 
 import anthropic  # noqa: E402
 import jsonschema  # noqa: E402
@@ -66,6 +68,7 @@ from backends import preflight_browser  # noqa: E402
 from cache import Cache  # noqa: E402
 from claude_agent import MODEL_ID, run_episode as claude_run_episode  # noqa: E402
 from corpus import open_corpus, trace_id_for  # noqa: E402
+from corpus_sync import DEFAULT_PREFIX, SQLITE_ARTIFACTS, S3Remote, do_push  # noqa: E402
 from episodes import MAX_CONSECUTIVE_FAILURES, plan_episodes, seeded_order  # noqa: E402
 from grounding import grounding_for_trace  # noqa: E402
 from openai_agent import build_client as openai_build_client  # noqa: E402
@@ -119,6 +122,15 @@ def parse_args():
     parser.add_argument("--cache-path", default=str(REPO_ROOT / "data" / "cache.sqlite"))
     parser.add_argument("--db", type=Path, default=REPO_ROOT / "data" / "corpus.sqlite",
                         help="corpus.sqlite path (default data/corpus.sqlite)")
+    parser.add_argument("--sync-every", type=int, default=0, metavar="N",
+                        help="push the corpus DB to S3 every N completed episodes (0 = off, "
+                             "the default), checkpointing teacher work OFF the pod so a crash "
+                             "or teardown can't lose more than the last N traces. Reuses "
+                             "corpus_sync's WAL-safe snapshot + skip-unchanged guard; a "
+                             "mid-build push failure is logged, NOT fatal (traces are already "
+                             "committed locally). Requires S3_BUCKET (+ AWS creds) in the "
+                             "environment -- reachability is preflighted before the first "
+                             "episode. Only the corpus DB is synced, never the (large) cache.")
     parser.add_argument("--seed", type=int, default=42, help="selection-order seed (default 42; keep fixed)")
     parser.add_argument("--list", action="store_true",
                         help="print the planned episodes and exit (no API calls)")
@@ -305,6 +317,25 @@ def trace_summary(trace: dict, row: dict) -> dict:
     }
 
 
+def push_corpus_snapshot(db_path: Path) -> None:
+    """Push the corpus DB to S3 in place -- the --sync-every checkpoint.
+
+    Reuses corpus_sync's WAL-safe VACUUM INTO snapshot + skip-unchanged guard, so a
+    mid-build checkpoint uploads a torn-write-free copy and re-uploads nothing when
+    no new traces landed since the last push. Raises on misconfiguration (no bucket,
+    wrong filename); the CALLER catches network/AWS errors so one failed checkpoint
+    never kills a metered build (the traces are already committed to the local DB)."""
+    bucket = os.environ.get("S3_BUCKET", "").strip()
+    if not bucket:
+        raise RuntimeError("S3_BUCKET is unset (repo-root .env or environment)")
+    if db_path.name not in SQLITE_ARTIFACTS:
+        raise RuntimeError(f"--sync-every needs a db named one of {SQLITE_ARTIFACTS}, "
+                           f"got {db_path.name!r}")
+    prefix = os.environ.get("S3_PREFIX", DEFAULT_PREFIX).strip()
+    remote = S3Remote(bucket, prefix)
+    do_push(remote, db_path.parent, [db_path.name], dry_run=False)
+
+
 def main():
     args = parse_args()
 
@@ -363,6 +394,25 @@ def main():
             browser_error = preflight_browser()
             if browser_error:
                 sys.exit(f"browser preflight failed, refusing to start:\n  {browser_error}")
+
+        # Same "fail before the first episode" discipline for --sync-every: verify
+        # the DB name is syncable and S3 is reachable NOW, not after 500 episodes of
+        # silently-dropped checkpoints. head_object needs only s3:GetObject; a
+        # missing object returns None (fine), bad creds / no access raise here.
+        if args.sync_every:
+            if args.db.name not in SQLITE_ARTIFACTS:
+                sys.exit(f"--sync-every needs --db named one of {SQLITE_ARTIFACTS}, "
+                         f"got {args.db.name!r}")
+            bucket = os.environ.get("S3_BUCKET", "").strip()
+            if not bucket:
+                sys.exit("--sync-every requires S3_BUCKET (repo-root .env or environment)")
+            prefix = os.environ.get("S3_PREFIX", DEFAULT_PREFIX).strip()
+            try:
+                S3Remote(bucket, prefix).head(args.db.name)
+            except Exception as exc:  # noqa: BLE001 -- surface an unreachable bucket up front
+                sys.exit(f"--sync-every preflight failed (cannot reach S3): {exc!r}")
+            print(f"sync: --sync-every {args.sync_every} -> s3://{bucket}/{prefix}/{args.db.name} "
+                  f"(corpus DB only; cache is not synced here)")
 
         cache = Cache(args.cache_path, miss_policy=args.cache_policy)
         # Tools/registry are restriction-independent; only the system prompt embeds
@@ -435,6 +485,20 @@ def main():
                           f"schema_valid={summary['schema_valid']} found={summary['found']} "
                           f"tool_calls={summary['tool_calls']} items={summary['items']} "
                           f"grounding={trace['grounding']}")
+
+                    # Periodic S3 checkpoint: every N written traces, push the corpus
+                    # DB off the pod. A failed push is logged, not raised -- the traces
+                    # are already committed locally, and the next checkpoint (or the
+                    # final push) retries. Runs on the main thread between futures, so
+                    # the snapshot reader never races the (also main-thread) writer.
+                    if args.sync_every and len(results) % args.sync_every == 0:
+                        try:
+                            push_corpus_snapshot(args.db)
+                            print(f"[sync] checkpoint: pushed {args.db.name} to S3 "
+                                  f"after {len(results)} episodes")
+                        except Exception as exc:  # noqa: BLE001 - a failed checkpoint must not kill the build
+                            print(f"[sync] WARNING: checkpoint push failed after "
+                                  f"{len(results)} episodes: {exc!r}")
             finally:
                 cancelled = sum(1 for f in futures if f.cancel())
                 if cancelled:
@@ -455,6 +519,16 @@ def main():
             print(f"  FAILED {rid} {name!r}: {err}")
         print(f"cache stats: {cache.stats()}")
         print(f"corpus traces: {cx.trace_count()} total")
+
+        # Final checkpoint so the tail (< sync-every traces since the last push) also
+        # lands in S3. Skipped as unchanged if the last interval push already covered
+        # it; still best-effort so a failure here can't mask a successful build.
+        if args.sync_every and results:
+            try:
+                push_corpus_snapshot(args.db)
+                print(f"[sync] final push: {args.db.name} -> S3")
+            except Exception as exc:  # noqa: BLE001
+                print(f"[sync] WARNING: final push failed: {exc!r}")
         cache.close()
 
 
