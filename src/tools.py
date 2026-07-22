@@ -34,18 +34,20 @@ from prompts import build_system_prompt
 # ---------------------------------------------------------------------------
 # Shared output bound
 # ---------------------------------------------------------------------------
-# Hard cap on a single tool result before it enters the message history. Sized to
-# bound CONTEXT GROWTH: the vLLM teacher accumulates EVERY tool result in one
-# prompt, so at ~3.3 chars/token a 24K-char cap is ~7K tokens and even a full
-# tool-call budget of scrapes stays inside the served window. An uncapped 75K-char
-# page was ~19K tokens, and a few of those overflowed the context (the corpus
-# build's context-length 400s -- see notes/experiments.md 2026-07-19). A typical
-# menu page still fits intact (Pagliacci's full order page was ~16K chars); a blind
-# char cap can clip the tail of an unusually long menu, so a hit is warned about
-# (below) -- never silent. Retunable without re-scraping (the cache stores the raw
-# uncapped response; see setup_tools). Paired with the output-budget clamp +
-# overflow-finalize in serving/openai_agent.run_episode as the safety net.
-MAX_TOOL_CHARS = 24000
+# Hard cap on a single tool result before it enters the message history. At ~3.3
+# chars/token a 100K-char cap is ~30K tokens. The vLLM TEACHER accumulates every
+# tool result in one prompt, but it serves a 131,072-token window (serve_teacher.sh)
+# with a per-call output-budget clamp + context-overflow finalize in
+# serving/openai_agent.run_episode, so even a full budget of large scrapes degrades
+# to a partial menu rather than the hard context-length 400 the old 24K cap was set
+# to dodge (see notes/experiments.md 2026-07-19). Raised from 24K so the teacher
+# reads long menus WHOLE instead of losing the tail. A blind char cap can still clip
+# an unusually long page, so a hit is WARNED about (below), never silent. Retunable
+# without re-scraping: the cache stores the raw response (bounded only by
+# cache.MAX_STORED_CHARS = 400K, always >> this), so the STUDENT's SFT cap can be
+# LOWERED independently at build time (analyze_tool_chars.py) to keep its shorter
+# training window in budget -- this value is the teacher-build read cap.
+MAX_TOOL_CHARS = 100000
 
 
 # ---------------------------------------------------------------------------
