@@ -136,6 +136,20 @@ def scrape_status(response: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Stored-response bound (general storage rule)
+# ---------------------------------------------------------------------------
+# A cache row never persists more than this many characters of response. The
+# read-time MAX_TOOL_CHARS cap (tools.py) already bounds what the AGENT sees; this
+# bounds what the cache STORES, so one pathological page cannot bloat the shared
+# cache.sqlite (a single 14M-char PDF scrape helped push the pilot cache to 2.15
+# GB). Kept well ABOVE MAX_TOOL_CHARS so the stored row still contains everything
+# any read-time cap would surface -- lowering the read cap stays retunable without
+# re-scraping. _set enforces it on every new write; clip_oversized() retro-applies
+# it to a cache built before the rule (then vacuum() reclaims the freed pages).
+MAX_STORED_CHARS = 400_000
+
+
+# ---------------------------------------------------------------------------
 # Cache
 # ---------------------------------------------------------------------------
 _SCHEMA = """
@@ -203,6 +217,11 @@ class Cache:
             return cur.fetchone()
 
     def _set(self, namespace, key, args, response, provider, status):
+        # General storage rule (see MAX_STORED_CHARS): never persist a monster
+        # response. `status` was already classified on the FULL response by the
+        # caller, so a huge page is still 'ok'; only the STORED text is bounded.
+        if response is not None and len(response) > MAX_STORED_CHARS:
+            response = response[:MAX_STORED_CHARS]
         row = (
             self._key_hash(namespace, key), namespace, key, json.dumps(args),
             response, provider, status, self.cache_version,
@@ -291,6 +310,41 @@ class Cache:
                 "miss_policy": self.miss_policy,
                 "cache_version": self.cache_version,
             }
+
+    def clip_oversized(self, max_chars: int = MAX_STORED_CHARS, *, dry_run: bool = False) -> dict:
+        """Retro-apply the MAX_STORED_CHARS storage rule to rows already stored.
+
+        Clips every response longer than `max_chars` to its first `max_chars`
+        characters -- the same bound _set now enforces on write -- so a cache built
+        before the rule can be cleaned in place. Returns a report
+        {'rows', 'chars_removed', 'largest_before', 'max_chars', 'applied'}; a
+        dry_run reports the same counts without mutating. The UPDATE only frees
+        pages INSIDE the file; call vacuum() afterward to actually shrink it on disk.
+        """
+        with self._lock:
+            n, removed, largest = self._conn.execute(
+                "SELECT count(*), coalesce(sum(length(response) - ?), 0), "
+                "coalesce(max(length(response)), 0) "
+                "FROM cache WHERE length(response) > ?",
+                (max_chars, max_chars),
+            ).fetchone()
+            if n and not dry_run:
+                self._conn.execute(
+                    "UPDATE cache SET response = substr(response, 1, ?) "
+                    "WHERE length(response) > ?",
+                    (max_chars, max_chars),
+                )
+                self._conn.commit()
+        return {
+            "rows": int(n), "chars_removed": int(removed), "largest_before": int(largest),
+            "max_chars": max_chars, "applied": bool(n and not dry_run),
+        }
+
+    def vacuum(self) -> None:
+        """Rebuild the db file to reclaim pages freed by clip_oversized (VACUUM).
+        Needs free disk roughly equal to the current db size for the temp copy."""
+        with self._lock:
+            self._conn.execute("VACUUM")
 
     def close(self):
         # Fold the WAL back into the main db and truncate the -wal sidecar so a

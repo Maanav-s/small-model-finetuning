@@ -16,6 +16,7 @@ import pytest
 # the entry scripts.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
+import cache as cache_mod  # noqa: E402
 from cache import (  # noqa: E402
     CANNED,
     MIN_CONTENT_CHARS,
@@ -486,3 +487,83 @@ class TestStats:
         wrapped("a"), wrapped("a")
         assert cache.stats()["misses"] == 2
         assert cache.stats()["writes"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Stored-response clip (MAX_STORED_CHARS): the general storage rule + its
+# retro-apply. One 14M-char PDF scrape helped bloat the pilot cache to 2.15 GB,
+# so a monster response is bounded ON WRITE, and a cache built before the rule is
+# cleaned in place by clip_oversized().
+# ---------------------------------------------------------------------------
+class TestStoredResponseClip:
+    def test_write_clips_stored_row_but_caller_sees_full_response(self, monkeypatch):
+        # A small bound so the test is cheap; _set reads the module global.
+        monkeypatch.setattr(cache_mod, "MAX_STORED_CHARS", 100)
+        cache = Cache(":memory:", miss_policy="live")
+        big = "x" * 250
+        wrapped = cache.wrap("search", CountingFn(big), key_fn=norm_query)
+
+        assert wrapped("q") == big  # the LIVE caller still gets the full response
+        # ... but only the first MAX_STORED_CHARS chars were persisted.
+        assert cache._get("search", norm_query("q"))["response"] == "x" * 100
+        assert wrapped("q") == "x" * 100  # a later HIT serves the clipped copy
+
+    def test_write_leaves_status_classified_on_full_response(self, monkeypatch):
+        # A page far over the bound is still 'ok' -- status is classified before the
+        # clip, so a big real page is never miscounted as 'empty'.
+        monkeypatch.setattr(cache_mod, "MAX_STORED_CHARS", 100)
+        cache = Cache(":memory:", miss_policy="live")
+        wrapped = cache.wrap("scrape", CountingFn("m" * 5000), key_fn=norm_scrape,
+                             status_fn=scrape_status)
+        wrapped("https://x.com/menu")
+        assert cache._get("scrape", norm_scrape("https://x.com/menu", "direct"))["status"] == "ok"
+
+    def test_under_bound_response_stored_intact(self, monkeypatch):
+        monkeypatch.setattr(cache_mod, "MAX_STORED_CHARS", 100)
+        cache = Cache(":memory:", miss_policy="live")
+        cache.wrap("search", CountingFn("y" * 80), key_fn=norm_query)("q")
+        assert cache._get("search", norm_query("q"))["response"] == "y" * 80
+
+    def test_clip_oversized_retro_clips_only_over_bound_rows(self):
+        cache = Cache(":memory:", miss_policy="live")
+        for i, n in enumerate((50, 300, 500)):
+            cache.wrap("search", CountingFn("z" * n), key_fn=norm_query)(f"q{i}")
+
+        report = cache.clip_oversized(max_chars=100)
+        assert report["rows"] == 2  # only the 300 and 500 rows exceed 100
+        assert report["chars_removed"] == (300 - 100) + (500 - 100)
+        assert report["largest_before"] == 500
+        assert report["applied"] is True
+        assert len(cache._get("search", norm_query("q0"))["response"]) == 50   # untouched
+        assert len(cache._get("search", norm_query("q1"))["response"]) == 100  # clipped
+        assert len(cache._get("search", norm_query("q2"))["response"]) == 100  # clipped
+
+    def test_clip_oversized_is_idempotent(self):
+        cache = Cache(":memory:", miss_policy="live")
+        cache.wrap("search", CountingFn("z" * 500), key_fn=norm_query)("q")
+        cache.clip_oversized(max_chars=100)
+        again = cache.clip_oversized(max_chars=100)
+        assert again["rows"] == 0 and again["applied"] is False
+
+    def test_clip_oversized_dry_run_reports_without_mutating(self):
+        cache = Cache(":memory:", miss_policy="live")
+        cache.wrap("search", CountingFn("z" * 500), key_fn=norm_query)("q")
+
+        report = cache.clip_oversized(max_chars=100, dry_run=True)
+        assert report["rows"] == 1 and report["applied"] is False
+        # the row is untouched
+        assert len(cache._get("search", norm_query("q"))["response"]) == 500
+
+    def test_vacuum_shrinks_after_clip(self, tmp_path):
+        path = str(tmp_path / "big.sqlite")
+        cache = Cache(path, miss_policy="live")
+        for i in range(20):
+            cache.wrap("search", CountingFn("z" * 20000), key_fn=norm_query)(f"q{i}")
+        cache.close()
+        big_size = Path(path).stat().st_size
+
+        cache = Cache(path, miss_policy="live")
+        assert cache.clip_oversized(max_chars=100)["rows"] == 20
+        cache.vacuum()  # must not raise; reclaims the freed pages
+        cache.close()
+        assert Path(path).stat().st_size < big_size
