@@ -395,6 +395,19 @@ def main():
                 row = e["row"]
                 try:
                     trace = fut.result()
+                    # A trace with no extractable JSON has no training target and
+                    # cannot be stored -- traces.final_json is NOT NULL by design, so
+                    # a menu-less episode is a FAILED episode, not a row. Enforce that
+                    # here (with a legible reason) rather than letting the DB reject it
+                    # with a cryptic IntegrityError. The write is INSIDE this try for
+                    # the same reason: on 2026-07-21 an unguarded main-thread write of
+                    # exactly this None aborted a 2252-episode build after ~50 good
+                    # ones. Both paths are idempotent -- no row is written, so a re-run
+                    # retries the episode.
+                    if trace.get("final_json") is None:
+                        reason = trace.get("parse_error") or "no JSON in final turn"
+                        raise ValueError(f"teacher emitted no parseable menu JSON ({reason})")
+                    cx.write_trace(trace)  # MAIN-THREAD-ONLY write
                 except Exception as exc:  # noqa: BLE001 - one bad episode must not kill the run
                     failures.append((row["restaurant_id"], row["name"], repr(exc)))
                     consecutive_failures += 1
@@ -406,7 +419,6 @@ def main():
                         break
                     continue
                 consecutive_failures = 0
-                cx.write_trace(trace)  # MAIN-THREAD-ONLY write
                 summary = trace_summary(trace, row)
                 results.append(summary)
                 diet = "conditioned" if summary["conditioned"] else "free"
