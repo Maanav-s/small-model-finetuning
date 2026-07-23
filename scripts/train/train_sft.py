@@ -194,7 +194,9 @@ def build_labels(tokenizer, tools, messages: list[dict], tool_response_open_id: 
 # ---------------------------------------------------------------------------
 def load_rows(path: str) -> list[dict]:
     rows = []
-    with open(path) as f:
+    # build_sft.py writes UTF-8; read it as UTF-8 explicitly so a non-UTF-8
+    # platform locale (e.g. Windows cp1252) can't mis-decode accented names.
+    with open(path, encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if line:
