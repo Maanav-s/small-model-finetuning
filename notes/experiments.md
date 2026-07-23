@@ -5,7 +5,7 @@ at the top. Each entry: what ran, the config that matters, the numbers, the take
 where the artifacts live (S3 is the source of truth — pods are ephemeral).
 
 Conventions:
-- **Eval plan** is the seed-reproducible mix from `scripts/build_corpus.py` (`load_seeded_rows` →
+- **Eval plan** is the seed-reproducible mix from `scripts/corpus/build_corpus.py` (`load_seeded_rows` →
   `plan_episodes`): `--split eval --seed 42 --conditioned-frac 0.4`, rendered with the **student**
   prompt (what we ship). Same plan across models → per-episode filenames line up.
 - **Self-report** metrics (no teacher reference): `schema-valid %`, `found=true %`, `mean items`.
@@ -237,7 +237,7 @@ misattributed before. **None of them was `head_dim=512`.**
 so the CLI cannot express the constraint at all. The **REST API** (`POST rest.runpod.io/v1/pods`)
 takes **`allowedCudaVersions: ["13.0"]`**. With it, the *same* `cu1281` image booted on
 **driver 580.126.20 / CUDA 13.0** — proving the image never mattered; only the host filter does.
-Now wrapped in [scripts/runpod_create.py](../scripts/runpod_create.py).
+Now wrapped in [scripts/infra/runpod_create.py](../scripts/infra/runpod_create.py).
 
 **2. FA4 is Hopper-only — but that is NOT fatal.** The H200 logged `Using FA4 for all layers`;
 the A100 logs:
@@ -397,7 +397,7 @@ slice is lower-item by design (dietary filtering removes items).
 text path). **LoRA** r16 / α32, scoped by regex to the **`language_model`** submodules only (PEFT can't
 adapt the towers' `Gemma4ClippableLinear`) → 258 modules, ~34.9M trainable params.
 **Data:** `v1/sft/train.jsonl` (948 examples; **786 kept at `--max-length 32768`**, ~83%), eval-frac 0.05.
-**Trainer:** `scripts/train_sft.py`, 3 epochs, per-device batch 1 × grad-accum 8, `attn=sdpa`, bf16.
+**Trainer:** `scripts/train/train_sft.py`, 3 epochs, per-device batch 1 × grad-accum 8, `attn=sdpa`, bf16.
 **Hardware:** 1× H200 (RunPod). Single-run, no length ramp (per decision to start at 32k).
 
 **Bound diagnosis:** **memory-bound, not param-bound.** Peak memory is dominated by the training loss
@@ -495,7 +495,7 @@ doc has flagged since day one:
 3. **Our merged checkpoints can't be served on vLLM's multimodal path at all**:
    `train_sft._save_outputs` saves model+tokenizer only, so there is no `preprocessor_config.json`
    and vLLM's `AutoProcessor` dies. Neither the S3 base copy nor the HF cache has that file.
-   **Fix: `scripts/to_text_only.py`** rebuilds a text-only `Gemma4ForCausalLM` from the multimodal
+   **Fix: `scripts/train/to_text_only.py`** rebuilds a text-only `Gemma4ForCausalLM` from the multimodal
    checkpoint (verified `missing=0 unexpected=0`, 7.46B params, towers dropped) — which is what the
    design doc wanted anyway ("we never use the vision/audio towers") and needs no processor.
 

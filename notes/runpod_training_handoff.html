@@ -63,6 +63,16 @@
 <p class="lede">Fine-tune <code>google/gemma-4-E4B-it</code> (LoRA / bf16) on the menu-extraction SFT corpus, on a
 single H100 SXM, then push the adapter + merged model to S3. <span class="pill">for the setup agent</span></p>
 
+<div class="box crit">
+<span class="lbl">Superseded — historical v1 handoff</span>
+This is a point-in-time snapshot of the <b>v1</b> SFT run (branch <code>phase2-caching</code>, the <code>v1/</code> S3 prefix,
+the loose <code>restaurants.jsonl</code>/<code>splits.json</code>/<code>traces/</code> data layout, and the flat
+<code>scripts/*.py</code>). That run is <b>done</b> — see the v1 SFT entry in <a href="experiments.md">experiments.md</a>.
+For the <b>current</b> SFT run use <a href="runpod_sft.md">notes/runpod_sft.md</a>; for the v2 pipeline and script layout
+see <a href="../CLAUDE.md">CLAUDE.md</a>. The paths, teacher (now the self-hosted Qwen3-235B, not Sonnet), and data
+files below are <b>not</b> current — kept only as the historical record.
+</div>
+
 <div class="box ok">
 <span class="lbl">Mission in one line</span>
 Provision 1× H100 SXM on RunPod, rebuild the SFT dataset from the S3 corpus, run <code>scripts/train_sft.py</code>,

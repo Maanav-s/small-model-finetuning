@@ -1,5 +1,20 @@
 # Phase 2 — Tool-call caching & training-corpus construction
 
+> **Superseded for data layout & script paths — see [v2_rebuild_plan.md](v2_rebuild_plan.md).**
+> This is the Phase-2 (v1) plan, kept as the historical record of the 1000-trace corpus
+> build; its caching design, workstream rationale, and SFT recipe still apply. Two things
+> below no longer match the current repo. **(1) Data files → one DB:** the loose `data/`
+> files it plans (`restaurants.jsonl`, `splits.json`, `traces/<id>.json`, and `labels.jsonl`
+> — the last was never built) were consolidated into the single **`data/corpus.sqlite`**
+> (via [src/corpus.py](../src/corpus.py)); `data/cache.sqlite` stays separate. **(2) Flat
+> scripts → `scripts/<stage>/`:** the proposed `scripts/*.py` were regrouped under `corpus/`,
+> `datasets/`, `train/`, `eval/`, `analysis/`, `infra/` — e.g. `harvest_restaurants.py →
+> corpus/harvest.py`, `build_corpus.py → corpus/build_corpus.py`, `build_sft.py →
+> datasets/build_sft.py`, `cache_sync.py → infra/corpus_sync.py`, `eval_menu.py` +
+> `eval_split.py → eval/eval.py`; `label_findability.py` was retired (findability is now a
+> derived field). The v1 teacher below (Claude Sonnet) is now the self-hosted Qwen3-235B
+> vLLM teacher. See [v2_rebuild_plan.md](v2_rebuild_plan.md) §7 for the full mapping.
+
 Phase 1 gave us a working agentic loop (`restaurant name -> menu JSON`) for both
 Gemma ([src/gemma/agent.py](../src/gemma/agent.py)) and the Claude baseline
 ([src/claude/claude_agent.py](../src/claude/claude_agent.py)), backed by live

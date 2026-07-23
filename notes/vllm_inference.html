@@ -73,8 +73,19 @@ The same vLLM serving layer also fixes the Gemma student's inference bottleneck.
 <code>head_dim=512</code> attention on non-Hopper GPUs — validate that first.
 </div>
 
+<div class="box ok">
+<span class="lbl">Outcome (2026-07) — built as designed</span>
+This plan was executed. The <code>head_dim=512</code> risk flagged above turned out to be a <b>NON-issue on
+vLLM</b> — it serves Gemma-4's mixed 256/512 heads on Hopper (FA4) and on Ampere (TRITON_ATTN); the FA2/SDPA
+saga is an HF-only problem (see §6 and CLAUDE.md "Hardware constraints"). The self-hosted teacher was built as
+<code>Qwen/Qwen3-235B-A22B-Instruct-2507-FP8</code> on 4×H100 (TP=4) and generated the v2 corpus (2233 traces).
+The model-choice tables and risk framing below are the original design reasoning, kept intact; for the as-built
+pipeline and serving gotchas see <a href="../CLAUDE.md">CLAUDE.md</a> "vLLM serving" and
+<a href="experiments.md">experiments.md</a>.
+</div>
+
 <h2>0 · Why this is clean to do here</h2>
-<p>The pipeline already decouples the teacher's wire format from the student. <code>scripts/build_sft.py</code>
+<p>The pipeline already decouples the teacher's wire format from the student. <code>scripts/datasets/build_sft.py</code>
 re-templates every captured trace into Gemma's native tool format, and the SFT/GRPO target is
 <b>tool-call semantics + the final JSON</b> — not the teacher's token stream. The Claude baseline is the existing
 proof: <code>to_anthropic_tools</code> in <a href="../src/claude/claude_agent.py">src/claude/claude_agent.py</a>
@@ -160,7 +171,7 @@ def _callable_to_openai(fn) -&gt; dict:
 
 def to_openai_tools(tools): return [_callable_to_openai(t) for t in tools]</code></pre>
 
-<h3>4b · The loop (<code>src/vllm/openai_agent.py</code>)</h3>
+<h3>4b · The loop (<code>src/serving/openai_agent.py</code>)</h3>
 <pre><code>from openai import OpenAI
 
 def run_episode(client, model, restaurant_name, tools, registry, system_prompt,
@@ -253,7 +264,7 @@ fail on Ampere with XFORMERS" caveat that stood here is <b>obsolete</b>.</div>
   <code>train_sft._save_outputs</code> saves model + tokenizer only, so there is no
   <code>preprocessor_config.json</code>; vLLM sees <code>Gemma4ForConditionalGeneration</code>, calls
   <code>AutoProcessor</code>, and dies. Neither the S3 base copy nor the HF cache carries that file.
-  <b>Fix: <code>scripts/to_text_only.py</code></b> rebuilds a text-only <code>Gemma4ForCausalLM</code> from the
+  <b>Fix: <code>scripts/train/to_text_only.py</code></b> rebuilds a text-only <code>Gemma4ForCausalLM</code> from the
   multimodal checkpoint (verified <code>missing=0 unexpected=0</code>; 7.46B params, towers dropped). That is the
   class to target anyway — we never use the vision/audio towers — and it needs no processor.</li>
 </ol></div>
@@ -320,9 +331,9 @@ concurrently and removes the single-worker eval bottleneck. Gate everything on t
 serve check and a 30–50-episode teacher-quality comparison against the Sonnet baseline already on disk.
 </div>
 
-<p class="small">Implementation surface, when greenlit: new <code>src/vllm/openai_agent.py</code>
+<p class="small">Implementation surface, when greenlit: new <code>src/serving/openai_agent.py</code>
 (<code>to_openai_tools</code> + <code>run_episode</code>), a <code>--model vllm</code> branch +
-<code>--base-url</code>/<code>--served-model-name</code> in <a href="../scripts/eval_split.py">eval_split.py</a>
+<code>--base-url</code>/<code>--served-model-name</code> in <a href="../scripts/eval/eval.py">eval_split.py</a>
 (and do <b>not</b> force <code>workers=1</code> for it), and a <code>vllm</code> extra in
 <code>pyproject.toml</code>. The Gemma-serve swap is a one-function change to <code>generate_turn</code> in
 <a href="../src/gemma/agent.py">agent.py</a> guarded behind a flag/env so the HF path stays the default.</p>

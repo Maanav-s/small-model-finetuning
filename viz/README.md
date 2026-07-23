@@ -1,23 +1,31 @@
-# viz — local menu visualizer
+# viz — local web tools
 
-A tiny, self-contained web app that puts a face on the Phase 1 agent loop: type a
-restaurant name, the Gemma model runs the same `run_episode` the CLI uses, and the
-returned menu JSON is rendered as a styled menu page in the browser.
+Two small, self-contained FastAPI apps that put a face on the pipeline. Both import
+from `src/`, add nothing the training/eval pipeline depends on, and have no build
+step (plain HTML + vanilla JS) — deleting `viz/` leaves the rest of the project
+untouched.
 
-This folder is **demo/visualization only**. It imports the engine from `src/` but
-adds nothing the training/eval pipeline depends on — deleting `viz/` leaves the
-rest of the project untouched.
+- **Menu visualizer ([server.py](server.py))** — type a restaurant name, the Gemma
+  (or Claude) agent runs the same `run_episode` the CLI uses, and the returned menu
+  JSON is rendered as a styled menu page. Loads the model + tools in-process.
+- **Trace review tool ([review.py](review.py))** — page through the corpus's
+  captured teacher traces one at a time and mark each **keep** or **reject**. Loads
+  **no** model/torch/tools/network — it only reads/writes `data/corpus.sqlite`.
 
 ## Layout
 
 ```
 viz/
-  server.py          # FastAPI backend: loads the model once, serves the API + page
-  static/index.html  # frontend: query box -> fetch -> rendered menu (vanilla JS)
-  README.md          # this file
+  server.py            # menu visualizer backend (loads the model, serves /api/extract)
+  review.py            # trace-review backend (reads/writes corpus.sqlite, no model)
+  static/index.html    # visualizer frontend: query box -> fetch -> rendered menu
+  static/review.html   # review frontend: trace nav + keep/reject controls
+  README.md            # this file
 ```
 
-## How it works
+---
+
+# Menu visualizer (server.py)
 
 One Python process does everything — there is no separate frontend server.
 
@@ -101,7 +109,7 @@ gating. This is fine for a local demo; it is not a multi-tenant server. (A
 consequence: a slow Gemma run will block a concurrent Claude request until it
 finishes.)
 
-## Running it
+### Running it
 
 From the repo root:
 
@@ -120,7 +128,7 @@ Then open <http://127.0.0.1:8000>.
 - To enable the **Claude** agent, add `ANTHROPIC_API_KEY` to the repo-root `.env`
   (same key `run_claude.py` uses). Gemma needs no extra key.
 
-### Notes / knobs
+#### Notes / knobs
 
 - **Quantization:** 4-bit by default (matches this 15 GB-host-RAM box — see the
   repo `CLAUDE.md`). Set `VIZ_QUANTIZE=0` to load full-quality bf16 on a
@@ -131,3 +139,53 @@ Then open <http://127.0.0.1:8000>.
   script against the API with `curl`, set a generous `--max-time`.
 - **Remote box:** bind `--host 0.0.0.0` to reach it from your laptop to the GPU
   instance (otherwise it's localhost-only).
+
+---
+
+# Trace review tool (review.py)
+
+Reviews the teacher traces stored in the corpus one at a time and marks each
+**keep** or **reject**. Unlike the visualizer, it loads **no** model, torch,
+anthropic, tools, or network — it only reads/writes the small `data/corpus.sqlite`
+via [src/corpus.py](../src/corpus.py) (corpus + grounding are stdlib-only). Keep it
+that way: importing it must never pull in the GPU stack.
+
+- **v2 data source.** A trace is addressed by its **`trace_id`** (`<rid>` or
+  `<rid>__<diet-slug>`), not a filename — the old `data/traces/*.json` plus
+  `data/review/{grounding,decisions,reject_list}.txt/json` files are gone. Grounding
+  and unmatched-items are trace **fields** (computed at capture time); the
+  keep/reject decision writes `Corpus.set_review_decision`, which stamps
+  `traces.reviewed_at` and sets `traces.rejected`. That flag — not a `reject_list.txt`
+  — is what the SFT export reads (`iter_traces(split="sft", include_rejected=False)`
+  in `scripts/datasets/build_sft.py`).
+- **Backend ([review.py](review.py))** — FastAPI, title *Trace Review*. Each handler
+  opens its own short-lived corpus connection (SQLite WAL mode makes concurrent
+  read/write fine). Endpoints:
+  - `GET /` → serves `static/review.html`
+  - `GET /api/review/traces?scope=notfound|all` → ordered trace summaries for the nav
+    plus a global keep/reject/undecided progress aggregate. `notfound` (default) shows
+    only `found=false` traces (the review task); `all` shows every trace.
+  - `GET /api/review/trace/{trace_id}` → one trace's menu, notes, source, %-grounded
+    field, a compact conversation view, and its **siblings** (the other slices of the
+    same restaurant — free + dietary-conditioned — with per-item "found in scrape"
+    highlights so you can cross-check identity).
+  - `GET /api/review/toolresult/{trace_id}?turn=&idx=` → the full (capped) text of one
+    tool result, so a truncated preview can be expanded on demand.
+  - `POST /api/review/decision` `{"trace_id", "decision": "keep"|"reject"|"undo",
+    "reason": "<optional>"}` → records the decision straight into `corpus.sqlite`
+    (`undo`/null un-reviews the trace) and returns the refreshed global aggregate.
+- **Frontend ([static/review.html](static/review.html))** — plain HTML + vanilla JS:
+  a trace list/nav, the rendered menu, the compact conversation, the sibling panel,
+  and keep/reject controls.
+
+### Running it
+
+From the repo root:
+
+```bash
+uv run uvicorn viz.review:app --host 127.0.0.1 --port 8001
+```
+
+Then open <http://127.0.0.1:8001>. It reads `data/corpus.sqlite` by default; set the
+`CORPUS_DB` env var to point it at a different DB. Bind `--host 0.0.0.0` to reach it
+from a laptop when the corpus lives on a remote box.

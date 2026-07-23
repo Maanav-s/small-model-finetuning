@@ -1,15 +1,21 @@
 # RunPod SFT run — Gemma 4 E4B menu extractor (2× H200)
 
-Setup + run guide for the LoRA SFT stage ([scripts/train_sft.py](../scripts/train_sft.py))
+Setup + run guide for the LoRA SFT stage ([scripts/train/train_sft.py](../scripts/train/train_sft.py))
 on a **RunPod pod with 2× NVIDIA H200 (141 GB each, Hopper / sm_90)**. This is the
 distillation step: the student learns the teacher's trajectories re-rendered under
-the **student** prompt (context distillation — see CLAUDE.md). Data comes from
-`data/sft/train.jsonl` ([scripts/build_sft.py](../scripts/build_sft.py)).
+the **student** prompt (context distillation — see [CLAUDE.md](../CLAUDE.md)). Data
+comes from `data/sft/<family>/train.jsonl` ([scripts/datasets/build_sft.py](../scripts/datasets/build_sft.py),
+family `gemma-4-e4b-it`).
 
-Unlike the dev box (1× 24 GB, 15 GB host RAM, no swap), the H200 pod is not
+Unlike the dev box (1× 24 GB, ~15 GB host RAM, no swap), the H200 pod is not
 memory-bound: we load the base in **bf16** (not 4-bit) and LoRA-train it. A 4B +
 LoRA fits in one H200 many times over, so we use plain **DDP** (one process per
 GPU, gradients all-reduced) — no DeepSpeed/FSDP.
+
+> **This is the HF-training path, not the vLLM path.** SFT uses `transformers` +
+> `trl` + `peft` on the torch `cu128` wheel (`uv sync`). The `cu130` / driver-580
+> requirement in CLAUDE.md is a **vLLM-serving** constraint (eval / GRPO rollouts),
+> not a training one. Do not conflate them.
 
 ---
 
@@ -25,6 +31,9 @@ GPU, gradients all-reduced) — no DeepSpeed/FSDP.
     you download them once.
   - `HF_TOKEN=<token>` — a HuggingFace token whose account has **accepted the
     google/gemma-4-E4B-it license** (the model is gated; the load 403s otherwise).
+  - The S3 config for pulling the dataset / pushing outputs (`S3_BUCKET`,
+    `S3_PREFIX=v2`, `AWS_DEFAULT_REGION`, and a **scoped** key — see
+    [S3_setup.md](S3_setup.md); never put root creds on the pod).
 
 After boot, verify GPUs and topology:
 
@@ -42,21 +51,28 @@ run single-process.
 
 ```bash
 cd /workspace
-git clone <this-repo> small-model-finetuning   # or rsync it up
+git clone <this-repo> small-model-finetuning
 cd small-model-finetuning
 ```
 
 Bring the SFT dataset onto the pod (it is git-ignored; source of truth is S3):
 
 ```bash
-# option A: pull the whole data/ snapshot from S3 (needs AWS creds on the pod)
-uv run python scripts/cache_sync.py pull        # brings data/ incl. traces + cache
-uv run python scripts/build_sft.py              # traces/ -> data/sft/train.jsonl
-# option B: just scp data/sft/train.jsonl up if you built it elsewhere
+# option A: pull just the SFT export from S3 (needs AWS creds on the pod)
+uv run python scripts/infra/corpus_sync.py pull --only sft
+#   -> data/sft/gemma-4-e4b-it/train.jsonl (+ .meta.json)
+
+# option B: rebuild it from the corpus on the pod (also needs the corpus DB)
+uv run python scripts/infra/corpus_sync.py pull --only corpus.sqlite
+uv run python scripts/datasets/build_sft.py            # corpus sft split -> data/sft/<family>/train.jsonl
+
+# option C: just scp data/sft/gemma-4-e4b-it/train.jsonl up if you built it elsewhere
 ```
 
-`train_sft.py` only needs `data/sft/train.jsonl`. It does **no** scraping, so you do
-**not** need `playwright install` on the pod.
+`train_sft.py` only needs `data/sft/<family>/train.jsonl`. It does **no** scraping,
+so you do **not** need `playwright install` on the pod. The base weights download
+from the HF hub via `HF_TOKEN` (cached under `HF_HOME`); a copy also lives at
+`s3://$S3_BUCKET/v2/models/gemma-4-e4b-it/base/` if you prefer to pull it.
 
 ---
 
@@ -93,25 +109,25 @@ token-length distribution, the drop-for-length count, and one rendered+masked
 example. **Do this once** to confirm the length distribution and pick `--max-length`.
 
 ```bash
-uv run python scripts/train_sft.py --dry-run --data data/sft/train.jsonl
+uv run python scripts/train/train_sft.py --dry-run
 ```
 
 Read the printed **length p50/p90/p95/p99/max**. Examples longer than `--max-length`
 are **dropped** (never right-truncated — that would cut off the final-JSON target).
 
-> **Measured on the current data (131 rows, `MAX_TOOL_CHARS=75000`):** episodes are
-> long — **p50 ≈ 14k, p90 ≈ 61k, p95 ≈ 95k, max ≈ 209k tokens** (several capped
-> scraped pages per episode). Keep-rate by `--max-length`: 16384 → 57%, **32768 →
-> 80% (the default)**, 49152 → 85%, 65536 → 92%, 98304 → 95%.
+> **Measured on the current dataset (2074 examples, `MAX_TOOL_CHARS=24000`):**
+> **p50 ≈ 9.3k, p90 ≈ 37k, p95 ≈ 56k, p99 ≈ 97k, max ≈ 116k tokens** (episodes carry
+> several capped scraped pages). At the trainer default **`--max-length 32768` →
+> keep 1834 / 2074 (88%), drop 240 (12%)** — the dropped rows are the longest,
+> many-scrape episodes. Raising to ~49k keeps ~93%, ~65k keeps ~96%, but the LM-head
+> loss logits grow with sequence length (`seq × vocab(262k)`, upcast to fp32) and a
+> ~65k sequence is ~69 GB of logits alone — fits an H200 but watch the first steps.
 >
-> The default `--max-length 32768` deliberately does **not** chase p95: a ~98k-token
-> sequence's LM-head logits (`seq × vocab × 2 bytes` ≈ 50 GB, doubled for grads)
-> risk OOM even on a 141 GB H200. **The right lever for the long tail is a lower
-> `MAX_TOOL_CHARS` in `build_sft.py`, then rebuild** — that shrinks every episode at
-> the source instead of dropping whole trajectories. Raise `--max-length` past 32768
-> only after verifying memory headroom (watch the first steps). The >10% drop
-> warning is expected at the default with this data; it's the signal to lower the
-> tool-result cap upstream.
+> The ~12% drop at the default is the intended trade-off; the recipe deliberately
+> does **not** chase p95 into OOM territory. **Do NOT lower `MAX_TOOL_CHARS` below
+> 24000 to shrink episodes** — 24000 is what the teacher saw when it produced each
+> menu, so truncating below it would cut the very text the target was grounded in
+> (and 24000 is already the teacher-reliability ceiling; see [CLAUDE.md](../CLAUDE.md)).
 
 ---
 
@@ -125,13 +141,12 @@ tmux new -s sft
 cd /workspace/small-model-finetuning
 
 accelerate launch --config_file configs/accelerate_ddp.yaml \
-    scripts/train_sft.py \
-    --data data/sft/train.jsonl \
+    scripts/train/train_sft.py \
     --output-dir /workspace/gemma-menu-sft \
-    --max-length 16384 \
     --num-train-epochs 3 \
     --lora-r 16 --lora-alpha 32 \
     --learning-rate 2e-4
+    # --max-length defaults to 32768; --data defaults to data/sft/<family>/train.jsonl
 ```
 
 Detach with `Ctrl-b d`; re-attach with `tmux attach -t sft`.
@@ -139,12 +154,11 @@ Detach with `Ctrl-b d`; re-attach with `tmux attach -t sft`.
 **torchrun equivalent** (same result, if you prefer it over accelerate):
 
 ```bash
-torchrun --nproc_per_node=2 scripts/train_sft.py \
-    --data data/sft/train.jsonl --output-dir /workspace/gemma-menu-sft
+torchrun --nproc_per_node=2 scripts/train/train_sft.py --output-dir /workspace/gemma-menu-sft
 ```
 
-> **You MUST use accelerate/torchrun.** Plain `python scripts/train_sft.py` launches
-> a **single** process — it trains on GPU 0 only and leaves GPU 1 idle (no DDP).
+> **You MUST use accelerate/torchrun.** Plain `python scripts/train/train_sft.py`
+> launches a **single** process — it trains on GPU 0 only and leaves GPU 1 idle (no DDP).
 
 ### Effective batch size
 
@@ -159,20 +173,37 @@ long sequences dominate activation memory even with gradient checkpointing on).
 
 ## 6. Outputs
 
-Written under `--output-dir` (put it on `/workspace`):
+Written under `--output-dir` (on `/workspace`), by [scripts/train/train_sft.py](../scripts/train/train_sft.py):
 
 - `…/adapter/` — the LoRA adapter (`save_pretrained`) + tokenizer.
 - `…/merged/`  — the adapter merged into the bf16 base (`merge_and_unload`) +
   tokenizer, a **plain HF model** so the eval runner needs no peft:
 
   ```bash
-  uv run python scripts/eval_split.py --model gemma --model-path /workspace/gemma-menu-sft/merged
+  uv run python scripts/eval/eval.py --model gemma --model-path /workspace/gemma-menu-sft/merged
   ```
 
+- `…/meta.json` — the lineage record (base + dataset by md5, LoRA/quant recipe,
+  hyperparams, git sha) written by [src/run_meta.py](../src/run_meta.py).
+
 The merge runs on the main process only (after `wait_for_everyone`), reloading the
-base to keep it DDP-wrapper-free. Push the outputs off the pod before terminating
-(they're only on `/workspace`, which survives termination, but back them up / sync
-to S3 to be safe).
+base to keep it DDP-wrapper-free.
+
+**Back the outputs up to S3 before terminating.** The v2 convention (see CLAUDE.md)
+is to store the **base + adapter only** under
+`v2/models/gemma-4-e4b-it/sft/<run-id>/` and **regenerate** `merged` / `merged-text`
+on demand — the merged bf16 checkpoint is large and reproducible from base+adapter.
+
+> **To serve the checkpoint on vLLM** (eval at scale / GRPO rollouts), you must first
+> rebuild it as a text-only class with the KV-shared tensors backfilled — vLLM cannot
+> load the raw `merged` dir (missing `preprocessor_config.json`; 54 uninitialized
+> `k_norm`/`k_proj`/`v_proj` tensors from `num_kv_shared_layers=18`):
+> ```bash
+> uv run python scripts/train/to_text_only.py /workspace/gemma-menu-sft/merged \
+>     /workspace/gemma-menu-sft/merged-text --base /workspace/base/gemma-4-E4B-it
+> ```
+> See CLAUDE.md "vLLM serving" for the full story. The HF eval path above needs none
+> of this.
 
 ---
 
@@ -180,15 +211,15 @@ to S3 to be safe).
 
 | flag | default | notes |
 |------|---------|-------|
-| `--max-length` | 16384 | drop (not truncate) longer examples; tune from the dry-run p95 |
+| `--max-length` | 32768 | drop (not truncate) longer examples; tune from the dry-run p95 |
 | `--lora-r` / `--lora-alpha` | 16 / 32 | rank 16–32 range; alpha = 2×r |
 | `--lora-dropout` | 0.05 | |
-| `--lora-target-modules` | q,k,v,o,gate,up,down `_proj` | Gemma attn+MLP; matched by suffix |
+| `--lora-target-modules` | q,k,v,o,gate,up,down `_proj` | Gemma attn+MLP; scoped to `language_model.*` via regex so the vision/audio towers aren't matched |
 | `--learning-rate` | 2e-4 | LoRA-appropriate (higher than full-FT's ~2e-5) |
-| `--num-train-epochs` | 3 | small corpus — watch overfit; lower if train loss collapses |
+| `--num-train-epochs` | 3 | small corpus (2074 examples) — watch overfit; lower if train loss collapses |
 | `--per-device-train-batch-size` | 1 | long sequences; raise only if VRAM allows |
 | `--gradient-accumulation-steps` | 8 | the lever for effective batch |
-| `--eval-frac` | 0.0 | hold out an SFT-loss eval set (distinct from the WS-G task eval) |
+| `--eval-frac` | 0.0 | hold out an SFT-loss eval set (distinct from the task eval in scripts/eval/eval.py) |
 | `--no-assistant-only-loss` | off | train on the full sequence instead of assistant-only |
 | `--report-to` | none | set `wandb`/`tensorboard` to log |
 
@@ -196,19 +227,19 @@ to S3 to be safe).
 
 ## 8. Design notes carried from CLAUDE.md (why the trainer looks the way it does)
 
-- **No `device_map`.** `model.py`'s `load_model` hardcodes `device_map={"":0}` for
-  single-GPU inference; that **breaks DDP** (accelerate raises "can't train a model
-  loaded with device_map in distributed mode"). `train_sft.py` uses its own loader
-  that **reuses model.py's SDPA/GQA patch** (`_force_repeat_kv_for_efficient_sdpa`,
-  which forces the mem-efficient kernel to serve Gemma 4's head_dim=512 global
-  layers instead of OOMing on the MATH backend) but omits `device_map` and lets the
-  Trainer place the model.
+- **No `device_map`.** `src/gemma/model.py`'s `load_model` hardcodes
+  `device_map={"":0}` for single-GPU inference; that **breaks DDP** (accelerate
+  raises "can't train a model loaded with device_map in distributed mode").
+  `train_sft.py` uses its own loader that **reuses model.py's SDPA/GQA patch**
+  (`_force_repeat_kv_for_efficient_sdpa`, which forces the mem-efficient kernel to
+  serve Gemma 4's head_dim=512 global layers instead of OOMing on the MATH backend)
+  but omits `device_map` and lets the Trainer place the model.
 - **`attn_implementation="sdpa"`, never FlashAttention.** Gemma 4 E4B's global
   layers have `head_dim=512`; FA2/FA3 both cap head_dim at **256**, so they cannot
   run this model on any GPU — including the H200. Do **not** add `flash-attn`.
 - **`packing=False`.** Padding-free/varlen packing requires FlashAttention (which we
   can't use), so packing under SDPA risks cross-document attention leakage. With only
-  ~1000 long examples, correctness beats throughput. (Future: packing becomes viable
+  ~2k long examples, correctness beats throughput. (Future: packing becomes viable
   once document-masking under SDPA is verified.)
 - **`assistant_only_loss` fallback.** Gemma 4's chat template has **no
   `{% generation %}` markers**, so TRL's `assistant_only_loss` is a **silent no-op**
@@ -223,3 +254,6 @@ to S3 to be safe).
 - **`gradient_checkpointing=True`** (`use_reentrant=False`, `ddp_find_unused_
   parameters=False`): sequences are long, so activation memory matters more than the
   recompute tax even on H200.
+- **Serve the merged bf16 checkpoint, never 4-bit base + adapter** (the v1
+  QLoRA-fidelity finding: 4-bit serving of a bf16-trained adapter cost ~32 points of
+  success rate — see [experiments.md](experiments.md)).

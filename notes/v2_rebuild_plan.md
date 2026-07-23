@@ -1,6 +1,11 @@
 # v2 rebuild plan — corpus, storage, and script restructure
 
-Status: **SPEC (no code yet)**. This is the reference we build the v2 revision against.
+Status: **BUILT** (was: spec — no code yet). The data layer (`corpus.sqlite`), the
+`scripts/<stage>/` restructure, the vLLM-teacher corpus rebuild, and the per-family SFT
+export described here are implemented and in use — the current v2 corpus holds 2233
+teacher traces (2074 kept after review), all in the `sft` split. The DAgger columns
+(§9.3) exist but student-led collection is still forward-looking. Kept as the design
+reference.
 Supersedes the ad-hoc v1 `data/` layout (loose `restaurants.jsonl` + `splits.json` +
 `traces/` + `data/review/*` files). v1 stays on the bucket under `v1/`; v2 is a clean
 rebuild under a new `v2/` prefix, not a migration.
@@ -41,7 +46,8 @@ vLLM teacher) — see §9.
 - **Models**: family-keyed layout; store **base + adapters + meta only**.
   Regenerate `merged/` and `merged-text/` on-pod. `merged` storage policy:
   **current-best is regenerated, never stored.**
-- **Teacher**: self-hosted vLLM (switch now), replacing the Claude API.
+- **Teacher**: self-hosted vLLM — now `Qwen/Qwen3-235B-A22B-Instruct-2507-FP8`
+  (4×H100, TP=4) — replacing the Claude API.
 - **Analysis**: `scripts/analysis/` CLIs (not a notebook — no plots today).
 - **Restaurant fields**: lean — `restaurant_id, name, city, source, is_chain,
   split`. Dropped from v1: `lat, lng, region, country, price_tier, cuisine`.

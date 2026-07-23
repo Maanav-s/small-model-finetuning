@@ -1,6 +1,8 @@
-# S3 bucket setup (Phase 2, Part 0.1 / 0.2)
+# S3 bucket setup (corpus + model store)
 
-Manual AWS setup is done. This is what exists and how WS-D (`scripts/cache_sync.py`) should talk to it.
+Manual AWS setup is done. This is the **canonical** reference for the bucket, the
+v2 object layout, the sync tool, and IAM/credentials. (The repo-root
+[S3_SETUP.md](../S3_SETUP.md) is just a pointer to this file — edit this one.)
 
 ## Bucket
 
@@ -10,91 +12,102 @@ Manual AWS setup is done. This is what exists and how WS-D (`scripts/cache_sync.
 - Default encryption: SSE-S3 (AES256)
 - Object ownership: `BucketOwnerEnforced` — ACLs are disabled, access is IAM-policy-only
 - **Versioning: ENABLED (2026-07-16).** Was off until then, which meant every delete/overwrite was
-  permanent — dangerous for `models/`, whose merged checkpoint costs an H100 training run to
-  re-derive. No lifecycle policy (nothing expires; at ~32 GB the whole bucket is ~$0.75/mo, so
-  there is no cost case for pruning).
+  permanent — dangerous for `models/`, whose merged checkpoint costs a training run to re-derive.
+  No lifecycle policy (nothing expires).
 
-## What's in the bucket (surveyed 2026-07-16: 1034 objects, 32.40 GB)
+## Sync tool
 
-| prefix | objs | size | notes |
-|---|---|---|---|
-| `v1/base-model/gemma-4-E4B-it/` | 6 | 16.02 GB | pinned base. **Not a faithful HF mirror** — no `preprocessor_config.json` (harmless: we serve text-only) |
-| `v1/base-model/kv-shared-backfill/` | 1 | 110 MB | **the 54 dead KV-shared tensors** (layers 24–41 `k_norm`/`k_proj`/`v_proj`) for `to_text_only.py --base`. Lets a pod fix a merged checkpoint for vLLM **without** pulling the 16 GB base |
-| `v1/models/gemma-menu-sft-20260714/merged/` | 6 | 15.88 GB | the v1 SFT student (bf16). **Missing 54 tensors** by construction — see experiments.md 2026-07-16 |
-| `v1/models/gemma-menu-sft-20260714/adapter/` | 7 | 0.17 GB | LoRA (139 MB) + tokenizer |
-| `v1/cache.sqlite` | 1 | 153.7 MB | frozen tool-call cache |
-| `v1/traces/` | 1000 | 73.1 MB | teacher corpus |
-| `v1/sft/train.jsonl` | 1 | 60.6 MB | 948 SFT examples |
-| `v1/restaurants.jsonl`, `v1/splits.json` | 2 | 0.94 MB | corpus index + seeded splits |
-| `v1/eval/2026071{4,5}/` | 11 | 1.3 MB | claude, gemma (4-bit full), gemma_bf16, gemma_bf16_newprompt |
-
-Two model copies are **98.6% of the bytes**; everything else is rounding error.
-
-### Integrity metadata (`x-amz-meta-md5`)
-
-Convention: upload big artifacts with an `md5` metadata entry. Held by `sft/train.jsonl`
-(`07dd4615…`), `base-model/model.safetensors` (`2ef04081…`), and `kv-shared-backfill`
-(`eb53b4c4…`). **GAP: `models/…/merged/model.safetensors` has NO metadata** — the one artifact
-you cannot re-derive is the one you cannot verify. Its ETag is `814e974e…-1894`, i.e. a
-**multipart** ETag (1894 × 8 MB parts), which is *not* an md5, and it carries no
-`ChecksumSHA256`/`CRC32C` either. Fill this in from the next pod that pulls it (it downloads the
-whole file anyway — `md5sum` it there, then `copy-object --metadata-directive REPLACE`); versioning
-now makes that copy-in-place safe.
-
-## Credentials — no static keys
-
-The devbox EC2 instance (`i-05cb4cfbe23ff2efd`) has an **IAM instance profile** attached:
-`menu-corpus-devbox-profile`, backed by role `menu-corpus-devbox-role`.
-
-The role's policy grants exactly:
-- `s3:ListBucket` on `arn:aws:s3:::restaurant-menu-corpus`
-- `s3:GetObject` / `s3:PutObject` on `arn:aws:s3:::restaurant-menu-corpus/*`
-
-boto3 picks this up automatically via the EC2 instance metadata service — **do not add
-`AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` to `.env`**. Just use a default boto3
-session/client (`boto3.client("s3")`) with no explicit credentials, and it will resolve
-the role on this box. Static keys would only be needed if this code ever runs somewhere
-other than the devbox.
-
-## Getting corpus/models onto a RunPod pod — use presigned URLs, not keys
-
-A pod is not the devbox, so it has no instance profile. The tempting fix is to mint an
-access key for the scoped `menu-corpus-pod` IAM user and drop it in `~/.aws/credentials`
-on the pod — **don't**: that's exactly the long-lived static key this project bans, and the
-secret is only shown once at creation (so it tends to get re-minted and left behind).
-
-**Presign from a box that already has credentials, and hand the pod URLs instead.** The pod
-holds no key material, each URL is read-only, single-object, and expires:
+[scripts/infra/corpus_sync.py](../scripts/infra/corpus_sync.py) mirrors the whole
+`data/` artifact set to/from S3 — it is the v2 rebuild of the old
+`scripts/cache_sync.py` (which only synced the cache). `data/` is git-ignored;
+**S3 is its source of truth.**
 
 ```bash
-# on the devbox / any box with creds. --region is REQUIRED: the bucket is us-west-2, and a
-# presign that defaults to us-east-1 returns PermanentRedirect ("must be addressed using the
-# specified endpoint") -- the same cross-region bounce AWS_DEFAULT_REGION guards against.
-for f in config.json tokenizer.json model.safetensors; do
-  aws s3 presign "s3://restaurant-menu-corpus/v1/models/<ckpt>/merged/$f" \
-    --expires-in 10800 --region us-west-2
-done
+uv run python scripts/infra/corpus_sync.py push                       # local data/ -> S3
+uv run python scripts/infra/corpus_sync.py pull                       # S3 -> local data/
+uv run python scripts/infra/corpus_sync.py push --only corpus.sqlite --only sft
+uv run python scripts/infra/corpus_sync.py push --dry-run             # plan only, no network
 ```
 
-Pipe the resulting `curl` script to the pod over ssh **stdin** (never argv — a presigned URL
-carries its signature in the query string, so it is a secret and would otherwise land in
-shell history / process lists). Measured 2026-07-16: 16 GB pulled in ~2 min.
+- **WAL snapshotting.** `corpus.sqlite` and `cache.sqlite` both run in WAL mode, so
+  their live state spans the `.sqlite` file plus `-wal`/`-shm` sidecars. `push`
+  never uploads the bare db: it snapshots each via `VACUUM INTO` (folds in the WAL,
+  runs `PRAGMA integrity_check`), uploads the clean snapshot, and deletes the temp.
+  The snapshot step runs under `--dry-run` too, so it stays exercisable without a bucket.
+- **Skip-unchanged guard.** Every upload stores the file's md5 as object metadata
+  (`x-amz-meta-md5`); the guard compares that first (ETags stop being plain md5s for
+  multipart uploads), then a single-part ETag, then size. `pull` never deletes a
+  local file that is absent remotely — it logs it as kept.
 
-Pushing results back needs `aws s3 presign` on a `put-object` (or just pull from the devbox
-after the run). If you do create a key anyway, it needs the user's **explicit** say-so.
+## v2 object layout (under the `v2/` prefix)
 
-## What to put in `.env` / `.env.example`
+| key (under `v2/`) | what |
+|---|---|
+| `corpus.sqlite` | **the single source of truth** — restaurants + the `sft`/`grpo`/`eval` split + teacher/DAgger traces + per-trace grounding + reject flags, all in one DB (via [src/corpus.py](../src/corpus.py)) |
+| `cache.sqlite` | content-hash-keyed tool-call cache (search + scrape results) |
+| `sft/<family>/train.jsonl` (+ `.meta.json`) | exported SFT dataset for a model family |
+| `grpo/train.jsonl` (+ `.meta.json`) | exported GRPO dataset |
+| `models/<family>/{base, sft/<run>, grpo/<run>}` | **base weights + adapters only** — `merged` / `merged-text` are regenerated locally, never stored |
+| `eval/` | eval run outputs |
+
+`<family>` is `gemma-4-e4b-it`. The `v2/` prefix replaces v1's loose files:
+`restaurants.jsonl`, `splits.json`, `labels.jsonl`, and the `traces/` dir are all
+folded into `corpus.sqlite`, and the old `data/review/reject_list.txt` is now the
+`traces.rejected` DB field (set by the viz review tool — see [viz/README.md](../viz/README.md)).
+
+## Credentials
+
+boto3's default credential chain resolves in this order here: **EC2 instance profile
+→ environment / `.env` keys.**
+
+- **On the devbox — no static keys.** The `ec2-devbox` instance has an IAM instance
+  profile (`menu-corpus-devbox-profile`, backed by role `menu-corpus-devbox-role`)
+  granting `s3:ListBucket` on the bucket and `s3:GetObject` / `s3:PutObject` on its
+  objects. boto3 picks it up from instance metadata — **do not** put
+  `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` in `.env` on the devbox.
+- **Local / laptop pushes — scoped IAM user.** Off the devbox there is no instance
+  profile, so use the scoped IAM user `restaurant-menu-corpus-sync` (inline policy:
+  `ListBucket` + `Get/PutObject` on `v1/*` and `v2/*` only). Put its static keys in
+  `.env`'s `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` — these **outrank** `~/.aws`,
+  so the push runs at least privilege rather than as root.
+- **On a RunPod pod — a separate scoped key.** A pod is not the devbox and has no
+  instance profile. Use the scoped IAM user `menu-corpus-pod` (its key is v2-scoped);
+  `scripts/corpus/build_corpus.py --sync-every` uses it to stream the growing corpus
+  to S3 during a build. Keep the key off-repo (pass it at runtime — e.g. from the
+  scratchpad) and **never** put root/full AWS creds on a pod.
+
+Never commit a real key value; `.env` is git-ignored (commit
+[.env.example](../.env.example) instead).
+
+## Keyless alternative for pod pulls — presigned URLs
+
+If you'd rather hand a pod no key at all, presign the specific objects from a box
+that already has credentials and pass the pod read-only, expiring URLs instead. The
+pod holds no key material; each URL is read-only, single-object, and expires:
+
+```bash
+# on the devbox / any box with creds. --region is REQUIRED (the bucket is us-west-2;
+# a presign that defaults to us-east-1 returns PermanentRedirect).
+aws s3 presign "s3://restaurant-menu-corpus/v2/models/<family>/base/model.safetensors" \
+  --expires-in 10800 --region us-west-2
+```
+
+Pipe the resulting URLs to the pod over ssh **stdin** (never argv — a presigned URL
+carries its signature in the query string, so it is a secret that would otherwise
+land in shell history / process lists).
+
+## .env keys
 
 ```
 S3_BUCKET=restaurant-menu-corpus
-S3_PREFIX=v1
+S3_PREFIX=v2
+AWS_DEFAULT_REGION=us-west-2
+# Off the devbox only — scoped `restaurant-menu-corpus-sync` keys (leave blank on the devbox):
+# AWS_ACCESS_KEY_ID=
+# AWS_SECRET_ACCESS_KEY=
 ```
-
-(`S3_PREFIX` is just a namespace under the bucket — pick something version-like since
-the cache is a frozen, dated snapshot per Part 1 framing. `v1` is a reasonable default
-if nothing else is decided yet.)
 
 ## Note on identity
 
-The bucket/role were created using root AWS credentials on this machine (one-off setup
-only) — not relevant to the training code, just flagging it's not an IAM user.
+The bucket/role were created using root AWS credentials on this machine (one-off
+setup only) — not relevant to the training code, just flagging it's not an IAM user.
