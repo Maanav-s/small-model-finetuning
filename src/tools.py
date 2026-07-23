@@ -27,7 +27,7 @@ import asyncio
 import functools
 import re
 
-from backends import build_scrape, build_search, is_cacheable
+from backends import DATA_URI_RE, build_scrape, build_search, is_cacheable
 from cache import norm_query, norm_scrape, scrape_status
 from prompts import build_system_prompt
 
@@ -35,19 +35,24 @@ from prompts import build_system_prompt
 # Shared output bound
 # ---------------------------------------------------------------------------
 # Hard cap on a single tool result before it enters the message history. At ~3.3
-# chars/token a 100K-char cap is ~30K tokens. The vLLM TEACHER accumulates every
-# tool result in one prompt, but it serves a 131,072-token window (serve_teacher.sh)
-# with a per-call output-budget clamp + context-overflow finalize in
-# serving/openai_agent.run_episode, so even a full budget of large scrapes degrades
-# to a partial menu rather than the hard context-length 400 the old 24K cap was set
-# to dodge (see notes/experiments.md 2026-07-19). Raised from 24K so the teacher
-# reads long menus WHOLE instead of losing the tail. A blind char cap can still clip
-# an unusually long page, so a hit is WARNED about (below), never silent. Retunable
-# without re-scraping: the cache stores the raw response (bounded only by
-# cache.MAX_STORED_CHARS = 400K, always >> this), so the STUDENT's SFT cap can be
-# LOWERED independently at build time (analyze_tool_chars.py) to keep its shorter
-# training window in budget -- this value is the teacher-build read cap.
-MAX_TOOL_CHARS = 100000
+# chars/token a 24K-char cap is ~7K tokens; the vLLM teacher accumulates every tool
+# result in one prompt.
+#
+# DO NOT RAISE without re-measuring the teacher end-to-end. A 100K cap was tried
+# 2026-07-22 and REVERTED: it did NOT overflow the 131K window (episodes sat at
+# ~70K tokens), but feeding Qwen3-235B two ~100K-char scrapes -- typically 400K-char
+# junk pages (infinite-scroll / nav / script-as-text) clipped down to 100K -- made
+# it return EMPTY output instead of JSON on ~11% of episodes (a lost trace, not a
+# clipped menu). A/B on the SAME restaurants over the warm cache was unambiguous: at
+# 100K, YORI / The Ritz / Katsuya all produced 0-char finals; at 24K all three
+# produced valid JSON, and Katsuya recovered a full 28-item menu the 100K junk had
+# buried (big noisy contexts also cut exploration short -- 5 tool calls vs 8). So 24K
+# is not a context-window limit; it is where the teacher stays reliable. A blind char
+# cap can still clip an unusually long REAL menu, so a hit is WARNED about (below),
+# never silent. Retunable without re-scraping (the cache stores the raw response,
+# bounded at cache.MAX_STORED_CHARS = 400K); the STUDENT's SFT cap is tuned
+# separately at build time (analyze_tool_chars.py).
+MAX_TOOL_CHARS = 24000
 
 
 # ---------------------------------------------------------------------------
@@ -69,13 +74,24 @@ _MD_DEAD_HREF_RE = re.compile(
     re.IGNORECASE,
 )
 
+# A list line that is ONLY a bullet marker (markdownify emits "* " for an empty <li>,
+# and image/link removal above can leave a bullet with nothing after it). Measured
+# 2026-07-22: one menu page had 918 of these. Pure noise -- drop the whole line.
+_MD_EMPTY_BULLET_RE = re.compile(r"(?m)^[ \t]*[-*+][ \t]*$\n?")
+
 
 def _slim_scrape(md: str) -> str:
     """Drop non-navigable markdown bulk from a scraped page (see block comment)."""
+    # Base64 data: URIs first (the dominant bulk; see backends.DATA_URI_RE). New
+    # scrapes are already scrubbed at the source, but rows CACHED before that landed
+    # still carry the blob -- often a data URI clipped mid-string, which the image
+    # regex below cannot match -- so strip it here at read time too.
+    md = DATA_URI_RE.sub("", md)
     md = _MD_IMAGE_RE.sub("", md)
     md = _MD_EMPTY_LINK_RE.sub("", md)
     md = _MD_DEAD_HREF_RE.sub(lambda m: m.group(1) or m.group(2), md)
-    return re.sub(r"\n{4,}", "\n\n\n", md)
+    md = _MD_EMPTY_BULLET_RE.sub("", md)  # after image/link removal, which can empty a bullet
+    return re.sub(r"\n{3,}", "\n\n", md)  # collapse runs of blank lines to a single one
 
 
 def _cap(text: str, label: str) -> str:

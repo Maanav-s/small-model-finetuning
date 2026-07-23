@@ -186,16 +186,30 @@ def _auto_scroll(page) -> None:
         last_height = height
 
 
+# Inline data: URIs -- base64 images/fonts, mostly `<img src="data:...;base64,...">`
+# -- are the DOMINANT scrape bulk. Measured 2026-07-22: a single inline image was
+# 397,471 chars (99% of a 400K page); another page repeated the same base64 line 8x.
+# The model can't see images, so this is pure noise -- and worse, MAX_STORED_CHARS
+# can clip a data URI mid-string, removing the closing ")" that tools._slim_scrape's
+# markdown-image regex needs, so the blob survives read-time slimming too. `[^\s)]*`
+# matches the whole base64 token (no whitespace/paren inside it) AND runs to
+# end-of-string when a clip took the closing paren. Scrubbed at the SOURCE here
+# (shrinks the cached row) and again in tools._slim_scrape (cleans rows already
+# cached before this landed).
+DATA_URI_RE = re.compile(r"data:[^\s)]*", re.IGNORECASE)
+
+
 def _html_to_markdown(html: str) -> str:
-    """Strip non-content tags, then convert the (rendered) HTML to markdown.
+    """Strip non-content tags + inline data: URIs, then convert HTML to markdown.
 
     Drops script/style/noscript/svg first so markdownify doesn't dump JS blobs or
-    inline CSS into the model's context.
+    inline CSS into the model's context, then scrubs base64 data: URIs (see
+    DATA_URI_RE) -- the single largest source of scrape bulk.
     """
     soup = BeautifulSoup(html, "html.parser")
     for tag in soup(["script", "style", "noscript", "svg", "template"]):
         tag.decompose()
-    return markdownify(str(soup)).strip()
+    return DATA_URI_RE.sub("", markdownify(str(soup)).strip())
 
 
 def _render_on_page(page, url: str, *, wait: bool, scroll: bool) -> str:
