@@ -15,10 +15,12 @@ The model only ever sees ONE search and ONE scrape tool, both named generically
 *backend stays invisible to the model*. The generic names also keep vendor
 branding out of the SFT/GRPO training data the tool calls get baked into later.
 
-Caching (Phase 2): setup_tools(cache=Cache(...)) wraps the live backend closures
-in the content-addressed SQLite cache (src/cache.py) BEFORE build_model_tools
-applies the MAX_TOOL_CHARS cap, so the stored response is raw/uncapped and the
-cap stays retunable without re-scraping. cache=None (default) = uncached.
+Caching (Phase 2): setup_tools(cache=Cache(...)) slims the scrape backend's output
+(_slim_scrape) and then wraps it in the content-addressed SQLite cache (src/cache.py)
+BEFORE build_model_tools applies the MAX_TOOL_CHARS cap -- so the stored response is
+SLIMMED (junk removed) but uncapped, and only the cap stays retunable without
+re-scraping. cache=None (default) = uncached. search is not slimmed (the model
+mines its results for URLs).
 """
 
 from __future__ import annotations
@@ -63,8 +65,11 @@ MAX_TOOL_CHARS = 24000
 
 
 # ---------------------------------------------------------------------------
-# Scrape-result slimming (token cost) -- applied at READ time, after the cache,
-# so the stored row keeps the full markdown and this stays retunable.
+# Scrape-result slimming (token cost) -- applied to the backend output BEFORE the
+# cache (setup_tools), so a NEW scrape caches (and returns) a slimmed body;
+# clean_cache.py retro-applies the SAME transform to rows cached earlier. The
+# MAX_TOOL_CHARS *cap* stays a separate read-time step (build_model_tools) so it
+# remains retunable without re-scraping -- only the junk removal is baked in.
 # ---------------------------------------------------------------------------
 # What gets dropped is deliberately CONSERVATIVE: images, text-less links, and
 # dead-end hrefs (tel:/mailto:/js/#fragments/image files) -- measured 10.0%
@@ -112,7 +117,7 @@ def _slim_scrape(md: str) -> str:
         # Base64 data: URIs (the dominant bulk; see backends.DATA_URI_RE). New scrapes
         # are already scrubbed at the source, but rows CACHED before that landed still
         # carry the blob -- often a data URI clipped mid-string, which the image regex
-        # below cannot match -- so strip it here at read time too.
+        # below cannot match -- so strip it here too.
         md = DATA_URI_RE.sub("", md)
         md = _MD_IMAGE_RE.sub("", md)
         md = _MD_EMPTY_LINK_RE.sub("", md)
@@ -120,6 +125,19 @@ def _slim_scrape(md: str) -> str:
         md = _MD_EMPTY_BULLET_RE.sub("", md)  # after image/link removal, which can empty a bullet
         md = re.sub(r"\n{3,}", "\n\n", md)  # collapse runs of blank lines to a single one
     return md
+
+
+def _slimming_scrape(scrape_fn):
+    """Wrap a scrape backend closure so it returns SLIMMED markdown.
+
+    setup_tools applies this to the raw build_scrape() closure BEFORE the cache wrap,
+    so the slimmed body is what gets stored (a new scrape caches a slim response) and
+    what negative-caching classifies -- not just what the read path shows. The wrapped
+    closure keeps the (url, mode="direct") signature the cache's norm_scrape key_fn and
+    the model-facing scrape_url both expect."""
+    def scrape(url, mode="direct"):
+        return _slim_scrape(scrape_fn(url, mode))
+    return scrape
 
 
 def _cap(text: str, label: str) -> str:
@@ -213,7 +231,9 @@ def build_model_tools(search_fn, scrape_fn, async_tools: bool = False):
                 as a fallback when a "direct" fetch came back empty or clearly
                 missing the menu, and keep whichever result actually has the menu.
         """
-        return _cap(_slim_scrape(scrape_fn(url, mode)), "scrape_url")
+        # scrape_fn already returns slimmed markdown (setup_tools wraps the backend
+        # with _slim_scrape BEFORE the cache), so here we only apply the char cap.
+        return _cap(scrape_fn(url, mode), "scrape_url")
 
     tools = [web_search, scrape_url]
     if async_tools:
@@ -236,16 +256,23 @@ def setup_tools(dietary_restrictions=None, variant: str = "teacher", cache=None,
     so the model filters the menu to complying items; empty means no filtering.
     variant ("teacher" | "student"): system-prompt variant (see prompts.py) --
     "teacher" (default) carries the source-selection guidance, "student" omits it.
-    cache (cache.Cache | None): when given, it wraps the BACKEND closures --
-    BEFORE the MAX_TOOL_CHARS cap above -- so the RAW uncapped response is stored
-    and the cap stays retunable without re-scraping. The cache's miss_policy
-    (live/canned/error) decides what a miss does; see src/cache.py.
+    cache (cache.Cache | None): when given, it wraps the BACKEND closures -- after
+    the scrape output is slimmed (below) but BEFORE the MAX_TOOL_CHARS cap -- so the
+    stored response is SLIMMED but uncapped, and the cap stays retunable without
+    re-scraping. The cache's miss_policy (live/canned/error) decides what a miss
+    does; see src/cache.py.
     async_tools (bool): return the tools as coroutines so TRL's GRPO loop executes them
     in PARALLEL rather than one-at-a-time (see _to_async -- this is the difference
     between ~40 min/step and a usable rollout rate on live tools). Only train_grpo.py
     wants this; the sync callers would get coroutines back.
     """
     search_fn, scrape_fn = build_search(), build_scrape()
+    # Slim the scrape backend's markdown BEFORE anything else wraps it, so a new
+    # scrape CACHES a slimmed body (matching what the model sees) and negative-caching
+    # classifies the slimmed text. _slim_scrape is idempotent, so a cache built before
+    # this (and clean_cache's retro slim) stays consistent. search is not slimmed --
+    # the model mines its results for URLs.
+    scrape_fn = _slimming_scrape(scrape_fn)
     if cache is not None:
         # scrape is 2-arg (url, mode); norm_scrape keys on BOTH so direct/browser
         # renders are distinct entries. scrape_status marks failure sentinels

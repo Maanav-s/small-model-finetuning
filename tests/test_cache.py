@@ -567,3 +567,58 @@ class TestStoredResponseClip:
         cache.vacuum()  # must not raise; reclaims the freed pages
         cache.close()
         assert Path(path).stat().st_size < big_size
+
+
+class TestSlimRows:
+    """Cache.slim_rows: bake a read-time slim transform into stored rows."""
+
+    @staticmethod
+    def _drop_junk(s):
+        return (s or "").replace("JUNK", "")
+
+    def test_slim_rows_rewrites_matching_rows_and_reports(self):
+        cache = Cache(":memory:", miss_policy="live")
+        cache.wrap("scrape", CountingFn("menuJUNKitems"), key_fn=norm_scrape)("https://a.com")
+        rep = cache.slim_rows(self._drop_junk)
+        assert rep["rows_changed"] == 1
+        assert rep["chars_removed"] == len("JUNK")
+        assert cache._get("scrape", norm_scrape("https://a.com", "direct"))["response"] == "menuitems"
+
+    def test_slim_rows_is_idempotent(self):
+        cache = Cache(":memory:", miss_policy="live")
+        cache.wrap("scrape", CountingFn("aJUNKb"), key_fn=norm_scrape)("https://a.com")
+        assert cache.slim_rows(self._drop_junk)["rows_changed"] == 1
+        assert cache.slim_rows(self._drop_junk)["rows_changed"] == 0  # nothing left to strip
+
+    def test_slim_rows_only_touches_its_namespace(self):
+        cache = Cache(":memory:", miss_policy="live")
+        cache.wrap("search", CountingFn("keepJUNK"), key_fn=norm_query)("q")
+        cache.slim_rows(self._drop_junk, namespace="scrape")  # scrape has no rows
+        assert cache._get("search", norm_query("q"))["response"] == "keepJUNK"  # search untouched
+
+    def test_slim_rows_dry_run_reports_without_mutating(self):
+        cache = Cache(":memory:", miss_policy="live")
+        cache.wrap("scrape", CountingFn("xJUNKy"), key_fn=norm_scrape)("https://a.com")
+        rep = cache.slim_rows(self._drop_junk, dry_run=True)
+        assert rep["rows_changed"] == 1 and rep["applied"] is False
+        assert cache._get("scrape", norm_scrape("https://a.com", "direct"))["response"] == "xJUNKy"
+
+
+class TestSlimBeforeCache:
+    """setup_tools slims the scrape backend BEFORE the cache, so a NEW scrape caches
+    (and returns) a slimmed body -- not just what the read path shows."""
+
+    def test_slimming_scrape_caches_a_slimmed_body(self):
+        from tools import _slimming_scrape  # local import: pulls backends/prompts/schema
+
+        raw = "![logo](data:image/png;base64,QUJDQUJD) Real menu: Pizza $10 " * 5
+        backend = CountingFn(raw)
+        cache = Cache(":memory:", miss_policy="live")
+        scrape_fn = cache.wrap("scrape", _slimming_scrape(backend), key_fn=norm_scrape,
+                               status_fn=scrape_status, provider="local")
+
+        out = scrape_fn("https://r.com/menu")
+        assert "data:image" not in out and "![logo]" not in out  # caller gets slim
+        assert "Real menu: Pizza $10" in out                     # real text kept
+        stored = cache._get("scrape", norm_scrape("https://r.com/menu", "direct"))["response"]
+        assert "data:image" not in stored                        # STORED row is slim too
