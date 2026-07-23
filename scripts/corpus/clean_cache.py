@@ -1,24 +1,29 @@
-"""Clip over-long responses out of a cache.sqlite and reclaim the disk space.
+"""Slim and clip a cache.sqlite in place, then reclaim the disk space.
 
-Retro-applies cache.MAX_STORED_CHARS (the general storage rule that src/cache.py
-now enforces on every write) to a cache built BEFORE that rule. A single monster
-scrape -- a multi-million-char PDF rendered to markdown, one was 14M chars -- can
-bloat the shared cache.sqlite far out of proportion to its usefulness (the read
-path never surfaces more than MAX_TOOL_CHARS anyway). This walks the DB, clips any
-response longer than --max-chars to its first --max-chars characters, then VACUUMs
-to shrink the file on disk.
+Two passes, both retro-applying what the LIVE read path already does, to a cache
+captured before those rules -- so the stored file matches what the agent sees
+(minus the read-time MAX_TOOL_CHARS cap) and shrinks:
 
-Non-destructive to the CACHE'S PURPOSE: the read-time MAX_TOOL_CHARS cap (tools.py)
-is far below the clip bound, so an agent replaying a clipped row sees byte-identical
-content to what it saw uncached. Only the unused tail past --max-chars is dropped.
+  1. SLIM (tools._slim_scrape on every scrape row): drops base64 data: URIs,
+     markdown images, empty links/bullets, dead hrefs, and collapses blank runs.
+     The base64 blobs dominate a pre-scrubbing cache -- a single inline image
+     measured 397K chars -- so this is the big reclaim. Skip with --no-slim.
+  2. CLIP (cache.MAX_STORED_CHARS, the storage rule src/cache.py enforces on every
+     write): clip any STILL-over-long response (a genuine multi-million-char page,
+     e.g. a huge PDF-to-markdown) to its first --max-chars characters.
 
-  uv run python scripts/corpus/clean_cache.py                       # data/cache.sqlite, clip>400k + vacuum
+Then VACUUM to shrink the file on disk. Non-destructive to the CACHE'S PURPOSE: the
+slim only removes noise the read path strips on every hit, and the clip bound sits
+far above MAX_TOOL_CHARS, so an agent replaying a cleaned row sees byte-identical
+content to what it saw uncached.
+
+  uv run python scripts/corpus/clean_cache.py                       # data/cache.sqlite: slim + clip + vacuum
   uv run python scripts/corpus/clean_cache.py --cache-path /workspace/cache.sqlite
   uv run python scripts/corpus/clean_cache.py --dry-run             # report only, no mutation
-  uv run python scripts/corpus/clean_cache.py --max-chars 200000 --no-vacuum
+  uv run python scripts/corpus/clean_cache.py --no-slim --max-chars 200000 --no-vacuum
 
 Run it ON the pod (where the big cache lives) before syncing that cache to S3, or
-locally against a pulled copy. Idempotent: a second run finds nothing to clip.
+locally against a pulled copy. Idempotent: a second run finds nothing to change.
 """
 
 import argparse
@@ -30,6 +35,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
 from cache import MAX_STORED_CHARS, Cache  # noqa: E402
+from tools import _slim_scrape  # noqa: E402  -- the exact read-time slim, baked into storage
 
 
 def parse_args():
@@ -38,9 +44,12 @@ def parse_args():
     )
     parser.add_argument("--cache-path", type=Path, default=REPO_ROOT / "data" / "cache.sqlite",
                         help="cache.sqlite to clean (default data/cache.sqlite)")
+    parser.add_argument("--no-slim", action="store_true",
+                        help="skip the slim pass (tools._slim_scrape on scrape rows); "
+                             "clip-only, the pre-slim behaviour")
     parser.add_argument("--max-chars", type=int, default=MAX_STORED_CHARS,
-                        help=f"clip any stored response longer than this (default "
-                             f"{MAX_STORED_CHARS}, = cache.MAX_STORED_CHARS)")
+                        help=f"clip any stored response STILL longer than this after slimming "
+                             f"(default {MAX_STORED_CHARS}, = cache.MAX_STORED_CHARS)")
     parser.add_argument("--no-vacuum", action="store_true",
                         help="skip the VACUUM after clipping (the clip alone only frees "
                              "pages inside the file; without VACUUM the file does not shrink "
@@ -57,17 +66,29 @@ def main():
 
     size_before = args.cache_path.stat().st_size
     cache = Cache(str(args.cache_path), miss_policy="live")
+    mutated = False
     try:
-        report = cache.clip_oversized(args.max_chars, dry_run=args.dry_run)
-        verb = "would clip" if args.dry_run else "clipped"
         print(f"{args.cache_path}: {size_before / 1e6:.1f} MB on disk")
-        print(f"  rows over {args.max_chars} chars: {report['rows']}  "
-              f"(largest response {report['largest_before']} chars)")
-        print(f"  {verb} {report['rows']} row(s), removing {report['chars_removed']:,} chars of text")
+
+        # Pass 1: slim scrape rows (base64 URIs, images, empty bullets, blank runs).
+        if not args.no_slim:
+            s = cache.slim_rows(_slim_scrape, dry_run=args.dry_run)
+            verb = "would slim" if args.dry_run else "slimmed"
+            print(f"  slim: {verb} {s['rows_changed']}/{s['rows_scanned']} scrape row(s), "
+                  f"removing {s['chars_removed']:,} chars (largest response {s['largest_before']} chars)")
+            mutated = mutated or s["applied"]
+
+        # Pass 2: clip anything STILL over the storage bound after slimming.
+        c = cache.clip_oversized(args.max_chars, dry_run=args.dry_run)
+        verb = "would clip" if args.dry_run else "clipped"
+        print(f"  clip: {verb} {c['rows']} row(s) over {args.max_chars} chars, "
+              f"removing {c['chars_removed']:,} chars (largest {c['largest_before']} chars)")
+        mutated = mutated or c["applied"]
+
         if args.dry_run:
             print("  (dry-run: nothing written; re-run without --dry-run to apply)")
             return
-        if report["rows"] and not args.no_vacuum:
+        if mutated and not args.no_vacuum:
             print("  vacuuming to reclaim freed pages on disk...")
             cache.vacuum()
     finally:

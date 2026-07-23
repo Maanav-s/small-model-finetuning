@@ -340,8 +340,63 @@ class Cache:
             "max_chars": max_chars, "applied": bool(n and not dry_run),
         }
 
+    def slim_rows(self, slim_fn, namespace: str = "scrape", *, dry_run: bool = False) -> dict:
+        """Bake a read-time slimming transform into every stored response in a namespace.
+
+        `slim_fn(response) -> str` is the SAME transform the read path applies (pass
+        tools._slim_scrape): it drops base64 data: URIs, markdown images, empty
+        links/bullets, and dead hrefs, and collapses blank runs. Storing the RAW
+        response keeps the MAX_TOOL_CHARS *cap* retunable, but the slim removes pure
+        noise the read path already strips on every hit -- so persisting it just makes
+        the file match what the agent sees (minus the cap) and reclaims the base64
+        bulk that dominates a cache captured before source-side scrubbing (a single
+        inline image measured 397K chars; it can also be clipped mid-string so the
+        read-time image regex can't catch it). Only rows whose slimmed text differs
+        are rewritten, so it is idempotent -- a second run changes nothing.
+
+        Scrape-only by default: search results are not slimmed on read (the model
+        mines them for URLs), so slimming them here would drift storage from the read
+        path. Returns {'namespace','rows_scanned','rows_changed','chars_removed',
+        'largest_before','applied'}; dry_run reports the same without mutating. Frees
+        pages inside the file only -- call vacuum() afterward to shrink it on disk.
+        """
+        scanned = changed = removed = largest = 0
+        with self._lock:
+            # Collect keys first, then fetch+update one row at a time: bounds peak
+            # memory to a single response (some are ~400K) instead of loading the
+            # whole namespace, and avoids mutating a live SELECT cursor mid-iteration.
+            key_hashes = [
+                r["key_hash"] for r in self._conn.execute(
+                    "SELECT key_hash FROM cache WHERE namespace = ?", (namespace,)
+                ).fetchall()
+            ]
+            for kh in key_hashes:
+                resp = self._conn.execute(
+                    "SELECT response FROM cache WHERE key_hash = ?", (kh,)
+                ).fetchone()["response"]
+                scanned += 1
+                if resp is None:
+                    continue
+                if len(resp) > largest:
+                    largest = len(resp)
+                slim = slim_fn(resp)
+                if slim != resp:
+                    changed += 1
+                    removed += len(resp) - len(slim)
+                    if not dry_run:
+                        self._conn.execute(
+                            "UPDATE cache SET response = ? WHERE key_hash = ?", (slim, kh)
+                        )
+            if changed and not dry_run:
+                self._conn.commit()
+        return {
+            "namespace": namespace, "rows_scanned": scanned, "rows_changed": changed,
+            "chars_removed": removed, "largest_before": largest,
+            "applied": bool(changed and not dry_run),
+        }
+
     def vacuum(self) -> None:
-        """Rebuild the db file to reclaim pages freed by clip_oversized (VACUUM).
+        """Rebuild the db file to reclaim pages freed by clip_oversized/slim_rows (VACUUM).
         Needs free disk roughly equal to the current db size for the temp copy."""
         with self._lock:
             self._conn.execute("VACUUM")

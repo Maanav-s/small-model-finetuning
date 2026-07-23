@@ -88,17 +88,38 @@ _MD_EMPTY_BULLET_RE = re.compile(r"(?m)^[ \t]*[-*+][ \t]*$\n?")
 
 
 def _slim_scrape(md: str) -> str:
-    """Drop non-navigable markdown bulk from a scraped page (see block comment)."""
-    # Base64 data: URIs first (the dominant bulk; see backends.DATA_URI_RE). New
-    # scrapes are already scrubbed at the source, but rows CACHED before that landed
-    # still carry the blob -- often a data URI clipped mid-string, which the image
-    # regex below cannot match -- so strip it here at read time too.
-    md = DATA_URI_RE.sub("", md)
-    md = _MD_IMAGE_RE.sub("", md)
-    md = _MD_EMPTY_LINK_RE.sub("", md)
-    md = _MD_DEAD_HREF_RE.sub(lambda m: m.group(1) or m.group(2), md)
-    md = _MD_EMPTY_BULLET_RE.sub("", md)  # after image/link removal, which can empty a bullet
-    return re.sub(r"\n{3,}", "\n\n", md)  # collapse runs of blank lines to a single one
+    """Drop non-navigable markdown bulk from a scraped page (see block comment).
+
+    Iterated to a FIXED POINT: one stage's removal can expose a match for an earlier
+    stage (e.g. dropping an image empties the bullet that held it; dropping a line
+    merges two blank runs), so a single pass isn't idempotent -- a few real pages
+    needed a second pass. That matters here because clean_cache.py bakes this same
+    transform into the stored rows: if `slim(raw)` still had junk `slim` would strip
+    on the next read, a cached hit (stored pre-slimmed) and a fresh fetch would
+    disagree. Every stage only deletes or shortens, so the length strictly drops on
+    any change and the loop terminates (typically after 2 passes: one real, one that
+    confirms nothing else matches)."""
+    prev = None
+    while md != prev:
+        prev = md
+        # NUL bytes never belong in menu markdown -- they signal a binary blob
+        # mangled through the HTML->markdown pipeline (one cached page was a binary
+        # file rendered to 1.9M chars with 10.6K NULs). Beyond being junk, an embedded
+        # NUL breaks SQLite's length()/substr() (both stop counting at the first NUL),
+        # so a NUL-bearing row is invisible to cache.clip_oversized's SQL bound and
+        # can't be trimmed until the NULs are gone -- strip them first.
+        md = md.replace("\x00", "")
+        # Base64 data: URIs (the dominant bulk; see backends.DATA_URI_RE). New scrapes
+        # are already scrubbed at the source, but rows CACHED before that landed still
+        # carry the blob -- often a data URI clipped mid-string, which the image regex
+        # below cannot match -- so strip it here at read time too.
+        md = DATA_URI_RE.sub("", md)
+        md = _MD_IMAGE_RE.sub("", md)
+        md = _MD_EMPTY_LINK_RE.sub("", md)
+        md = _MD_DEAD_HREF_RE.sub(lambda m: m.group(1) or m.group(2), md)
+        md = _MD_EMPTY_BULLET_RE.sub("", md)  # after image/link removal, which can empty a bullet
+        md = re.sub(r"\n{3,}", "\n\n", md)  # collapse runs of blank lines to a single one
+    return md
 
 
 def _cap(text: str, label: str) -> str:
