@@ -45,6 +45,7 @@ import argparse
 import json
 import os
 import sys
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
@@ -75,10 +76,12 @@ from openai_agent import build_client as openai_build_client  # noqa: E402
 from openai_agent import run_episode as vllm_run_episode  # noqa: E402
 from prompts import build_system_prompt  # noqa: E402
 from schema import MENU_SCHEMA, extract_json  # noqa: E402
-from tools import setup_tools  # noqa: E402
+from tools import MAX_TOOL_CHARS, setup_tools  # noqa: E402
 
 PROMPT_VARIANT = "teacher"  # default: what generates SFT data (--prompt-variant to override)
 DEFAULT_VLLM_BASE_URL = "http://localhost:8000/v1"
+PROGRESS_EVERY = 25  # print an aggregate progress line every N processed episodes
+DEFAULT_WANDB_PROJECT = "menu-corpus-build"
 
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -132,6 +135,18 @@ def parse_args():
                              "environment -- reachability is preflighted before the first "
                              "episode. Only the corpus DB is synced, never the (large) cache.")
     parser.add_argument("--seed", type=int, default=42, help="selection-order seed (default 42; keep fixed)")
+    parser.add_argument("--max-consecutive-failures", type=int, default=MAX_CONSECUTIVE_FAILURES,
+                        help=f"abort after this many episodes RAISE in a row (default "
+                             f"{MAX_CONSECUTIVE_FAILURES}). The breaker exists to catch a SYSTEMIC "
+                             "failure (dead teacher/browser/key -> every episode fails), not the "
+                             "baseline ~10%% menu-less rate; raise it (e.g. 15) for a long run so an "
+                             "unlucky cluster of graceful failures can't abort the whole build. A "
+                             "dead teacher still trips it promptly since it fails 100%%.")
+    parser.add_argument("--no-wandb", action="store_true",
+                        help="disable Weights & Biases logging even when WANDB_API_KEY is set. "
+                             "By default the build logs to W&B iff WANDB_API_KEY is in the "
+                             "environment (project from WANDB_PROJECT, default "
+                             f"{DEFAULT_WANDB_PROJECT!r}); without the key it is a no-op.")
     parser.add_argument("--list", action="store_true",
                         help="print the planned episodes and exit (no API calls)")
     return parser.parse_args()
@@ -241,8 +256,10 @@ def run_teacher(client, teacher: str, episode_input: str, tools, registry,
     """Dispatch one episode to the chosen teacher; return (final_text, canonical
     messages) -- messages already normalized to the Anthropic content-block shape."""
     if teacher == "vllm":
+        # verbose=False: 16-32 concurrent episodes would otherwise interleave a flood
+        # of per-tool-call prints; the build reports its own aggregate progress.
         final_text, raw = vllm_run_episode(
-            client, teacher_model, episode_input, tools, registry, system_prompt
+            client, teacher_model, episode_input, tools, registry, system_prompt, verbose=False
         )
         return final_text, openai_messages_to_anthropic(raw)
     final_text, raw = claude_run_episode(
@@ -313,8 +330,104 @@ def trace_summary(trace: dict, row: dict) -> dict:
         "schema_valid": trace["schema_valid"], "found": trace["found"],
         "tool_calls": len(trace["queries"]) + len(trace["urls"]),
         "items": sum(len(s.get("items", [])) for s in fj.get("menu", []) or []),
+        "grounding": trace.get("grounding"),
         "conditioned": bool(trace["dietary_restrictions"]),
     }
+
+
+# ---------------------------------------------------------------------------
+# Progress reporting + optional Weights & Biases telemetry
+# ---------------------------------------------------------------------------
+def _fmt_dur(seconds: float) -> str:
+    """Compact duration for the progress line + ETA (e.g. '1h07m' or '3m20s')."""
+    m, s = divmod(int(max(0, seconds)), 60)
+    h, m = divmod(m, 60)
+    return f"{h}h{m:02d}m" if h else f"{m}m{s:02d}s"
+
+
+def progress_line(processed: int, n_todo: int, results: list, failures: list,
+                  t_start: float, cache) -> str:
+    """One aggregate progress line: throughput, ETA, running found/schema rates, cache."""
+    elapsed = time.monotonic() - t_start
+    rate = processed / elapsed if elapsed > 0 else 0.0  # episodes/sec
+    eta = (n_todo - processed) / rate if rate > 0 else 0.0
+    n_ok = len(results)
+    found = sum(r["found"] for r in results)
+    schema = sum(r["schema_valid"] for r in results)
+    cs = cache.stats()
+    return (f"[progress] {processed}/{n_todo} ({100 * processed / n_todo:.0f}%)  "
+            f"{rate * 60:.1f} eps/min  elapsed {_fmt_dur(elapsed)}  ETA {_fmt_dur(eta)}  |  "
+            f"ok={n_ok} failed={len(failures)}  "
+            f"found={100 * found / max(1, n_ok):.0f}%  schema={100 * schema / max(1, n_ok):.0f}%  |  "
+            f"cache hits={cs['hits']} misses={cs['misses']}")
+
+
+def init_wandb(args, n_todo: int):
+    """Start a W&B run iff WANDB_API_KEY is set and --no-wandb was not passed.
+
+    Returns the run (or None). NEVER fatal: a missing wandb package or a failed init
+    degrades to console-only logging -- a metered corpus build must not die because
+    telemetry is misconfigured. Reads WANDB_PROJECT / WANDB_ENTITY / WANDB_NAME from
+    the environment (the caller exports them), defaulting the project only."""
+    if args.no_wandb or not os.environ.get("WANDB_API_KEY"):
+        return None
+    try:
+        import wandb
+    except ImportError:
+        print("[wandb] WANDB_API_KEY is set but the wandb package is not installed "
+              "(pip install wandb); logging to console only")
+        return None
+    try:
+        run = wandb.init(
+            project=os.environ.get("WANDB_PROJECT", DEFAULT_WANDB_PROJECT),
+            config={
+                "teacher": args.teacher, "teacher_model": args.teacher_model or args.model,
+                "split": args.split, "limit": args.limit,
+                "conditioned_frac": args.conditioned_frac, "workers": args.workers,
+                "seed": args.seed, "prompt_variant": args.prompt_variant,
+                "cache_policy": args.cache_policy, "max_tool_chars": MAX_TOOL_CHARS,
+                "n_todo": n_todo,
+            },
+        )
+    except Exception as exc:  # noqa: BLE001 -- telemetry must never break the build
+        print(f"[wandb] init failed ({exc!r}); logging to console only")
+        return None
+    print(f"[wandb] logging to {run.url}")
+    return run
+
+
+def wandb_log(run, processed: int, n_todo: int, results: list, failures: list,
+              t_start: float, episode: dict | None) -> None:
+    """Log cumulative build metrics (+ this episode's, on success) to W&B at step=processed."""
+    if run is None:
+        return
+    elapsed = time.monotonic() - t_start
+    n_ok = len(results)
+    metrics = {
+        "processed": processed,
+        "completed": n_ok,
+        "failed": len(failures),
+        "pct_done": processed / n_todo,
+        "eps_per_min": processed / elapsed * 60 if elapsed > 0 else 0.0,
+        "found_rate": sum(r["found"] for r in results) / max(1, n_ok),
+        "schema_valid_rate": sum(r["schema_valid"] for r in results) / max(1, n_ok),
+        "failure_rate": len(failures) / max(1, processed),
+    }
+    if episode is not None:
+        metrics.update({
+            "episode/found": int(episode["found"]),
+            "episode/schema_valid": int(episode["schema_valid"]),
+            "episode/tool_calls": episode["tool_calls"],
+            "episode/items": episode["items"],
+            "episode/grounding": episode["grounding"],
+            "episode/conditioned": int(episode["conditioned"]),
+        })
+    else:
+        metrics["episode/failed"] = 1
+    try:
+        run.log(metrics, step=processed)
+    except Exception as exc:  # noqa: BLE001 -- a telemetry hiccup must not kill the build
+        print(f"[wandb] log failed at {processed} ({exc!r}); continuing")
 
 
 def push_corpus_snapshot(db_path: Path) -> None:
@@ -430,6 +543,8 @@ def main():
 
         results, failures = [], []
         consecutive_failures = 0
+        wandb_run = init_wandb(args, len(todo))
+        t_start = time.monotonic()
 
         # Network episodes run in the pool; cx.write_trace happens ONLY here on the
         # main thread as each future resolves (corpus.Corpus is a single-writer
@@ -473,7 +588,10 @@ def main():
                         failures.append((row["restaurant_id"], row["name"], repr(exc)))
                         consecutive_failures += 1
                         print(f"[{i}/{len(todo)}] FAILED {row['name']!r}: {exc!r}")
-                        if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                        wandb_log(wandb_run, i, len(todo), results, failures, t_start, None)
+                        if i % PROGRESS_EVERY == 0:
+                            print(progress_line(i, len(todo), results, failures, t_start, cache))
+                        if consecutive_failures >= args.max_consecutive_failures:
                             print(f"aborting: {consecutive_failures} consecutive failures")
                             break  # the finally cancels the queued backlog
                         continue
@@ -485,6 +603,9 @@ def main():
                           f"schema_valid={summary['schema_valid']} found={summary['found']} "
                           f"tool_calls={summary['tool_calls']} items={summary['items']} "
                           f"grounding={trace['grounding']}")
+                    wandb_log(wandb_run, i, len(todo), results, failures, t_start, summary)
+                    if i % PROGRESS_EVERY == 0:
+                        print(progress_line(i, len(todo), results, failures, t_start, cache))
 
                     # Periodic S3 checkpoint: every N written traces, push the corpus
                     # DB off the pod. A failed push is logged, not raised -- the traces
@@ -529,6 +650,19 @@ def main():
                 print(f"[sync] final push: {args.db.name} -> S3")
             except Exception as exc:  # noqa: BLE001
                 print(f"[sync] WARNING: final push failed: {exc!r}")
+
+        if wandb_run is not None:
+            n_ok = len(results)
+            wandb_run.summary.update({
+                "final/completed": n_ok,
+                "final/failed": len(failures),
+                "final/found_rate": sum(r["found"] for r in results) / max(1, n_ok),
+                "final/schema_valid_rate": sum(r["schema_valid"] for r in results) / max(1, n_ok),
+                "final/corpus_traces": cx.trace_count(),
+                "final/elapsed_sec": round(time.monotonic() - t_start, 1),
+                **{f"cache/{k}": v for k, v in cache.stats().items() if isinstance(v, (int, float))},
+            })
+            wandb_run.finish()
         cache.close()
 
 

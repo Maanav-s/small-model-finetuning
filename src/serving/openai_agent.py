@@ -241,8 +241,14 @@ def run_episode(
     system_prompt: str,
     max_tool_calls: int = MAX_TOOL_CALLS,
     max_tokens: int = MAX_TOKENS,
+    verbose: bool = True,
 ) -> tuple[str, list[dict]]:
     """Run the tool-call loop for one restaurant; return (final_text, messages).
+
+    verbose=True (default) prints a per-tool-call / per-result trace -- useful for a
+    single interactive episode (smoke_teacher). Pass verbose=False for a batched
+    corpus build, where 16-32 concurrent episodes would otherwise interleave a flood
+    of these lines; build_corpus drives its own aggregate progress instead.
 
     Standard manual agentic loop over client.chat.completions.create: call the
     model, execute any tool_calls via the shared registry, feed tool results back
@@ -322,17 +328,21 @@ def run_episode(
                 args = json.loads(tc.function.arguments or "{}")
             except json.JSONDecodeError:
                 args = {}
-            print(f"  [step {step}] tool call: {name}({args})")
+            if verbose:
+                print(f"  [step {step}] tool call: {name}({args})")
             if name not in tool_registry:
                 out = f"Error: unknown tool {name!r}"
-                print(f"  [warn] unknown tool {name!r}")
+                if verbose:
+                    print(f"  [warn] unknown tool {name!r}")
             else:
                 try:
                     out = tool_registry[name](**args)
-                    print(f"  [step {step}] -> {len(out)} chars returned")
+                    if verbose:
+                        print(f"  [step {step}] -> {len(out)} chars returned")
                 except Exception as e:  # noqa: BLE001 -- a bad call must not abort the episode
                     out = f"Error running tool {name!r}: {e}"
-                    print(f"  [warn] {out}")
+                    if verbose:
+                        print(f"  [warn] {out}")
             messages.append(
                 {"role": "tool", "tool_call_id": tc.id, "name": name, "content": out}
             )
