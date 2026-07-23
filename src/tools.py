@@ -46,8 +46,15 @@ from prompts import build_system_prompt
 # clipped menu). A/B on the SAME restaurants over the warm cache was unambiguous: at
 # 100K, YORI / The Ritz / Katsuya all produced 0-char finals; at 24K all three
 # produced valid JSON, and Katsuya recovered a full 28-item menu the 100K junk had
-# buried (big noisy contexts also cut exploration short -- 5 tool calls vs 8). So 24K
-# is not a context-window limit; it is where the teacher stays reliable. A blind char
+# buried (big noisy contexts also cut exploration short -- 5 tool calls vs 8). A
+# follow-up 50K test 2026-07-23 -- run AFTER base64 data: URIs were stripped, to check
+# whether that junk was the cause -- reproduced it anyway: on 15 worst-case big-page
+# restaurants over the same warm cache, 50K gave 4/15 EMPTY finals vs 24K's 0/15, and
+# 24K produced BETTER menus (Imperial Restaurant: 140 items at 24K vs a give-up at
+# 50K). So the trigger is TOTAL accumulated context (a few capped scrapes = 100-150K
+# chars), NOT per-scrape junk -- base64 stripping lets the 24K window carry more real
+# menu text but buys ZERO headroom for a bigger cap. So 24K is not a context-window
+# limit; it is where the teacher stays reliable. A blind char
 # cap can still clip an unusually long REAL menu, so a hit is WARNED about (below),
 # never silent. Retunable without re-scraping (the cache stores the raw response,
 # bounded at cache.MAX_STORED_CHARS = 400K); the STUDENT's SFT cap is tuned
