@@ -117,7 +117,9 @@ _SCRAPE_FAILURE_MARKERS = ("(scrape failed", "(page returned no content)", "(pag
 # re-fetches on every populate pass, and a site that stonewalls us will stonewall us
 # again -- this is a permanent negative result, not a transient one. The floor sits
 # well under the smallest real page observed (636 chars) and well over the bot-wall
-# bodies (15 chars).
+# bodies (15 chars). backends.py's dead-end sentinels (BLOCKED_SITE_RESULT etc.)
+# RELY on this floor: they stay under it (and match no failure marker) precisely so
+# they classify 'empty' and cache as permanent negatives.
 MIN_CONTENT_CHARS = 200
 
 
@@ -343,8 +345,8 @@ class Cache:
     def slim_rows(self, slim_fn, namespace: str = "scrape", *, dry_run: bool = False) -> dict:
         """Bake a read-time slimming transform into every stored response in a namespace.
 
-        `slim_fn(response) -> str` is the SAME transform the read path applies (pass
-        tools._slim_scrape): it drops base64 data: URIs, markdown images, empty
+        `slim_fn(response) -> str` is the SAME transform the backend applies (pass
+        backends._slim_scrape): it drops base64 data: URIs, markdown images, empty
         links/bullets, and dead hrefs, and collapses blank runs. Storing the RAW
         response keeps the MAX_TOOL_CHARS *cap* retunable, but the slim removes pure
         noise the read path already strips on every hit -- so persisting it just makes
@@ -393,6 +395,49 @@ class Cache:
             "namespace": namespace, "rows_scanned": scanned, "rows_changed": changed,
             "chars_removed": removed, "largest_before": largest,
             "applied": bool(changed and not dry_run),
+        }
+
+    def reclassify(self, status_fn, namespace: str = "scrape", *, dry_run: bool = False) -> dict:
+        """Recompute `status` from the STORED response for every row in a namespace.
+
+        slim_rows/clip_oversized rewrite `response` only, so a row classified on its
+        PRE-slim text keeps that verdict forever -- e.g. a bot-wall page whose raw
+        markdown was 300 chars of image junk classified 'ok' when stored, but slims
+        to under MIN_CONTENT_CHARS and should be 'empty' (a permanent negative).
+        Under "live" that stale 'ok' is a permanent hit serving junk. Run this AFTER
+        slim_rows with the same status_fn the read path uses (cache.scrape_status)
+        so storage and classification agree.
+
+        Returns {'namespace', 'rows_scanned', 'rows_changed', 'transitions',
+        'applied'}; `transitions` counts each change as "old->new". dry_run reports
+        without mutating. Rows with a NULL response are left untouched.
+        """
+        scanned = changed = 0
+        transitions: dict[str, int] = {}
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT key_hash, status, response FROM cache WHERE namespace = ?",
+                (namespace,),
+            ).fetchall()
+            for row in rows:
+                scanned += 1
+                if row["response"] is None:
+                    continue
+                status = status_fn(row["response"])
+                if status != row["status"]:
+                    changed += 1
+                    key = f"{row['status']}->{status}"
+                    transitions[key] = transitions.get(key, 0) + 1
+                    if not dry_run:
+                        self._conn.execute(
+                            "UPDATE cache SET status = ? WHERE key_hash = ?",
+                            (status, row["key_hash"]),
+                        )
+            if changed and not dry_run:
+                self._conn.commit()
+        return {
+            "namespace": namespace, "rows_scanned": scanned, "rows_changed": changed,
+            "transitions": transitions, "applied": bool(changed and not dry_run),
         }
 
     def vacuum(self) -> None:
