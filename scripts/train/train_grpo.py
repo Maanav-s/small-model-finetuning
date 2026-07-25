@@ -306,10 +306,42 @@ def main() -> None:
     from cache import Cache
     from peft import LoraConfig
     from tools import setup_tools
-    from transformers import AutoTokenizer
+    from transformers import AutoTokenizer, TrainerCallback
     from trl import GRPOConfig, GRPOTrainer
 
     from model import MODEL_ID
+
+    # TRL's tool loop CATCHES tool exceptions (grpo_trainer.py ~1527 wraps sync calls
+    # in `except Exception`; the async path gathers with return_exceptions=True) and
+    # feeds `{"error": str(e)}` back as the tool message -- so backends'
+    # BrowserDeadError CANNOT abort training from inside a tool call. What it does
+    # instead is saturate TRL's `tools/failure_rate` metric (once the breaker trips,
+    # every scrape raises instantly). This callback is the abort path: stop when the
+    # failure rate stays saturated, before hundreds of steps train against
+    # {"error": ...} rollouts. A healthy run sits near 0 -- scrape/site failures
+    # return SENTINELS (never raise), so TRL-visible failures are only malformed
+    # tool-call args and the breaker itself -- which puts the threshold far outside
+    # normal noise. Stopping via `should_training_stop` is graceful: the in-flight
+    # step finishes and the adapter save below still runs.
+    TOOL_FAILURE_ABORT_RATE = 0.8
+    TOOL_FAILURE_ABORT_LOGS = 3
+
+    class ToolFailureAbort(TrainerCallback):
+        def __init__(self):
+            self.consecutive = 0
+
+        def on_log(self, args_, state, control, logs=None, **kwargs):
+            rate = (logs or {}).get("tools/failure_rate")
+            if rate is None:
+                return
+            self.consecutive = self.consecutive + 1 if rate >= TOOL_FAILURE_ABORT_RATE else 0
+            if self.consecutive >= TOOL_FAILURE_ABORT_LOGS:
+                print(f"\n[ABORT] tools/failure_rate >= {TOOL_FAILURE_ABORT_RATE} for "
+                      f"{self.consecutive} consecutive logging steps (step {state.global_step}): "
+                      f"the tool stack is broken (dead local browser / BrowserDeadError), so "
+                      f"rollouts are error text, not evidence. Stopping training; the adapter "
+                      f"for the steps already trained is still saved.", flush=True)
+                control.should_training_stop = True
 
     # Fail before the (expensive, GPU-holding) model load, not on rollout 1: under a
     # live/error cache policy the rollouts scrape through the local browser, and a
@@ -396,6 +428,7 @@ def main() -> None:
         tools=tools,
         peft_config=lora_config,
         processing_class=tokenizer,
+        callbacks=[ToolFailureAbort()],
     )
     trainer.train()
 

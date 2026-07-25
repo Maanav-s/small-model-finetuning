@@ -542,14 +542,18 @@ def _throttle(host: str) -> None:
 # Consecutive scrapes that failed on the LOCAL browser stack. A dead browser turns
 # every scrape into an infra sentinel; per-script breakers (warm_cache's
 # INFRA_ABORT_CONSECUTIVE, build_corpus's episode counter) can only notice after
-# whole restaurants/episodes of work have been wasted -- and a caller without one
-# (TRL's GRPO tool loop) would grind to the end of the run training on failure
-# text. Raising here stops EVERY caller: the exception propagates out of the tool
-# call, fails the episode, and trips whatever per-episode breaker the script has.
-# Successful browser renders and SITE failures (the browser worked; the site
-# refused) reset the streak, so only a browser failing every consecutive call can
-# trip it. A browser broken FROM THE START is caught cheaper by preflight_browser;
-# this catches one that dies MID-RUN.
+# whole restaurants/episodes of work have been wasted. Raising stops the sync
+# callers: the exception propagates out of the tool call, fails the episode, and
+# trips the script's per-episode breaker. ONE caller needs its own companion:
+# TRL's GRPO tool loop CATCHES tool exceptions (grpo_trainer.py ~1527 `except
+# Exception`; async gathers with return_exceptions=True) and feeds {"error": ...}
+# back as the tool message -- there, this raise surfaces as a SATURATED
+# `tools/failure_rate` metric (every call raising instantly), and train_grpo.py's
+# ToolFailureAbort callback is what turns that into a stop. Successful browser
+# renders and SITE failures (the browser worked; the site refused) reset the
+# streak, so only a browser failing every consecutive call can trip it. A browser
+# broken FROM THE START is caught cheaper by preflight_browser; this catches one
+# that dies MID-RUN.
 INFRA_STREAK_ABORT = 15
 _infra_streak = 0
 _INFRA_LOCK = threading.Lock()
