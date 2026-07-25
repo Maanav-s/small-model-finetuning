@@ -20,8 +20,10 @@ not just the teacher's path, must be pre-cached, so:
 
 Caching is NOT reimplemented: the same Cache.wrap over the same backend closures
 with the same key fns (norm_query / norm_scrape) as tools.setup_tools, so an agent
-later issuing an identical query/URL/mode hits the rows warmed here, and the stored
-responses are the raw uncapped strings (MAX_TOOL_CHARS stays a read-time concern).
+later issuing an identical query/URL/mode hits the rows warmed here. build_scrape
+slims its own output at the source (backends._slim_scrape), so the stored responses
+are the SLIMMED, uncapped strings -- exactly what a cache hit serves the agent
+(MAX_TOOL_CHARS stays a read-time concern).
 
 Idempotent / resumable BY CONSTRUCTION: every call goes through the cache under
 miss_policy="live", where an already-stored ok/empty row is a hit that returns
@@ -55,6 +57,8 @@ from dotenv import load_dotenv  # noqa: E402
 load_dotenv(REPO_ROOT / ".env")
 
 from backends import (  # noqa: E402
+    SKIP_DOMAINS,
+    SKIP_EXTENSIONS,
     build_scrape,
     build_search,
     close_pool,
@@ -62,6 +66,7 @@ from backends import (  # noqa: E402
     is_cacheable,
     is_infra_failure,
     preflight_browser,
+    skip_reason,
 )
 from cache import CANNED, Cache, norm_query, norm_scrape, scrape_status  # noqa: E402
 from corpus import VALID_SPLITS, open_corpus  # noqa: E402
@@ -77,22 +82,23 @@ DIRECT_MODE, BROWSER_MODE = "direct", "browser"
 # signal (under --modes auto) to ALSO warm the auto-scroll "browser" render.
 WARM_BROWSER_IF_UNDER = 2000
 
-# Obvious dead ends, not warmed (bot-walled aggregators / login-walled socials).
-# Match by registrable suffix (subdomains included).
-SKIP_DOMAINS = frozenset({
-    "doordash.com", "ubereats.com", "grubhub.com", "seamless.com",
-    "postmates.com", "yelp.com", "facebook.com", "instagram.com",
-})
-
-# Non-HTML payloads the markdown scrape can't do anything useful with.
-SKIP_EXTENSIONS = (".pdf", ".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg")
+# Dead-end URLs (bot-walled aggregators, binary payloads -- backends.SKIP_DOMAINS /
+# SKIP_EXTENSIONS, imported above) are handled TWO ways here:
+#   * extract_urls keeps them OUT of the top-N funnel, so real URLs fill the
+#     urls_per_query slots instead of bot walls;
+#   * warm_one still WARMS them (both modes) -- the backend answers each with an
+#     instant deterministic sentinel (backends.skip_reason, no network), so the row
+#     costs nothing and a canned/frozen run later replays the exact string a live
+#     run would have seen instead of falling to the CANNED miss constant.
 
 # A cache hit returns in microseconds; anything slower did real network work.
 NETWORK_CALL_MIN_S = 0.05
 
-# Abort if this many restaurants RAISE in a row. warm_one only raises via search
-# (scrape returns sentinels instead), so this guards a dead Brave key/network --
-# same pattern as build_corpus.
+# Abort if this many restaurants RAISE in a row. warm_one raises via search (a dead
+# Brave key/network -- same pattern as build_corpus) and, since the backends-level
+# circuit breaker landed, via scrape's BrowserDeadError (15 consecutive infra-failed
+# scrapes process-wide) -- either way, consecutive raising restaurants mean the RUN
+# is broken, not the restaurants.
 MAX_CONSECUTIVE_FAILURES = 5
 
 # ... and this guards the browser, which never raises: scrape returns a sentinel
@@ -184,7 +190,8 @@ def render_queries(templates: list[str], row: dict) -> list[str]:
 def extract_urls(search_response: str, top_n: int) -> tuple[list[str], list[str]]:
     """Top-N result URLs from a formatted search response -> (keep, skipped).
 
-    Dead ends (SKIP_DOMAINS / SKIP_EXTENSIONS / non-http) land in `skipped`.
+    Dead ends (backends.SKIP_DOMAINS / SKIP_EXTENSIONS / non-http) land in
+    `skipped` and do not consume top-N slots.
     """
     keep, skipped = [], []
     for url in _RESULT_URL_RE.findall(search_response or ""):
@@ -224,14 +231,17 @@ def warm_one(row: dict, search_fn, scrape_fn, queries: list[str], urls_per_query
     Each direct scrape escalates to a browser render when warm_both (--modes both)
     OR the direct result is thin/failed (WARM_BROWSER_IF_UNDER). URLs seen under an
     earlier template are not re-scraped (the cache would hit anyway; skipping keeps
-    the counters honest). Returns a summary dict; the caller aggregates.
+    the counters honest). Dead-end URLs (skip_reason) are warmed too, both modes --
+    the backend answers them with an instant sentinel and no network, so a frozen
+    (canned) run replays the same string a live run sees. Returns a summary dict;
+    the caller aggregates.
 
     `stop` is a cooperative-cancel flag: the loops check it between scrapes so a
     Ctrl+C (main sets it) makes an in-flight restaurant bail promptly instead of
     running its full query x URL grid.
     """
     rendered = render_queries(queries, row)
-    n_direct = n_browser = 0
+    n_direct = n_browser = n_sentinels = 0
     infra_errors = site_errors = 0
     n_urls = n_skipped = n_no_results = 0
     seen_urls: set[str] = set()
@@ -280,10 +290,25 @@ def warm_one(row: dict, search_fn, scrape_fn, queries: list[str], urls_per_query
                 bresult = _scrape(scrape_fn, url, BROWSER_MODE, sleep_s)
                 n_browser += 1
                 count(bresult)
+        # Dead ends the backend will answer with an instant sentinel: warm BOTH
+        # modes anyway (no network, near-zero cost) so a canned/frozen run later
+        # replays the exact sentinel a live run sees instead of the CANNED miss
+        # constant. Non-http junk (skip_reason None) would cost a real failed
+        # fetch, so it stays un-warmed.
+        for url in skipped:
+            if stop is not None and stop.is_set():
+                break
+            if url in seen_urls or skip_reason(url) is None:
+                continue
+            seen_urls.add(url)
+            n_sentinels += 1
+            _scrape(scrape_fn, url, DIRECT_MODE, sleep_s)
+            _scrape(scrape_fn, url, BROWSER_MODE, sleep_s)
 
     return {
         "rid": row["restaurant_id"], "name": row["name"],
         "queries": len(rendered), "urls": n_urls, "urls_skipped": n_skipped,
+        "sentinels": n_sentinels,
         "no_results": n_no_results,
         "scrape_direct": n_direct, "scrape_browser": n_browser,
         "scrape_calls": n_direct + n_browser,
@@ -320,7 +345,8 @@ def dry_run(selection: list[dict], cache_path: str, queries: list[str],
             for url in urls:
                 print(f"    scrape: {url} ({browser_note})")
             for url in skipped:
-                print(f"    skip (dead end): {url}")
+                note = "warmed as instant sentinel" if skip_reason(url) else "not warmed"
+                print(f"    dead end ({note}): {url}")
     peek.close()
 
 
@@ -354,10 +380,12 @@ def main():
 
     cache = Cache(args.cache_path, miss_policy="live")
 
-    # Exactly the setup_tools wiring: cache wraps the RAW backend closures with
+    # Exactly the setup_tools wiring: cache wraps the same backend closures with
     # the same key fns the agent runs use, so agent-issued identical queries /
-    # url+mode pairs hit the rows warmed here. store_if=is_cacheable keeps
-    # local-browser failures out of the DB entirely (they'd be fabricated rows).
+    # url+mode pairs hit the rows warmed here. build_scrape slims at the source,
+    # so what's stored is the slimmed body the agent would see. store_if=
+    # is_cacheable keeps local-browser failures out of the DB entirely (they'd be
+    # fabricated rows).
     search_fn = cache.wrap("search", build_search(), key_fn=norm_query, provider="brave")
     scrape_fn = cache.wrap("scrape", build_scrape(), key_fn=norm_scrape,
                            status_fn=scrape_status, provider="local", store_if=is_cacheable)
@@ -399,9 +427,10 @@ def main():
                     failures.append((row["restaurant_id"], row["name"], repr(exc)))
                     consecutive_failures += 1
                     print(f"[{i}/{len(selection)}] FAILED {row['name']!r}: {exc!r}")
-                    # warm_one only raises via SEARCH (scrape returns sentinels
-                    # instead), so this breaker guards Brave -- a dead key or a
-                    # network outage -- while the infra one below guards the browser.
+                    # warm_one raises via SEARCH (a dead Brave key / network outage)
+                    # or via scrape's BrowserDeadError (the backends-level infra
+                    # breaker); the infra counter below guards a browser that is
+                    # failing but hasn't tripped that breaker yet.
                     if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
                         aborted = f"{consecutive_failures} consecutive restaurant failures (search)"
                         halt()
@@ -449,7 +478,8 @@ def main():
         n_calls = n_direct + n_browser
         print(f"searches issued: {sum(r['queries'] for r in results)}  "
               f"urls planned: {sum(r['urls'] for r in results)}  "
-              f"dead ends skipped: {sum(r['urls_skipped'] for r in results)}  "
+              f"dead ends: {sum(r['urls_skipped'] for r in results)} "
+              f"(sentinel-warmed: {sum(r['sentinels'] for r in results)})  "
               f"searches with no results: {sum(r['no_results'] for r in results)}")
         print(f"scrape calls: {n_direct} direct + {n_browser} browser = {n_calls} total; "
               f"{100 * n_browser / max(1, n_direct):.0f}% browser rate")

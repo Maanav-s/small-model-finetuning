@@ -243,6 +243,45 @@ class TestWarmOne:
         assert cache._get("scrape", norm_scrape("https://a.com", "direct")) is None
         assert cache.stats()["writes"] == 1  # the search row only
 
+    def test_dead_end_urls_are_sentinel_warmed_in_both_modes(self):
+        """Dead ends stay OUT of the top-N funnel but are still warmed: the real
+        backend answers them with an instant sentinel (skip_reason, no network), so
+        warming costs nothing and a canned run later replays the same string a live
+        run sees -- instead of falling to the CANNED miss constant. Non-fetchable
+        junk (mailto: etc.) is NOT warmed: the backend would really try it."""
+        from backends import BLOCKED_SITE_RESULT
+
+        cache = Cache(":memory:", miss_policy="live")
+        scrape_calls = []
+
+        def fake_scrape(url, mode="direct"):
+            scrape_calls.append((url, mode))
+            return BLOCKED_SITE_RESULT if "doordash" in url else _FULL
+
+        search_fn = cache.wrap("search", lambda q: brave_response(
+            "https://www.doordash.com/store/x", "mailto:owner@place.com",
+            "https://own-site.com/menu",
+        ), key_fn=norm_query)
+        scrape_fn = cache.wrap("scrape", fake_scrape, key_fn=norm_scrape,
+                               status_fn=scrape_status)
+        row = {"restaurant_id": "abc", "name": "A", "city": "B"}
+        summary = warm_cache.warm_one(row, search_fn, scrape_fn, QUERIES,
+                                      urls_per_query=3, sleep_s=0, warm_both=False)
+
+        assert scrape_calls == [
+            ("https://own-site.com/menu", "direct"),          # the real URL, top-N slot
+            ("https://www.doordash.com/store/x", "direct"),   # sentinel-warmed...
+            ("https://www.doordash.com/store/x", "browser"),  # ...in BOTH modes
+        ]  # mailto: never scraped -- skip_reason(None) means a real (failing) fetch
+        assert summary["urls"] == 1 and summary["urls_skipped"] == 2
+        assert summary["sentinels"] == 1
+        # The sentinel rows are stored as PERMANENT negatives ('empty'): a hit under
+        # live, replayed verbatim under canned.
+        for mode in ("direct", "browser"):
+            stored = cache._get("scrape", norm_scrape("https://www.doordash.com/store/x", mode))
+            assert stored is not None and stored["status"] == "empty"
+            assert stored["response"] == BLOCKED_SITE_RESULT
+
     def test_modes_both_warms_browser_even_when_direct_is_full(self):
         cache = Cache(":memory:", miss_policy="live")
         scrape_calls = []
@@ -310,5 +349,5 @@ class TestDryRun:
 
         out = self._run(monkeypatch, capsys, corpus_path, cache_path)
         assert "scrape: https://ssamjang.com/menu (direct, + browser only if direct is thin)" in out
-        assert "skip (dead end): https://www.doordash.com/store/ssamjang" in out
+        assert "dead end (warmed as instant sentinel): https://www.doordash.com/store/ssamjang" in out
         assert out.count("search not cached yet") == 1  # only the un-warmed row
