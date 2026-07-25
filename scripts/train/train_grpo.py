@@ -302,6 +302,7 @@ def main() -> None:
 
     load_dotenv(ROOT / ".env")  # BRAVE_API_KEY for the live scrape/search tool backends
 
+    from backends import preflight_browser
     from cache import Cache
     from peft import LoraConfig
     from tools import setup_tools
@@ -309,6 +310,16 @@ def main() -> None:
     from trl import GRPOConfig, GRPOTrainer
 
     from model import MODEL_ID
+
+    # Fail before the (expensive, GPU-holding) model load, not on rollout 1: under a
+    # live/error cache policy the rollouts scrape through the local browser, and a
+    # browser that cannot launch would turn every tool result into an infra sentinel
+    # the reward then trains against. Same discipline as build_corpus/warm_cache; a
+    # browser that dies MID-run is caught by backends' BrowserDeadError breaker.
+    if args.cache_policy != "canned":  # canned replays only; it never launches a browser
+        browser_error = preflight_browser()
+        if browser_error:
+            sys.exit(f"browser preflight failed, refusing to start:\n  {browser_error}")
 
     # Tools: real backends wrapped in the cache (live -> grounding sees real content).
     cache = Cache(args.cache_path, miss_policy=args.cache_policy)

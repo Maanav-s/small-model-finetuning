@@ -89,6 +89,7 @@ from episodes import (  # noqa: E402
     plan_episodes,
     seeded_order,
 )
+from backends import preflight_browser  # noqa: E402
 from cache import Cache, CacheMiss  # noqa: E402
 from claude_agent import MODEL_ID as CLAUDE_MODEL_ID  # noqa: E402
 from claude_agent import run_episode as claude_run_episode  # noqa: E402
@@ -414,6 +415,15 @@ def produce_candidates(args, episodes, todo, candidate_dir):
         sys.exit("ANTHROPIC_API_KEY is required for --model claude (repo-root .env)")
 
     label = model_label(args)
+
+    # Fail before episode 1, not on scrape 1 of a long eval: under live/error the
+    # tools scrape through the local browser (canned replays only and never launches
+    # one). Same discipline as build_corpus/warm_cache/train_grpo.
+    if args.cache_policy != "canned":
+        browser_error = preflight_browser()
+        if browser_error:
+            sys.exit(f"browser preflight failed, refusing to start:\n  {browser_error}")
+
     cache = Cache(args.cache_path, miss_policy=args.cache_policy)
     # Tools/registry are restriction-independent (only the system prompt embeds the
     # restriction), so build tools ONCE and memoize the student prompt per unique
