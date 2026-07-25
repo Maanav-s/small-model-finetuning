@@ -15,9 +15,10 @@ The model only ever sees ONE search and ONE scrape tool, both named generically
 *backend stays invisible to the model*. The generic names also keep vendor
 branding out of the SFT/GRPO training data the tool calls get baked into later.
 
-Caching (Phase 2): setup_tools(cache=Cache(...)) slims the scrape backend's output
-(_slim_scrape) and then wraps it in the content-addressed SQLite cache (src/cache.py)
-BEFORE build_model_tools applies the MAX_TOOL_CHARS cap -- so the stored response is
+Caching (Phase 2): setup_tools(cache=Cache(...)) wraps the backend closures in the
+content-addressed SQLite cache (src/cache.py) BEFORE build_model_tools applies the
+MAX_TOOL_CHARS cap. The scrape backend slims its own output at the source
+(backends._slim_scrape, baked into build_scrape) -- so the stored response is
 SLIMMED (junk removed) but uncapped, and only the cap stays retunable without
 re-scraping. cache=None (default) = uncached. search is not slimmed (the model
 mines its results for URLs).
@@ -27,9 +28,8 @@ from __future__ import annotations
 
 import asyncio
 import functools
-import re
 
-from backends import DATA_URI_RE, build_scrape, build_search, is_cacheable
+from backends import build_scrape, build_search, is_cacheable
 from cache import norm_query, norm_scrape, scrape_status
 from prompts import build_system_prompt
 
@@ -62,82 +62,6 @@ from prompts import build_system_prompt
 # bounded at cache.MAX_STORED_CHARS = 400K); the STUDENT's SFT cap is tuned
 # separately at build time (analyze_tool_chars.py).
 MAX_TOOL_CHARS = 24000
-
-
-# ---------------------------------------------------------------------------
-# Scrape-result slimming (token cost) -- applied to the backend output BEFORE the
-# cache (setup_tools), so a NEW scrape caches (and returns) a slimmed body;
-# clean_cache.py retro-applies the SAME transform to rows cached earlier. The
-# MAX_TOOL_CHARS *cap* stays a separate read-time step (build_model_tools) so it
-# remains retunable without re-scraping -- only the junk removal is baked in.
-# ---------------------------------------------------------------------------
-# What gets dropped is deliberately CONSERVATIVE: images, text-less links, and
-# dead-end hrefs (tel:/mailto:/js/#fragments/image files) -- measured 10.0%
-# smaller on the pilot's 401 cached pages. Navigable hrefs are KEPT: 17.7% of
-# the teacher's scrape calls used a URL found only via in-page links (homepage
-# -> menu page, own site -> ordering platform), so stripping all link targets
-# (a further ~13%) would break real trajectories. Applied to scrape results
-# only -- search results are WHERE the model gets URLs from.
-_MD_IMAGE_RE = re.compile(r"!\[[^\]]*\]\([^)]*\)")
-_MD_EMPTY_LINK_RE = re.compile(r"\[\s*\]\(\s*[^)]*\)")
-_MD_DEAD_HREF_RE = re.compile(
-    r"\[([^\]]+)\]\(\s*(?:tel:|mailto:|javascript:|#)[^)]*\)"
-    r"|\[([^\]]+)\]\(\s*[^)]*\.(?:png|jpe?g|gif|webp|svg|ico)(?:\?[^)]*)?\s*\)",
-    re.IGNORECASE,
-)
-
-# A list line that is ONLY a bullet marker (markdownify emits "* " for an empty <li>,
-# and image/link removal above can leave a bullet with nothing after it). Measured
-# 2026-07-22: one menu page had 918 of these. Pure noise -- drop the whole line.
-_MD_EMPTY_BULLET_RE = re.compile(r"(?m)^[ \t]*[-*+][ \t]*$\n?")
-
-
-def _slim_scrape(md: str) -> str:
-    """Drop non-navigable markdown bulk from a scraped page (see block comment).
-
-    Iterated to a FIXED POINT: one stage's removal can expose a match for an earlier
-    stage (e.g. dropping an image empties the bullet that held it; dropping a line
-    merges two blank runs), so a single pass isn't idempotent -- a few real pages
-    needed a second pass. That matters here because clean_cache.py bakes this same
-    transform into the stored rows: if `slim(raw)` still had junk `slim` would strip
-    on the next read, a cached hit (stored pre-slimmed) and a fresh fetch would
-    disagree. Every stage only deletes or shortens, so the length strictly drops on
-    any change and the loop terminates (typically after 2 passes: one real, one that
-    confirms nothing else matches)."""
-    prev = None
-    while md != prev:
-        prev = md
-        # NUL bytes never belong in menu markdown -- they signal a binary blob
-        # mangled through the HTML->markdown pipeline (one cached page was a binary
-        # file rendered to 1.9M chars with 10.6K NULs). Beyond being junk, an embedded
-        # NUL breaks SQLite's length()/substr() (both stop counting at the first NUL),
-        # so a NUL-bearing row is invisible to cache.clip_oversized's SQL bound and
-        # can't be trimmed until the NULs are gone -- strip them first.
-        md = md.replace("\x00", "")
-        # Base64 data: URIs (the dominant bulk; see backends.DATA_URI_RE). New scrapes
-        # are already scrubbed at the source, but rows CACHED before that landed still
-        # carry the blob -- often a data URI clipped mid-string, which the image regex
-        # below cannot match -- so strip it here too.
-        md = DATA_URI_RE.sub("", md)
-        md = _MD_IMAGE_RE.sub("", md)
-        md = _MD_EMPTY_LINK_RE.sub("", md)
-        md = _MD_DEAD_HREF_RE.sub(lambda m: m.group(1) or m.group(2), md)
-        md = _MD_EMPTY_BULLET_RE.sub("", md)  # after image/link removal, which can empty a bullet
-        md = re.sub(r"\n{3,}", "\n\n", md)  # collapse runs of blank lines to a single one
-    return md
-
-
-def _slimming_scrape(scrape_fn):
-    """Wrap a scrape backend closure so it returns SLIMMED markdown.
-
-    setup_tools applies this to the raw build_scrape() closure BEFORE the cache wrap,
-    so the slimmed body is what gets stored (a new scrape caches a slim response) and
-    what negative-caching classifies -- not just what the read path shows. The wrapped
-    closure keeps the (url, mode="direct") signature the cache's norm_scrape key_fn and
-    the model-facing scrape_url both expect."""
-    def scrape(url, mode="direct"):
-        return _slim_scrape(scrape_fn(url, mode))
-    return scrape
 
 
 def _cap(text: str, label: str) -> str:
@@ -231,8 +155,8 @@ def build_model_tools(search_fn, scrape_fn, async_tools: bool = False):
                 as a fallback when a "direct" fetch came back empty or clearly
                 missing the menu, and keep whichever result actually has the menu.
         """
-        # scrape_fn already returns slimmed markdown (setup_tools wraps the backend
-        # with _slim_scrape BEFORE the cache), so here we only apply the char cap.
+        # scrape_fn already returns slimmed markdown (build_scrape slims at the
+        # source -- see backends._slim_scrape), so here we only apply the char cap.
         return _cap(scrape_fn(url, mode), "scrape_url")
 
     tools = [web_search, scrape_url]
@@ -256,8 +180,8 @@ def setup_tools(dietary_restrictions=None, variant: str = "teacher", cache=None,
     so the model filters the menu to complying items; empty means no filtering.
     variant ("teacher" | "student"): system-prompt variant (see prompts.py) --
     "teacher" (default) carries the source-selection guidance, "student" omits it.
-    cache (cache.Cache | None): when given, it wraps the BACKEND closures -- after
-    the scrape output is slimmed (below) but BEFORE the MAX_TOOL_CHARS cap -- so the
+    cache (cache.Cache | None): when given, it wraps the BACKEND closures BEFORE
+    the MAX_TOOL_CHARS cap. build_scrape slims its own output at the source, so the
     stored response is SLIMMED but uncapped, and the cap stays retunable without
     re-scraping. The cache's miss_policy (live/canned/error) decides what a miss
     does; see src/cache.py.
@@ -267,12 +191,6 @@ def setup_tools(dietary_restrictions=None, variant: str = "teacher", cache=None,
     wants this; the sync callers would get coroutines back.
     """
     search_fn, scrape_fn = build_search(), build_scrape()
-    # Slim the scrape backend's markdown BEFORE anything else wraps it, so a new
-    # scrape CACHES a slimmed body (matching what the model sees) and negative-caching
-    # classifies the slimmed text. _slim_scrape is idempotent, so a cache built before
-    # this (and clean_cache's retro slim) stays consistent. search is not slimmed --
-    # the model mines its results for URLs.
-    scrape_fn = _slimming_scrape(scrape_fn)
     if cache is not None:
         # scrape is 2-arg (url, mode); norm_scrape keys on BOTH so direct/browser
         # renders are distinct entries. scrape_status marks failure sentinels

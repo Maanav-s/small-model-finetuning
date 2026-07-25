@@ -6,6 +6,7 @@ pytest's tmp_path; everything else runs on :memory: sqlite.
 Run: uv run python -m pytest tests/ -q
 """
 
+import re
 import sys
 import threading
 from pathlib import Path
@@ -605,20 +606,67 @@ class TestSlimRows:
 
 
 class TestSlimBeforeCache:
-    """setup_tools slims the scrape backend BEFORE the cache, so a NEW scrape caches
-    (and returns) a slimmed body -- not just what the read path shows."""
+    """build_scrape slims its own output AT THE SOURCE, so ANY cache wrapping the
+    backend closure stores (and returns) a slimmed body -- this is what used to
+    live in tools.setup_tools, where warm_cache's own wiring could (and did) miss
+    it and cache raw rows."""
 
-    def test_slimming_scrape_caches_a_slimmed_body(self):
-        from tools import _slimming_scrape  # local import: pulls backends/prompts/schema
+    def test_build_scrape_caches_a_slimmed_body(self, monkeypatch):
+        import backends  # local import: keeps cache tests decoupled unless needed
 
-        raw = "![logo](data:image/png;base64,QUJDQUJD) Real menu: Pizza $10 " * 5
-        backend = CountingFn(raw)
+        raw_html = ("<p>" + "Real menu: Pizza $10 " * 30 + "</p>"
+                    "<img src='https://r.com/logo.png' alt='logo'><ul><li></li></ul>")
+        monkeypatch.setattr(backends, "_render_pooled",
+                            lambda url, *, wait, scroll: raw_html)
         cache = Cache(":memory:", miss_policy="live")
-        scrape_fn = cache.wrap("scrape", _slimming_scrape(backend), key_fn=norm_scrape,
+        scrape_fn = cache.wrap("scrape", backends.build_scrape(), key_fn=norm_scrape,
                                status_fn=scrape_status, provider="local")
 
-        out = scrape_fn("https://r.com/menu")
-        assert "data:image" not in out and "![logo]" not in out  # caller gets slim
+        out = scrape_fn("https://r.com/menu", "browser")
+        assert "![" not in out and "logo.png" not in out         # caller gets slim
         assert "Real menu: Pizza $10" in out                     # real text kept
-        stored = cache._get("scrape", norm_scrape("https://r.com/menu", "direct"))["response"]
-        assert "data:image" not in stored                        # STORED row is slim too
+        stored = cache._get("scrape", norm_scrape("https://r.com/menu", "browser"))["response"]
+        assert stored == out                                     # STORED row is slim too
+
+
+class TestReclassify:
+    """Cache.reclassify: recompute status from the STORED text (slim_rows rewrites
+    the response only, so a row classified on pre-slim junk keeps a stale 'ok')."""
+
+    JUNK = "![x](https://a.com/x.png) " * 20  # raw: >200 chars 'ok'; slims to nothing
+
+    def _stale_cache(self):
+        cache = Cache(":memory:", miss_policy="live")
+        cache.wrap("scrape", CountingFn(self.JUNK), key_fn=norm_scrape,
+                   status_fn=scrape_status)("https://junk.com")
+        assert cache._get("scrape", norm_scrape("https://junk.com", "direct"))["status"] == "ok"
+        # The retro slim shrinks the text but NOT the status -- the stale-'ok' hole.
+        cache.slim_rows(lambda s: re.sub(r"!\[[^\]]*\]\([^)]*\)", "", s).strip())
+        return cache
+
+    def test_reclassify_fixes_a_stale_ok(self):
+        cache = self._stale_cache()
+        rep = cache.reclassify(scrape_status)
+        assert rep["rows_changed"] == 1
+        assert rep["transitions"] == {"ok->empty": 1}
+        assert cache._get("scrape", norm_scrape("https://junk.com", "direct"))["status"] == "empty"
+
+    def test_reclassify_is_idempotent(self):
+        cache = self._stale_cache()
+        assert cache.reclassify(scrape_status)["rows_changed"] == 1
+        assert cache.reclassify(scrape_status)["rows_changed"] == 0
+
+    def test_dry_run_reports_without_mutating(self):
+        cache = self._stale_cache()
+        rep = cache.reclassify(scrape_status, dry_run=True)
+        assert rep["rows_changed"] == 1 and rep["applied"] is False
+        assert cache._get("scrape", norm_scrape("https://junk.com", "direct"))["status"] == "ok"
+
+    def test_correct_rows_and_other_namespaces_untouched(self):
+        cache = Cache(":memory:", miss_policy="live")
+        cache.wrap("scrape", CountingFn("x" * 300), key_fn=norm_scrape,
+                   status_fn=scrape_status)("https://fine.com")
+        cache.wrap("search", CountingFn(""), key_fn=norm_query)("q")  # 'empty' search row
+        rep = cache.reclassify(scrape_status)  # scrape namespace only
+        assert rep["rows_changed"] == 0
+        assert cache._get("search", norm_query("q"))["status"] == "empty"

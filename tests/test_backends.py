@@ -10,7 +10,26 @@ from playwright.sync_api import Error as PlaywrightError
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 import backends  # noqa: E402
-from backends import build_scrape, is_cacheable, preflight_browser  # noqa: E402
+from backends import (  # noqa: E402
+    BINARY_URL_RESULT,
+    BLOCKED_SITE_RESULT,
+    BrowserDeadError,
+    build_scrape,
+    is_cacheable,
+    preflight_browser,
+    skip_reason,
+)
+from cache import MIN_CONTENT_CHARS, scrape_status  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _reset_backend_state(monkeypatch):
+    """Isolate the process-wide backend state (infra streak, throttle ledger) per
+    test, and zero the politeness interval so tests never sleep."""
+    monkeypatch.setattr(backends, "_infra_streak", 0)
+    monkeypatch.setattr(backends, "_LAST_FETCH", {})
+    monkeypatch.setattr(backends, "DOMAIN_MIN_INTERVAL_S", 0)
+
 
 # Deep enough to blow the interpreter recursion limit inside BeautifulSoup /
 # markdownify -- the shape that killed 10/99 pilot episodes (see build_corpus).
@@ -167,6 +186,177 @@ class TestIsCacheable:
                             "Page.goto: Timeout 30000ms exceeded.)")
         assert is_cacheable("(page returned no content)")
         assert is_cacheable("# Real menu\n- Pad Thai $12")
+
+
+def _no_network(monkeypatch):
+    """Make ANY network path fail the test loudly (requests fetch + browser render)."""
+    def boom(*args, **kwargs):
+        raise AssertionError("network path touched")
+    monkeypatch.setattr(backends.requests.Session, "get", boom)
+    monkeypatch.setattr(backends, "_render_pooled", boom)
+
+
+class FakeResp:
+    """Minimal requests.Response stand-in for the direct path."""
+
+    def __init__(self, text="", ctype="text/html"):
+        self.text = text
+        self.headers = {"content-type": ctype}
+
+    def raise_for_status(self):
+        pass
+
+
+class TestSkipReason:
+    def test_blocked_domains_and_subdomains(self):
+        assert skip_reason("https://www.doordash.com/store/x") == BLOCKED_SITE_RESULT
+        assert skip_reason("https://order.ubereats.com/x") == BLOCKED_SITE_RESULT
+
+    def test_binary_extensions(self):
+        assert skip_reason("https://menu.example.com/menu.pdf") == BINARY_URL_RESULT
+
+    def test_lookalike_domain_and_real_urls_pass(self):
+        assert skip_reason("https://notyelp.com/menu") is None
+        assert skip_reason("https://pagliacci.com/menu") is None
+
+    def test_sentinel_contract_permanent_negative(self):
+        """The sentinels MUST classify 'empty' (cached once, never re-fetched under
+        live, replayed under canned) and be storable -- the whole design leans on
+        cache.MIN_CONTENT_CHARS and the failure-marker prefixes not matching."""
+        for sentinel in (BLOCKED_SITE_RESULT, BINARY_URL_RESULT,
+                         backends._non_html_result("application/pdf")):
+            assert len(sentinel) < MIN_CONTENT_CHARS
+            assert scrape_status(sentinel) == "empty"
+            assert is_cacheable(sentinel)
+
+
+class TestDeadEndsAnswerInstantly:
+    """A known dead-end URL must never reach the network -- no 30-45s bot-wall
+    timeout, no 'error' row that live policy re-fetches every pass."""
+
+    def test_blocked_domain_returns_sentinel_without_network(self, monkeypatch):
+        _no_network(monkeypatch)
+        scrape = build_scrape()
+        assert scrape("https://www.yelp.com/biz/some-place") == BLOCKED_SITE_RESULT
+        assert scrape("https://www.yelp.com/biz/some-place", mode="browser") == BLOCKED_SITE_RESULT
+
+    def test_binary_extension_returns_sentinel_without_network(self, monkeypatch):
+        _no_network(monkeypatch)
+        assert build_scrape()("https://a.com/menu.pdf") == BINARY_URL_RESULT
+
+
+class TestContentTypeGuard:
+    def test_non_html_payload_returns_sentinel_and_does_not_escalate(self, monkeypatch):
+        """An extension-less URL serving a PDF must not be markdownified (one PDF
+        made a 14M-char row) NOR handed to the browser (which can't read it either)."""
+        monkeypatch.setattr(backends.requests.Session, "get",
+                            lambda self, url, timeout=None: FakeResp("%PDF-1.7 ...",
+                                                                     "application/pdf"))
+        def no_render(*args, **kwargs):
+            raise AssertionError("browser render attempted for a binary payload")
+        monkeypatch.setattr(backends, "_render_pooled", no_render)
+        out = build_scrape()("https://a.com/menu")  # no .pdf extension
+        assert "application/pdf" in out
+        assert scrape_status(out) == "empty"
+
+    def test_html_with_charset_param_passes(self, monkeypatch):
+        big = "<p>" + "menu item $9 " * 200 + "</p>"
+        monkeypatch.setattr(backends.requests.Session, "get",
+                            lambda self, url, timeout=None: FakeResp(
+                                big, "text/html; charset=utf-8"))
+        out = build_scrape()("https://a.com/menu")
+        assert "menu item $9" in out
+
+
+class TestSlimAtSource:
+    def test_scrape_output_is_slimmed(self, monkeypatch):
+        html = ("<p>" + "Real menu: Pizza $10 " * 30 + "</p>"
+                "<img src='https://a.com/logo.png' alt='logo'><ul><li></li></ul>")
+        monkeypatch.setattr(backends, "_render_pooled", lambda url, *, wait, scroll: html)
+        out = build_scrape()("https://a.com/menu", mode="browser")
+        assert "![" not in out and "logo.png" not in out
+        assert "Real menu: Pizza $10" in out
+
+
+class TestInfraBreaker:
+    """INFRA_STREAK_ABORT consecutive infra-failed scrapes must raise instead of
+    grinding out sentinels -- a run whose local browser died mid-run has nothing
+    left to produce, and only warm_cache used to notice (per-restaurant counter);
+    build_corpus billed a teacher pod through it and TRL's GRPO loop would train
+    on the failure text."""
+
+    def _dead_browser(self, monkeypatch):
+        def boom(url, *, wait, scroll):
+            raise PlaywrightError("BrowserType.launch: browser has crashed")
+        monkeypatch.setattr(backends, "_render_pooled", boom)
+
+    def test_raises_browser_dead_after_streak(self, monkeypatch):
+        monkeypatch.setattr(backends, "INFRA_STREAK_ABORT", 3)
+        self._dead_browser(monkeypatch)
+        scrape = build_scrape()
+        for i in range(2):
+            out = scrape(f"https://site{i}.test/menu", mode="browser")
+            assert out.startswith("(scrape failed")  # sentinel until the streak trips
+        with pytest.raises(BrowserDeadError):
+            scrape("https://site9.test/menu", mode="browser")
+
+    def test_site_failure_resets_the_streak(self, monkeypatch):
+        """A nav timeout means the browser WORKED and the site refused -- it must
+        not accumulate toward the abort, or aggregator-heavy selections would
+        false-trip it."""
+        monkeypatch.setattr(backends, "INFRA_STREAK_ABORT", 3)
+        calls = {"n": 0}
+
+        def flaky(url, *, wait, scroll):
+            calls["n"] += 1
+            if calls["n"] == 3:
+                raise PlaywrightError("Page.goto: Timeout 30000ms exceeded.")
+            raise PlaywrightError("BrowserType.launch: browser has crashed")
+        monkeypatch.setattr(backends, "_render_pooled", flaky)
+        scrape = build_scrape()
+        for i in range(5):  # infra, infra, SITE (resets), infra, infra -- never 3 in a row
+            out = scrape(f"https://site{i}.test/menu", mode="browser")
+            assert out.startswith("(scrape failed")
+
+    def test_successful_render_resets_the_streak(self, monkeypatch):
+        monkeypatch.setattr(backends, "INFRA_STREAK_ABORT", 2)
+        calls = {"n": 0}
+
+        def flaky(url, *, wait, scroll):
+            calls["n"] += 1
+            if calls["n"] == 2:
+                return "<p>" + "menu " * 300 + "</p>"
+            raise PlaywrightError("BrowserType.launch: browser has crashed")
+        monkeypatch.setattr(backends, "_render_pooled", flaky)
+        scrape = build_scrape()
+        assert scrape("https://a.test/x", mode="browser").startswith("(scrape failed")
+        assert "menu" in scrape("https://b.test/x", mode="browser")  # resets
+        assert scrape("https://c.test/x", mode="browser").startswith("(scrape failed")
+
+
+class TestThrottle:
+    def test_same_host_waits_out_the_interval(self, monkeypatch):
+        import time as time_mod
+        monkeypatch.setattr(backends, "DOMAIN_MIN_INTERVAL_S", 5.0)
+        backends._LAST_FETCH["h.test"] = time_mod.monotonic()
+        slept = []
+
+        def fake_sleep(s):
+            slept.append(s)
+            backends._LAST_FETCH["h.test"] = -1e9  # release so the loop exits
+        monkeypatch.setattr(backends.time, "sleep", fake_sleep)
+        backends._throttle("h.test")
+        assert slept and 4.0 < slept[0] <= 5.0
+
+    def test_distinct_hosts_do_not_wait(self, monkeypatch):
+        import time as time_mod
+        monkeypatch.setattr(backends, "DOMAIN_MIN_INTERVAL_S", 5.0)
+        backends._LAST_FETCH["a.test"] = time_mod.monotonic()
+
+        def no_sleep(s):
+            raise AssertionError("throttled a fetch to a DIFFERENT host")
+        monkeypatch.setattr(backends.time, "sleep", no_sleep)
+        backends._throttle("b.test")  # must return immediately
 
 
 class TestPreflight:

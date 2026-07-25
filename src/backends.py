@@ -31,6 +31,18 @@ no event loop). It does NOT beat bot-protection (DoorDash/Yelp detect headless
 Chromium) or recover *virtualized* lists (recycled DOM nodes). Needs
 `playwright install chromium` + its system libs.
 
+Baked-in protections (every consumer gets these -- they are properties of the
+backend, not of any one caller's wiring):
+  * SLIM: scrape output is passed through _slim_scrape at the source, so what a
+    Cache stores IS what the agent sees (minus the read-time MAX_TOOL_CHARS cap).
+  * DEAD ENDS: known bot-walled/login-walled domains (SKIP_DOMAINS), binary file
+    extensions (SKIP_EXTENSIONS), and non-HTML Content-Types answer with an
+    instant, deterministic sentinel instead of a 30-45s timeout -- see skip_reason.
+  * THROTTLE: network fetches to the same host are spaced >= DOMAIN_MIN_INTERVAL_S
+    apart, process-wide, so parallel rollouts don't hammer one site from one IP.
+  * CIRCUIT BREAKER: INFRA_STREAK_ABORT consecutive infra-failed scrapes raise
+    BrowserDeadError, so a run whose local browser died aborts instead of grinding.
+
 The model-facing wrappers in tools.py apply the MAX_TOOL_CHARS cap, so the
 functions here return un-capped strings.
 """
@@ -42,6 +54,7 @@ import os
 import re
 import threading
 import time
+from urllib.parse import urlsplit
 
 import requests
 from bs4 import BeautifulSoup
@@ -190,12 +203,12 @@ def _auto_scroll(page) -> None:
 # -- are the DOMINANT scrape bulk. Measured 2026-07-22: a single inline image was
 # 397,471 chars (99% of a 400K page); another page repeated the same base64 line 8x.
 # The model can't see images, so this is pure noise -- and worse, MAX_STORED_CHARS
-# can clip a data URI mid-string, removing the closing ")" that tools._slim_scrape's
-# markdown-image regex needs, so the blob survives read-time slimming too. `[^\s)]*`
+# can clip a data URI mid-string, removing the closing ")" that _slim_scrape's
+# markdown-image regex needs, so the blob survives markdown slimming too. `[^\s)]*`
 # matches the whole base64 token (no whitespace/paren inside it) AND runs to
-# end-of-string when a clip took the closing paren. Scrubbed at the SOURCE here
-# (shrinks the cached row) and again in tools._slim_scrape (cleans rows already
-# cached before this landed).
+# end-of-string when a clip took the closing paren. Scrubbed in _html_to_markdown
+# (shrinks every conversion) and again in _slim_scrape (cleans rows cached before
+# this landed, where a clip may have orphaned the blob).
 DATA_URI_RE = re.compile(r"data:[^\s)]*", re.IGNORECASE)
 
 
@@ -210,6 +223,72 @@ def _html_to_markdown(html: str) -> str:
     for tag in soup(["script", "style", "noscript", "svg", "template"]):
         tag.decompose()
     return DATA_URI_RE.sub("", markdownify(str(soup)).strip())
+
+
+# ---------------------------------------------------------------------------
+# Scrape-result slimming (token cost) -- baked into build_scrape at the SOURCE, so
+# every consumer (setup_tools' cache wrap, warm_cache's cache wrap, an uncached
+# agent run) returns -- and therefore STORES -- the same slimmed body. It used to
+# live in tools.setup_tools, which left warm_cache caching RAW rows that a later
+# cache hit served raw to the agent; putting it here makes that drift impossible.
+# clean_cache.py retro-applies the SAME transform to rows cached before this. The
+# MAX_TOOL_CHARS *cap* stays a read-time step in tools.py so it remains retunable
+# without re-scraping -- only the junk removal is baked in.
+# ---------------------------------------------------------------------------
+# What gets dropped is deliberately CONSERVATIVE: images, text-less links, and
+# dead-end hrefs (tel:/mailto:/js/#fragments/image files) -- measured 10.0%
+# smaller on the pilot's 401 cached pages. Navigable hrefs are KEPT: 17.7% of
+# the teacher's scrape calls used a URL found only via in-page links (homepage
+# -> menu page, own site -> ordering platform), so stripping all link targets
+# (a further ~13%) would break real trajectories. Applied to scrape results
+# only -- search results are WHERE the model gets URLs from.
+_MD_IMAGE_RE = re.compile(r"!\[[^\]]*\]\([^)]*\)")
+_MD_EMPTY_LINK_RE = re.compile(r"\[\s*\]\(\s*[^)]*\)")
+_MD_DEAD_HREF_RE = re.compile(
+    r"\[([^\]]+)\]\(\s*(?:tel:|mailto:|javascript:|#)[^)]*\)"
+    r"|\[([^\]]+)\]\(\s*[^)]*\.(?:png|jpe?g|gif|webp|svg|ico)(?:\?[^)]*)?\s*\)",
+    re.IGNORECASE,
+)
+
+# A list line that is ONLY a bullet marker (markdownify emits "* " for an empty <li>,
+# and image/link removal above can leave a bullet with nothing after it). Measured
+# 2026-07-22: one menu page had 918 of these. Pure noise -- drop the whole line.
+_MD_EMPTY_BULLET_RE = re.compile(r"(?m)^[ \t]*[-*+][ \t]*$\n?")
+
+
+def _slim_scrape(md: str) -> str:
+    """Drop non-navigable markdown bulk from a scraped page (see block comment).
+
+    Iterated to a FIXED POINT: one stage's removal can expose a match for an earlier
+    stage (e.g. dropping an image empties the bullet that held it; dropping a line
+    merges two blank runs), so a single pass isn't idempotent -- a few real pages
+    needed a second pass. That matters here because clean_cache.py bakes this same
+    transform into the stored rows: if `slim(raw)` still had junk `slim` would strip
+    on the next read, a cached hit (stored pre-slimmed) and a fresh fetch would
+    disagree. Every stage only deletes or shortens, so the length strictly drops on
+    any change and the loop terminates (typically after 2 passes: one real, one that
+    confirms nothing else matches)."""
+    prev = None
+    while md != prev:
+        prev = md
+        # NUL bytes never belong in menu markdown -- they signal a binary blob
+        # mangled through the HTML->markdown pipeline (one cached page was a binary
+        # file rendered to 1.9M chars with 10.6K NULs). Beyond being junk, an embedded
+        # NUL breaks SQLite's length()/substr() (both stop counting at the first NUL),
+        # so a NUL-bearing row is invisible to cache.clip_oversized's SQL bound and
+        # can't be trimmed until the NULs are gone -- strip them first.
+        md = md.replace("\x00", "")
+        # Base64 data: URIs (the dominant bulk; see DATA_URI_RE). New scrapes are
+        # already scrubbed in _html_to_markdown, but rows CACHED before that landed
+        # still carry the blob -- often a data URI clipped mid-string, which the image
+        # regex below cannot match -- so strip it here too.
+        md = DATA_URI_RE.sub("", md)
+        md = _MD_IMAGE_RE.sub("", md)
+        md = _MD_EMPTY_LINK_RE.sub("", md)
+        md = _MD_DEAD_HREF_RE.sub(lambda m: m.group(1) or m.group(2), md)
+        md = _MD_EMPTY_BULLET_RE.sub("", md)  # after image/link removal, which can empty a bullet
+        md = re.sub(r"\n{3,}", "\n\n", md)  # collapse runs of blank lines to a single one
+    return md
 
 
 def _render_on_page(page, url: str, *, wait: bool, scroll: bool) -> str:
@@ -353,6 +432,154 @@ def is_cacheable(response: str) -> bool:
     return not is_infra_failure(response)
 
 
+# ---------------------------------------------------------------------------
+# Known dead ends -- answered instantly, with no network fetch (skip_reason)
+# ---------------------------------------------------------------------------
+# Bot-walled aggregators / login-walled socials / SEO-spam menu-mirror farms.
+# Matched by registrable suffix (subdomains included). This list used to live only
+# in scripts/corpus/warm_cache.py, which meant the warm skipped these but the LIVE
+# tool paid a 30-45s bot-wall timeout per visit -- and, because a stored 'error'
+# row is a MISS under miss_policy="live" (cache.py), paid it again on every later
+# pass of the same URL. Answering here makes the dead end instant, cacheable as a
+# permanent negative, and byte-identical between live and canned runs.
+SKIP_DOMAINS = frozenset({
+    # US delivery apps (headless-Chromium bot-walled)
+    "doordash.com", "ubereats.com", "grubhub.com", "seamless.com", "postmates.com",
+    # reservation / review aggregators (bot-walled; every render times out to an error)
+    "yelp.com", "yelp.ca", "yelp.co.uk", "yelp.com.au",
+    "opentable.com", "opentable.co.uk", "opentable.ca", "opentable.com.au",
+    # login-walled socials
+    "facebook.com", "instagram.com",
+    # SEO-spam menu-mirror farms (auto-generated <slug>.<farm> subdomains, never a real menu)
+    "restaurants-world.com", "restaurants-world.net",
+    "menu-world.com", "menu-res.com", "res-menu.net",
+})
+
+# Non-HTML payloads the markdown scrape can't do anything useful with (a PDF
+# markdownified as binary once produced a 14M-char row; see also the Content-Type
+# guard in build_scrape, which catches the extension-less version of this).
+SKIP_EXTENSIONS = (".pdf", ".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg")
+
+# These sentinels are MODEL-FACING (they enter SFT/GRPO training data), so they say
+# what the model should do next. Contract, relied on by cache.scrape_status:
+#   * under cache.MIN_CONTENT_CHARS (200) and matching no failure/infra marker, so
+#     they classify 'empty' -- a PERMANENT negative: stored once, a hit under
+#     "live" (never re-fetched), replayed verbatim under "canned";
+#   * NOT starting with "(scrape failed"/"(page returned no content)"/"(page not
+#     available)" (would classify 'error' -> re-fetched every live pass) and
+#     containing no _INFRA_FAILURE_MARKERS (would make them uncacheable).
+BLOCKED_SITE_RESULT = ("(this site blocks automated access and returns no usable "
+                       "content -- try a different search result)")
+BINARY_URL_RESULT = ("(this link is a file download, not a readable web page -- "
+                     "try a different search result)")
+
+
+def _non_html_result(content_type: str) -> str:
+    """Sentinel for a fetch that answered with a non-HTML payload (PDF, image...)."""
+    return (f"(this page returned {content_type[:40]!r}, not readable web content "
+            f"-- try a different search result)")
+
+
+def _readable_content_type(ctype: str) -> bool:
+    """Content-Types the HTML->markdown pipeline can do something useful with.
+
+    Empty is allowed (some servers omit the header; the DIRECT_MIN_CHARS shell
+    check and markdownify cope). text/plain and JSON are readable as-is."""
+    return (not ctype or ctype.startswith("text/")
+            or "html" in ctype or "xml" in ctype or "json" in ctype)
+
+
+def skip_reason(url: str) -> str | None:
+    """The instant sentinel for a known dead-end URL, or None to really fetch it.
+
+    Checked by build_scrape before any network work. Exposed so bulk populators
+    (warm_cache) can tell "this URL will answer instantly with a sentinel" apart
+    from "this URL will cost a real fetch" when planning/counting."""
+    parts = urlsplit(url)
+    host = parts.netloc.lower().removeprefix("www.")
+    if any(host == d or host.endswith("." + d) for d in SKIP_DOMAINS):
+        return BLOCKED_SITE_RESULT
+    if parts.path.lower().endswith(SKIP_EXTENSIONS):
+        return BINARY_URL_RESULT
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Per-host politeness throttle (process-wide, across threads)
+# ---------------------------------------------------------------------------
+# Minimum spacing between NETWORK fetches to the same host. Cache hits never reach
+# the backend, so this only paces genuine fetches. warm_cache used to be the only
+# throttled caller (its --sleep); live GRPO rollouts run the tools in PARALLEL
+# (tools._to_async -> asyncio.gather) from one egress IP, which is exactly the
+# per-site rate-limit hazard CLAUDE.md flags -- so the pacing belongs here, where
+# every caller inherits it.
+DOMAIN_MIN_INTERVAL_S = 1.0
+_LAST_FETCH: dict[str, float] = {}
+_THROTTLE_LOCK = threading.Lock()
+
+
+def _throttle(host: str) -> None:
+    """Block until DOMAIN_MIN_INTERVAL_S has passed since the last fetch to `host`.
+
+    Loop-and-recheck: several waiters can wake together, but only the one that
+    claims the slot under the lock proceeds; the rest wait out a fresh interval."""
+    if DOMAIN_MIN_INTERVAL_S <= 0:
+        return
+    while True:
+        with _THROTTLE_LOCK:
+            now = time.monotonic()
+            ready_at = _LAST_FETCH.get(host, 0.0) + DOMAIN_MIN_INTERVAL_S
+            if now >= ready_at:
+                _LAST_FETCH[host] = now
+                return
+            wait = ready_at - now
+        time.sleep(wait)
+
+
+# ---------------------------------------------------------------------------
+# Infra circuit breaker (process-wide, across threads)
+# ---------------------------------------------------------------------------
+# Consecutive scrapes that failed on the LOCAL browser stack. A dead browser turns
+# every scrape into an infra sentinel; per-script breakers (warm_cache's
+# INFRA_ABORT_CONSECUTIVE, build_corpus's episode counter) can only notice after
+# whole restaurants/episodes of work have been wasted -- and a caller without one
+# (TRL's GRPO tool loop) would grind to the end of the run training on failure
+# text. Raising here stops EVERY caller: the exception propagates out of the tool
+# call, fails the episode, and trips whatever per-episode breaker the script has.
+# Successful browser renders and SITE failures (the browser worked; the site
+# refused) reset the streak, so only a browser failing every consecutive call can
+# trip it. A browser broken FROM THE START is caught cheaper by preflight_browser;
+# this catches one that dies MID-RUN.
+INFRA_STREAK_ABORT = 15
+_infra_streak = 0
+_INFRA_LOCK = threading.Lock()
+
+
+class BrowserDeadError(RuntimeError):
+    """INFRA_STREAK_ABORT consecutive scrapes failed on the local browser stack."""
+
+
+def _note_scrape_outcome(result: str | None) -> None:
+    """Feed one scrape outcome to the breaker (None = a successful browser render).
+
+    Raises BrowserDeadError once the streak reaches INFRA_STREAK_ABORT; the streak
+    is left at the threshold, so every subsequent infra failure keeps raising until
+    a render succeeds (i.e. the run stays dead until the browser recovers)."""
+    global _infra_streak
+    with _INFRA_LOCK:
+        if result is None or not is_infra_failure(result):
+            _infra_streak = 0
+            return
+        _infra_streak += 1
+        streak = _infra_streak
+    if streak >= INFRA_STREAK_ABORT:
+        raise BrowserDeadError(
+            f"{streak} consecutive scrape calls failed on the LOCAL browser stack "
+            f"(latest: {result}) -- the browser is dead, not the sites; aborting "
+            f"instead of grinding out infra sentinels"
+        )
+
+
 # Thread-local browser pool: a sync Playwright browser is bound to the thread that
 # created it, so each thread lazily launches its own Chromium and reuses it.
 # _POOL_REGISTRY tracks every (playwright, browser) started so atexit can
@@ -449,6 +676,18 @@ def _render_pooled(url: str, *, wait: bool, scroll: bool) -> str:
         context.close()
 
 
+def _render_tracked(url: str, host: str, *, wait: bool, scroll: bool) -> str:
+    """A throttled pooled render that also feeds the infra circuit breaker.
+
+    Success means the browser stack works -> reset the streak. A failure raises
+    through to build_scrape's handler, which classifies it (infra vs site) and
+    feeds THAT to the breaker -- so the reset only ever happens on real renders."""
+    _throttle(host)
+    html = _render_pooled(url, wait=wait, scroll=scroll)
+    _note_scrape_outcome(None)
+    return html
+
+
 def preflight_browser() -> str | None:
     """Launch this thread's browser now; return None on success or a one-line reason.
 
@@ -499,7 +738,15 @@ def build_scrape():
     server-rendered pages). If that returns fewer than DIRECT_MIN_CHARS of markdown
     -- the tell-tale of a client-rendered shell -- escalate to a NO-SCROLL browser
     render. mode="browser": the pooled auto-scroll render. All failures return a
-    readable message (see _scrape_error) instead of raising.
+    readable message (see _scrape_error) instead of raising -- except a dead local
+    browser, which raises BrowserDeadError once the infra streak trips (a broken
+    machine must abort the run, not fail every URL in it).
+
+    Baked in on every path: known dead ends answer instantly (skip_reason), a
+    non-HTML Content-Type answers with a sentinel instead of markdownified binary,
+    fetches to one host are spaced by _throttle, and successful output is slimmed
+    (_slim_scrape) at the source -- so a Cache wrapping this closure stores exactly
+    what the agent sees (minus the read-time MAX_TOOL_CHARS cap).
     """
     session = requests.Session()
     session.headers.update(
@@ -509,30 +756,47 @@ def build_scrape():
         }
     )
 
-    def scrape(url: str, mode: str = "direct") -> str:
-        try:
-            if mode == "browser":
-                html = _render_pooled(url, wait=False, scroll=True)
-                return _html_to_markdown(html) or "(page returned no content)"
+    def fetch(url: str, mode: str, host: str) -> str:
+        if mode == "browser":
+            html = _render_tracked(url, host, wait=False, scroll=True)
+            return _html_to_markdown(html) or "(page returned no content)"
 
-            # direct: cheap requests first ...
-            md = ""
-            try:
-                resp = session.get(url, timeout=SCRAPE_HTTP_TIMEOUT)
-                resp.raise_for_status()
-                md = _html_to_markdown(resp.text)
-            except requests.RequestException:
-                md = ""  # fall through to the browser render below
-            if len(md) >= DIRECT_MIN_CHARS:
-                return md
-            # ... escalate a thin/failed fetch to a no-scroll browser render.
-            html = _render_pooled(url, wait=True, scroll=False)
-            return _html_to_markdown(html) or md or "(page returned no content)"
+        # direct: cheap requests first ...
+        md = ""
+        try:
+            _throttle(host)
+            resp = session.get(url, timeout=SCRAPE_HTTP_TIMEOUT)
+            resp.raise_for_status()
+            ctype = (resp.headers.get("content-type") or "").split(";")[0].strip().lower()
+            if not _readable_content_type(ctype):
+                # A binary payload (PDF/image on an extension-less URL) markdownifies
+                # to enormous junk -- one PDF made a 14M-char row -- and a browser
+                # render of it can do no better, so don't escalate: answer with the
+                # permanent sentinel.
+                return _non_html_result(ctype)
+            md = _html_to_markdown(resp.text)
+        except requests.RequestException:
+            md = ""  # fall through to the browser render below
+        if len(md) >= DIRECT_MIN_CHARS:
+            return md
+        # ... escalate a thin/failed fetch to a no-scroll browser render.
+        html = _render_tracked(url, host, wait=True, scroll=False)
+        return _html_to_markdown(html) or md or "(page returned no content)"
+
+    def scrape(url: str, mode: str = "direct") -> str:
+        reason = skip_reason(url)
+        if reason is not None:
+            return reason  # instant, deterministic, no network
+        host = urlsplit(url).netloc.lower()
+        try:
+            return _slim_scrape(fetch(url, mode, host))
         # RecursionError: BeautifulSoup/markdownify recurse over the DOM, and a
         # pathologically nested page blows the interpreter limit -- observed
         # killing 10/99 pilot episodes. Same contract as Playwright failures:
         # return the sentinel so the model can try another URL/mode.
         except (PlaywrightError, RecursionError) as e:
-            return _scrape_error(url, mode, e)
+            sentinel = _scrape_error(url, mode, e)
+            _note_scrape_outcome(sentinel)  # raises BrowserDeadError past the streak
+            return sentinel
 
     return scrape

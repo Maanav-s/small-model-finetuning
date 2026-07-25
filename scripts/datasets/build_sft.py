@@ -83,6 +83,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 sys.path.insert(0, str(REPO_ROOT / "src" / "gemma"))
 
+from backends import _slim_scrape  # noqa: E402
 from corpus import open_corpus  # noqa: E402
 from prompts import build_system_prompt  # noqa: E402
 from run_meta import git_sha, md5_file  # noqa: E402
@@ -90,7 +91,6 @@ from schema import extract_json  # noqa: E402
 from tools import (  # noqa: E402
     MAX_TOOL_CHARS,
     _cap,
-    _slim_scrape,
     build_model_tools,
 )
 
