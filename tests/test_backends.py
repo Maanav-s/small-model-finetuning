@@ -2,6 +2,7 @@
 
 import os
 import sys
+import threading
 from pathlib import Path
 
 import pytest
@@ -390,3 +391,119 @@ class TestPreflight:
             raise RuntimeError("Sync API inside the asyncio loop")
         monkeypatch.setattr(backends, "_pooled_browser", boom)
         assert "asyncio loop" in preflight_browser()
+
+
+# ---------------------------------------------------------------------------
+# Render watchdog: no protocol call may block a worker forever
+# ---------------------------------------------------------------------------
+class _FakeProc:
+    """Stands in for the node driver subprocess (the watchdog's kill handle)."""
+
+    def __init__(self, on_kill=None):
+        self.killed = False
+        self._on_kill = on_kill
+
+    def kill(self):
+        self.killed = True
+        if self._on_kill is not None:
+            self._on_kill()
+
+
+class _FakeContext:
+    def new_page(self):
+        return object()
+
+    def close(self):
+        pass
+
+
+class _FakeBrowser:
+    def new_context(self, **kwargs):
+        return _FakeContext()
+
+
+def _pool_with(monkeypatch, proc):
+    pool = type("L", (), {})()
+    pool.driver_proc = proc
+    monkeypatch.setattr(backends, "_POOL", pool)
+    monkeypatch.setattr(backends, "_pooled_browser", lambda: _FakeBrowser())
+
+
+class TestRenderWatchdog:
+    """THE REGRESSION THIS GUARDS (2026-07-25): page.evaluate/content() have NO
+    client-side timeout, so one page with a wedged renderer parked a warm worker
+    forever -- all 3 workers within 29 minutes, zero CPU, no timeout ever coming.
+    The watchdog kills this thread's driver so the blocked call raises, and the
+    fallout is rewritten to a SITE failure (cacheable, non-infra)."""
+
+    def test_wedged_render_is_killed_and_classified_as_site_failure(self, monkeypatch):
+        unblocked = threading.Event()
+        proc = _FakeProc(on_kill=unblocked.set)
+        _pool_with(monkeypatch, proc)
+        monkeypatch.setattr(backends, "RENDER_WATCHDOG_S", 0.05)
+
+        def wedged(page, url, *, wait, scroll):
+            # Blocks like a dead protocol call: only the driver kill releases it.
+            assert unblocked.wait(5), "watchdog never fired"
+            raise PlaywrightError("Connection closed while reading from the driver")
+        monkeypatch.setattr(backends, "_render_on_page", wedged)
+
+        out = build_scrape()("https://wedged.example/menu", mode="browser")
+        assert proc.killed
+        assert out.startswith("(scrape failed") and "render watchdog" in out
+        # A wedged page is a fact about the URL, not this machine: it must cache
+        # (as 'error' -> self-healing under live) and must NOT feed the breaker.
+        assert is_cacheable(out)
+        assert not backends.is_infra_failure(out)
+        assert scrape_status(out) == "error"
+
+    def test_driver_crash_without_watchdog_is_infra(self, monkeypatch):
+        """The same 'Connection closed' raised WITHOUT the watchdog firing is a
+        real driver death -- an infra fact that must not be cached."""
+        _pool_with(monkeypatch, _FakeProc())
+
+        def crashed(page, url, *, wait, scroll):
+            raise PlaywrightError("Connection closed while reading from the driver")
+        monkeypatch.setattr(backends, "_render_on_page", crashed)
+
+        out = build_scrape()("https://fine.example/menu", mode="browser")
+        assert backends.is_infra_failure(out)
+        assert not is_cacheable(out)
+
+    def test_fast_render_cancels_the_watchdog(self, monkeypatch):
+        proc = _FakeProc()
+        _pool_with(monkeypatch, proc)
+        monkeypatch.setattr(backends, "RENDER_WATCHDOG_S", 0.2)
+        monkeypatch.setattr(backends, "_render_on_page",
+                            lambda page, url, *, wait, scroll: "<p>" + "menu $9 " * 100 + "</p>")
+        out = build_scrape()("https://quick.example/menu", mode="browser")
+        assert "menu $9" in out
+        import time
+        time.sleep(0.3)  # past the (shrunk) deadline: a cancelled timer must not kill
+        assert not proc.killed
+
+    def test_missing_kill_handle_degrades_to_no_watchdog(self, monkeypatch):
+        """_driver_proc is private-API-backed; if upstream moves it, rendering must
+        keep working (just without the watchdog), not crash."""
+        _pool_with(monkeypatch, None)
+        monkeypatch.setattr(backends, "_render_on_page",
+                            lambda page, url, *, wait, scroll: "<p>" + "menu $9 " * 100 + "</p>")
+        out = build_scrape()("https://nohandle.example/menu", mode="browser")
+        assert "menu $9" in out
+
+
+def test_driver_proc_walks_the_private_path_and_degrades():
+    class T:
+        _proc = "P"
+
+    class C:
+        _transport = T()
+
+    class I:
+        _connection = C()
+
+    class PW:
+        _impl_obj = I()
+
+    assert backends._driver_proc(PW()) == "P"
+    assert backends._driver_proc(object()) is None

@@ -42,6 +42,10 @@ backend, not of any one caller's wiring):
     apart, process-wide, so parallel rollouts don't hammer one site from one IP.
   * CIRCUIT BREAKER: INFRA_STREAK_ABORT consecutive infra-failed scrapes raise
     BrowserDeadError, so a run whose local browser died aborts instead of grinding.
+  * RENDER WATCHDOG: every browser render runs under a RENDER_WATCHDOG_S hard
+    wall-clock cap; a page whose renderer wedges (page.evaluate/content have no
+    client-side timeout) gets its driver killed and fails as a site error instead
+    of parking the worker thread forever.
 
 The model-facing wrappers in tools.py apply the MAX_TOOL_CHARS cap, so the
 functions here return un-capped strings.
@@ -410,6 +414,11 @@ _INFRA_FAILURE_MARKERS = (
     "asyncio loop",
     "BrowserType.launch",
     "Target page, context or browser has been closed",
+    # The driver (node) process died out from under a call -- a real crash is an
+    # infra fact. A RENDER-WATCHDOG kill produces this too, but _render_pooled
+    # rewrites that case into its own "render watchdog:" error BEFORE
+    # classification, so a watchdog kill stays a (cacheable) site fact.
+    "Connection closed while reading from the driver",
 )
 
 
@@ -601,6 +610,35 @@ _POOL_LOCK = threading.Lock()
 BROWSER_LAUNCH_ATTEMPTS = 3
 BROWSER_LAUNCH_BACKOFF_S = 1.0
 
+# Hard wall-clock cap on ONE render. goto/networkidle carry their own timeouts,
+# but page.evaluate (the auto-scroll), page.content(), and context open/close are
+# PROTOCOL calls with NO client-side timeout: a page whose renderer goes
+# unresponsive (wedged main thread) never answers, the call blocks forever, and
+# the worker thread is starved for the rest of the run. Measured 2026-07-25: a
+# grpo warm sat 30+ minutes with all 3 workers parked in exactly this state --
+# idle CPU, no sockets, no timeout ever coming. The budgeted worst LEGIT render
+# is ~100s (NAV 30 + NETWORKIDLE 15 + 40 scroll rounds x 0.6 + big-DOM
+# serialization), so 180s only ever fires on a genuinely wedged page.
+RENDER_WATCHDOG_S = 180
+
+
+def _driver_proc(pw):
+    """The node driver subprocess behind a sync_playwright instance, or None.
+
+    Private Playwright internals (verified against the pinned version), guarded so
+    an upstream refactor degrades to 'no watchdog' instead of an AttributeError.
+    The watchdog needs an OS-level kill handle precisely because the wedge is
+    protocol-level: no Playwright API call can time it out, and the sync API is
+    greenlet-bound to its thread, so another thread cannot close the browser
+    politely. Killing the DRIVER tears down the pipe, which makes every pending
+    call on this thread raise immediately -- and each thread has its own driver,
+    so only the wedged worker is affected.
+    """
+    try:
+        return pw._impl_obj._connection._transport._proc
+    except AttributeError:
+        return None
+
 
 def _drop_thread_browser() -> None:
     """Tear down and forget this thread's pooled browser (used when it has died).
@@ -612,6 +650,7 @@ def _drop_thread_browser() -> None:
     browser = getattr(_POOL, "browser", None)
     _POOL.pw = None
     _POOL.browser = None
+    _POOL.driver_proc = None
     if browser is not None:
         try:
             browser.close()
@@ -660,24 +699,68 @@ def _pooled_browser():
             raise
         _POOL.pw = pw
         _POOL.browser = browser
+        _POOL.driver_proc = _driver_proc(pw)  # the render watchdog's kill handle
         with _POOL_LOCK:
             _POOL_REGISTRY.append((pw, browser))
         return browser
 
 
 def _render_pooled(url: str, *, wait: bool, scroll: bool) -> str:
-    """Render `url` on a fresh context of this thread's pooled browser.
+    """Render `url` on a fresh context of this thread's pooled browser, under a
+    hard RENDER_WATCHDOG_S wall-clock cap.
 
     A new context per call keeps state isolated (cookies/storage) while reusing
-    the expensive browser process; the context is always closed, the browser kept.
+    the expensive browser process; the context is always closed, the browser kept
+    -- unless the watchdog fires, which kills this thread's driver (see
+    _driver_proc for why that is the only reliable lever): every blocked call
+    raises immediately, the error is rewritten to a "render watchdog:" site
+    failure, and the next call relaunches a fresh browser via _pooled_browser's
+    is_connected() check.
     """
     browser = _pooled_browser()
-    context = browser.new_context(user_agent=USER_AGENT, viewport=VIEWPORT)
+    proc = getattr(_POOL, "driver_proc", None)
+    fired = threading.Event()
+
+    def _kill_driver():
+        fired.set()
+        try:
+            proc.kill()
+        except Exception:  # noqa: BLE001 - already-dead driver; the raise below still happens
+            pass
+
+    timer = None
+    if proc is not None:
+        timer = threading.Timer(RENDER_WATCHDOG_S, _kill_driver)
+        timer.daemon = True
+        timer.start()
     try:
-        page = context.new_page()
-        return _render_on_page(page, url, wait=wait, scroll=scroll)
+        context = browser.new_context(user_agent=USER_AGENT, viewport=VIEWPORT)
+        try:
+            page = context.new_page()
+            return _render_on_page(page, url, wait=wait, scroll=scroll)
+        finally:
+            # Still inside the watchdog window: close() is an untimed protocol
+            # call too, and a wedged page can hang it just like content().
+            try:
+                context.close()
+            except PlaywrightError:
+                if not fired.is_set():
+                    raise
+    except Exception as e:
+        if fired.is_set():
+            # The page, not our stack, is broken: a wedged renderer is a fact
+            # about that URL. Rewrite the kill fallout ("Connection closed while
+            # reading from the driver" -- an INFRA marker when it happens on its
+            # own) into a site-class failure so it caches as a normal 'error' row
+            # and does not feed the infra circuit breaker.
+            raise PlaywrightError(
+                f"render watchdog: the page did not respond within "
+                f"{RENDER_WATCHDOG_S}s (wedged renderer); the browser was recycled"
+            ) from e
+        raise
     finally:
-        context.close()
+        if timer is not None:
+            timer.cancel()
 
 
 def _render_tracked(url: str, host: str, *, wait: bool, scroll: bool) -> str:
