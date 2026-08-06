@@ -3,6 +3,7 @@
 import os
 import sys
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -507,3 +508,134 @@ def test_driver_proc_walks_the_private_path_and_degrades():
 
     assert backends._driver_proc(PW()) == "P"
     assert backends._driver_proc(object()) is None
+
+
+class _ZombieBrowser:
+    """A browser whose driver has been killed: every protocol call HANGS.
+
+    Modelling the hang as an exception would be too generous -- the whole 2026-08-05
+    freeze was that these calls do NOT raise. Any test that touches one fails loudly
+    instead of blocking the suite forever.
+    """
+
+    def __init__(self):
+        self.touched = False
+
+    def _hang(self, what):
+        self.touched = True
+        raise AssertionError(
+            f"{what} was called on a browser whose driver was killed -- in production "
+            f"this HANGS forever holding the GIL (unkillable process), it does not raise"
+        )
+
+    def new_context(self, **kwargs):
+        self._hang("browser.new_context()")
+
+    def close(self):
+        self._hang("browser.close()")
+
+    def is_connected(self):
+        # The real one returns a CACHED flag that a force-killed driver never clears.
+        return True
+
+
+class TestWatchdogLeavesNoZombie:
+    """THE REGRESSION THIS GUARDS (2026-08-05): the watchdog killed the driver and
+    the FIRST call correctly raised -- but the dead browser stayed in the pool,
+    is_connected() kept saying True (cached flag, no close event from a SIGKILL),
+    and the NEXT call spun forever inside Playwright's sync wrapper, pinning a core
+    and holding the GIL. Ctrl+C could not be delivered; the process needed a kill."""
+
+    def test_pool_is_cleared_after_a_watchdog_kill(self, monkeypatch):
+        proc = _FakeProc()
+        pool = type("L", (), {})()
+        pool.pw = "PW-SENTINEL"
+        pool.browser = _FakeBrowser()
+        pool.driver_proc = proc
+        monkeypatch.setattr(backends, "_POOL", pool)
+        monkeypatch.setattr(backends, "_POOL_REGISTRY", [("PW-SENTINEL", pool.browser)])
+        monkeypatch.setattr(backends, "_pooled_browser", lambda: pool.browser)
+        monkeypatch.setattr(backends, "RENDER_WATCHDOG_S", 0.05)
+
+        def wedged(page, url, *, wait, scroll):
+            time.sleep(0.4)  # outlive the deadline
+            raise PlaywrightError("Connection closed while reading from the driver")
+        monkeypatch.setattr(backends, "_render_on_page", wedged)
+
+        out = build_scrape()("https://wedged.example/menu", mode="browser")
+        assert "render watchdog" in out
+        # The zombie must be gone from BOTH the thread pool and the atexit registry
+        # (close_pool() would otherwise call close() on it and hang at interpreter exit).
+        assert pool.browser is None and pool.pw is None and pool.driver_proc is None
+        assert backends._POOL_REGISTRY == []
+
+    def test_next_scrape_relaunches_instead_of_touching_the_zombie(self, monkeypatch):
+        """The end-to-end property: after a watchdog kill, the following scrape on
+        the same thread must reach a FRESH browser. The browser here starts healthy
+        and ZOMBIFIES when its driver is killed -- exactly what the kill does in
+        production -- so any reuse fails the test where production would freeze."""
+        zombie = _FakeBrowser()
+
+        def _zombify():
+            # From the kill onward this browser behaves like the real thing: its
+            # protocol calls never return. _ZombieBrowser raises instead of hanging
+            # so the suite fails loudly rather than blocking forever.
+            zombie.__class__ = _ZombieBrowser
+            zombie.touched = False
+
+        pool = type("L", (), {})()
+        pool.pw = "PW-SENTINEL"
+        pool.browser = zombie
+        pool.driver_proc = _FakeProc(on_kill=_zombify)
+        monkeypatch.setattr(backends, "_POOL", pool)
+        monkeypatch.setattr(backends, "_POOL_REGISTRY", [("PW-SENTINEL", zombie)])
+        monkeypatch.setattr(backends, "RENDER_WATCHDOG_S", 0.05)
+
+        launches = {"n": 0}
+
+        def fake_pooled_browser():
+            """Stands in for the real one: hands back the pooled browser if the pool
+            still holds one, else 'launches' a fresh (working) browser."""
+            if getattr(backends._POOL, "browser", None) is not None:
+                return backends._POOL.browser
+            launches["n"] += 1
+            fresh = _FakeBrowser()
+            backends._POOL.browser = fresh
+            backends._POOL.pw = f"PW-{launches['n']}"
+            backends._POOL.driver_proc = _FakeProc()
+            return fresh
+        monkeypatch.setattr(backends, "_pooled_browser", fake_pooled_browser)
+
+        calls = {"n": 0}
+
+        def render(page, url, *, wait, scroll):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                time.sleep(0.4)  # wedge the first render past the deadline
+                raise PlaywrightError("Connection closed while reading from the driver")
+            return "<p>" + "menu $9 " * 100 + "</p>"
+        monkeypatch.setattr(backends, "_render_on_page", render)
+
+        scrape = build_scrape()
+        first = scrape("https://wedged.example/menu", mode="browser")
+        assert "render watchdog" in first
+
+        second = scrape("https://fine.example/menu", mode="browser")
+        assert "menu $9" in second, second
+        assert not zombie.touched, "the killed browser was reused"
+        assert launches["n"] == 1, "the watchdog kill did not force a relaunch"
+
+    def test_forget_makes_no_protocol_calls(self, monkeypatch):
+        """_drop_thread_browser calls close()/stop(); the watchdog path must NOT --
+        those are the calls that hang against a dead driver."""
+        zombie = _ZombieBrowser()
+        pool = type("L", (), {})()
+        pool.pw = "PW-SENTINEL"
+        pool.browser = zombie
+        pool.driver_proc = _FakeProc()
+        monkeypatch.setattr(backends, "_POOL", pool)
+        monkeypatch.setattr(backends, "_POOL_REGISTRY", [("PW-SENTINEL", zombie)])
+
+        backends._forget_thread_browser()
+        assert not zombie.touched
+        assert pool.browser is None and backends._POOL_REGISTRY == []

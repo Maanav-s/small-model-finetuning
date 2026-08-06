@@ -665,8 +665,41 @@ def _drop_thread_browser() -> None:
             _POOL_REGISTRY[:] = [(p, b) for p, b in _POOL_REGISTRY if p is not pw]
 
 
+def _forget_thread_browser() -> None:
+    """Drop this thread's pooled browser WITHOUT talking to it (watchdog path).
+
+    _drop_thread_browser's close()/stop() are PROTOCOL calls. Against a killed
+    driver they do not fail -- they HANG, spinning in Playwright's sync wrapper
+    (`while not task.done(): fiber.switch()`) on a reply that can never arrive.
+    That spin is pure greenlet work, so it pins a core AND holds the GIL, which
+    starves the main thread and makes the process unkillable by Ctrl+C. Measured
+    2026-08-05: a warm froze exactly this way with all 3 workers inside
+    new_context()/close() and every driver already dead.
+
+    A killed driver needs no cleanup anyway -- the OS reaped it and its Chromium
+    child with it -- so the correct move is to forget the references and
+    deregister them (so close_pool() at exit doesn't try to close a zombie
+    either). The next _pooled_browser() then sees browser=None and launches fresh.
+    """
+    pw = getattr(_POOL, "pw", None)
+    _POOL.pw = None
+    _POOL.browser = None
+    _POOL.driver_proc = None
+    if pw is not None:
+        with _POOL_LOCK:
+            _POOL_REGISTRY[:] = [(p, b) for p, b in _POOL_REGISTRY if p is not pw]
+
+
 def _pooled_browser():
-    """Return this thread's Chromium, launching (and registering) it on first use."""
+    """Return this thread's Chromium, launching (and registering) it on first use.
+
+    NOTE: `is_connected()` is `return self._is_connected` -- a CACHED flag that
+    Playwright only clears when it receives a close EVENT over the pipe. A driver
+    we force-killed sends no such event, so this check cannot be relied on to
+    notice one; the watchdog path must clear the pool itself
+    (_forget_thread_browser). Reusing a zombie browser is what froze the
+    2026-08-05 warm.
+    """
     browser = getattr(_POOL, "browser", None)
     if browser is not None and browser.is_connected():
         return browser
@@ -710,12 +743,14 @@ def _render_pooled(url: str, *, wait: bool, scroll: bool) -> str:
     hard RENDER_WATCHDOG_S wall-clock cap.
 
     A new context per call keeps state isolated (cookies/storage) while reusing
-    the expensive browser process; the context is always closed, the browser kept
-    -- unless the watchdog fires, which kills this thread's driver (see
-    _driver_proc for why that is the only reliable lever): every blocked call
-    raises immediately, the error is rewritten to a "render watchdog:" site
-    failure, and the next call relaunches a fresh browser via _pooled_browser's
-    is_connected() check.
+    the expensive browser process; the context is always closed, the browser kept.
+
+    When the watchdog fires it kills this thread's driver (see _driver_proc for
+    why that is the only reliable lever). Everything after that point must assume
+    the driver is GONE, because a protocol call against a dead driver hangs rather
+    than raising (see _forget_thread_browser): the context is NOT closed, the
+    pooled browser is FORGOTTEN so the next call relaunches, and the failure is
+    rewritten to a "render watchdog:" site error.
     """
     browser = _pooled_browser()
     proc = getattr(_POOL, "driver_proc", None)
@@ -739,13 +774,15 @@ def _render_pooled(url: str, *, wait: bool, scroll: bool) -> str:
             page = context.new_page()
             return _render_on_page(page, url, wait=wait, scroll=scroll)
         finally:
-            # Still inside the watchdog window: close() is an untimed protocol
-            # call too, and a wedged page can hang it just like content().
-            try:
+            # Skip the close entirely once the watchdog has fired: close() is an
+            # untimed protocol call, so against the just-killed driver it would
+            # hang forever -- the precise freeze this watchdog exists to prevent.
+            # Nothing leaks: the driver and its Chromium are already gone.
+            # (Tiny race: the timer can fire between this check and the call. The
+            # window is microseconds at the end of a 180s deadline, and the
+            # outcome is only the pre-existing hang, not a new failure mode.)
+            if not fired.is_set():
                 context.close()
-            except PlaywrightError:
-                if not fired.is_set():
-                    raise
     except Exception as e:
         if fired.is_set():
             # The page, not our stack, is broken: a wedged renderer is a fact
@@ -761,6 +798,14 @@ def _render_pooled(url: str, *, wait: bool, scroll: bool) -> str:
     finally:
         if timer is not None:
             timer.cancel()
+        if fired.is_set():
+            # Unconditional, not just on the error path: if the render happened to
+            # finish in the instant the watchdog fired, the driver is dead all the
+            # same, and leaving that browser in the pool is what hangs the NEXT
+            # call. is_connected() cannot catch it (cached flag, no close event),
+            # so clearing the pool here is the only thing standing between a
+            # watchdog kill and a frozen worker.
+            _forget_thread_browser()
 
 
 def _render_tracked(url: str, host: str, *, wait: bool, scroll: bool) -> str:
