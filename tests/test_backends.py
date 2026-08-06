@@ -1,5 +1,6 @@
 """Regression tests for the scrape backend's failure contract (no network)."""
 
+import asyncio
 import os
 import sys
 import threading
@@ -510,6 +511,24 @@ def test_driver_proc_walks_the_private_path_and_degrades():
     assert backends._driver_proc(object()) is None
 
 
+class _FakePW:
+    """Stands in for the sync_playwright() instance held in the pool.
+
+    stop() is TRANSPORT teardown (safe against a dead driver) and is what releases
+    the thread's asyncio loop -- skipping it is what poisoned every worker on
+    2026-08-06. `boom=True` models it failing, so the fallback path is exercised.
+    """
+
+    def __init__(self, boom: bool = False):
+        self.stopped = False
+        self._boom = boom
+
+    def stop(self):
+        self.stopped = True
+        if self._boom:
+            raise RuntimeError("stop() failed")
+
+
 class _ZombieBrowser:
     """A browser whose driver has been killed: every protocol call HANGS.
 
@@ -549,11 +568,11 @@ class TestWatchdogLeavesNoZombie:
     def test_pool_is_cleared_after_a_watchdog_kill(self, monkeypatch):
         proc = _FakeProc()
         pool = type("L", (), {})()
-        pool.pw = "PW-SENTINEL"
+        pool.pw = _FakePW()
         pool.browser = _FakeBrowser()
         pool.driver_proc = proc
         monkeypatch.setattr(backends, "_POOL", pool)
-        monkeypatch.setattr(backends, "_POOL_REGISTRY", [("PW-SENTINEL", pool.browser)])
+        monkeypatch.setattr(backends, "_POOL_REGISTRY", [(pool.pw, pool.browser)])
         monkeypatch.setattr(backends, "_pooled_browser", lambda: pool.browser)
         monkeypatch.setattr(backends, "RENDER_WATCHDOG_S", 0.05)
 
@@ -584,11 +603,11 @@ class TestWatchdogLeavesNoZombie:
             zombie.touched = False
 
         pool = type("L", (), {})()
-        pool.pw = "PW-SENTINEL"
+        pool.pw = _FakePW()
         pool.browser = zombie
         pool.driver_proc = _FakeProc(on_kill=_zombify)
         monkeypatch.setattr(backends, "_POOL", pool)
-        monkeypatch.setattr(backends, "_POOL_REGISTRY", [("PW-SENTINEL", zombie)])
+        monkeypatch.setattr(backends, "_POOL_REGISTRY", [(pool.pw, zombie)])
         monkeypatch.setattr(backends, "RENDER_WATCHDOG_S", 0.05)
 
         launches = {"n": 0}
@@ -601,7 +620,7 @@ class TestWatchdogLeavesNoZombie:
             launches["n"] += 1
             fresh = _FakeBrowser()
             backends._POOL.browser = fresh
-            backends._POOL.pw = f"PW-{launches['n']}"
+            backends._POOL.pw = _FakePW()
             backends._POOL.driver_proc = _FakeProc()
             return fresh
         monkeypatch.setattr(backends, "_pooled_browser", fake_pooled_browser)
@@ -630,12 +649,84 @@ class TestWatchdogLeavesNoZombie:
         those are the calls that hang against a dead driver."""
         zombie = _ZombieBrowser()
         pool = type("L", (), {})()
-        pool.pw = "PW-SENTINEL"
+        pool.pw = _FakePW()
         pool.browser = zombie
         pool.driver_proc = _FakeProc()
         monkeypatch.setattr(backends, "_POOL", pool)
-        monkeypatch.setattr(backends, "_POOL_REGISTRY", [("PW-SENTINEL", zombie)])
+        monkeypatch.setattr(backends, "_POOL_REGISTRY", [(pool.pw, zombie)])
 
         backends._forget_thread_browser()
         assert not zombie.touched
         assert pool.browser is None and backends._POOL_REGISTRY == []
+
+
+class TestWatchdogDoesNotPoisonTheThread:
+    """THE REGRESSION THIS GUARDS (2026-08-06): the watchdog cleanup skipped
+    pw.stop() to avoid the hang above -- but stop() is TRANSPORT teardown, not a
+    protocol request, and it is what ends the thread's asyncio loop. Without it the
+    loop stays running, PlaywrightContextManager.__enter__ refuses to start a second
+    one on that thread ("Sync API inside the asyncio loop"), and the worker is dead
+    for the rest of the run. One wedged page cost 585 infra failures and aborted the
+    warm with 5 BrowserDeadErrors."""
+
+    def test_forget_stops_playwright_but_never_touches_the_browser(self, monkeypatch):
+        pw, zombie = _FakePW(), _ZombieBrowser()
+        pool = type("L", (), {})()
+        pool.pw, pool.browser, pool.driver_proc = pw, zombie, _FakeProc()
+        monkeypatch.setattr(backends, "_POOL", pool)
+        monkeypatch.setattr(backends, "_POOL_REGISTRY", [(pw, zombie)])
+
+        backends._forget_thread_browser()
+        assert pw.stopped, "pw.stop() was skipped -- the thread's asyncio loop leaks"
+        assert not zombie.touched, "the browser was touched -- that hangs in production"
+        assert pool.pw is None and pool.browser is None
+        assert backends._POOL_REGISTRY == []
+
+    def test_watchdog_kill_stops_playwright(self, monkeypatch):
+        """End-to-end: the stop must happen on the real watchdog path, not just
+        when _forget_thread_browser is called directly."""
+        pw = _FakePW()
+        browser = _FakeBrowser()
+        pool = type("L", (), {})()
+        pool.pw, pool.browser, pool.driver_proc = pw, browser, _FakeProc()
+        monkeypatch.setattr(backends, "_POOL", pool)
+        monkeypatch.setattr(backends, "_POOL_REGISTRY", [(pw, browser)])
+        monkeypatch.setattr(backends, "_pooled_browser", lambda: browser)
+        monkeypatch.setattr(backends, "RENDER_WATCHDOG_S", 0.05)
+
+        def wedged(page, url, *, wait, scroll):
+            time.sleep(0.4)
+            raise PlaywrightError("Connection closed while reading from the driver")
+        monkeypatch.setattr(backends, "_render_on_page", wedged)
+
+        out = build_scrape()("https://wedged.example/menu", mode="browser")
+        assert "render watchdog" in out
+        assert pw.stopped, "the watchdog path left the thread's playwright loop running"
+
+    def test_a_failing_stop_still_unpoisons_the_thread(self, monkeypatch):
+        """Fallback path: if stop() raises we must still clear asyncio's running-loop
+        marker, or __enter__ keeps refusing and the worker stays dead."""
+        pw = _FakePW(boom=True)
+        pool = type("L", (), {})()
+        pool.pw, pool.browser, pool.driver_proc = pw, _ZombieBrowser(), _FakeProc()
+        monkeypatch.setattr(backends, "_POOL", pool)
+        monkeypatch.setattr(backends, "_POOL_REGISTRY", [(pw, pool.browser)])
+
+        cleared = []
+        monkeypatch.setattr(backends, "_clear_running_loop", lambda: cleared.append(1))
+        backends._forget_thread_browser()  # must not raise
+        assert pw.stopped and cleared == [1]
+
+    def test_clear_running_loop_actually_clears_it(self):
+        """The fallback must really reset asyncio's per-thread marker -- the exact
+        state that makes sync_playwright().start() raise."""
+        loop = asyncio.new_event_loop()
+        try:
+            asyncio._set_running_loop(loop)
+            assert asyncio.get_running_loop() is loop
+            backends._clear_running_loop()
+            with pytest.raises(RuntimeError):
+                asyncio.get_running_loop()  # what __enter__ needs to see
+        finally:
+            asyncio._set_running_loop(None)
+            loop.close()

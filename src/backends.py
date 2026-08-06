@@ -53,6 +53,7 @@ functions here return un-capped strings.
 
 from __future__ import annotations
 
+import asyncio
 import atexit
 import os
 import re
@@ -666,28 +667,63 @@ def _drop_thread_browser() -> None:
 
 
 def _forget_thread_browser() -> None:
-    """Drop this thread's pooled browser WITHOUT talking to it (watchdog path).
+    """Release this thread's pooled browser after its driver was KILLED.
 
-    _drop_thread_browser's close()/stop() are PROTOCOL calls. Against a killed
-    driver they do not fail -- they HANG, spinning in Playwright's sync wrapper
-    (`while not task.done(): fiber.switch()`) on a reply that can never arrive.
-    That spin is pure greenlet work, so it pins a core AND holds the GIL, which
-    starves the main thread and makes the process unkillable by Ctrl+C. Measured
-    2026-08-05: a warm froze exactly this way with all 3 workers inside
-    new_context()/close() and every driver already dead.
+    Two hazards pull in OPPOSITE directions here, and both have bitten. The
+    difference between them is protocol call vs transport call:
 
-    A killed driver needs no cleanup anyway -- the OS reaped it and its Chromium
-    child with it -- so the correct move is to forget the references and
-    deregister them (so close_pool() at exit doesn't try to close a zombie
-    either). The next _pooled_browser() then sees browser=None and launches fresh.
+    * browser.close() must NOT be called. It awaits a driver RESPONSE, and against
+      a killed driver it does not fail -- it HANGS, spinning in Playwright's sync
+      wrapper (`while not task.done(): fiber.switch()`), pinning a core AND holding
+      the GIL until the process cannot even be Ctrl+C'd. Measured 2026-08-05: a
+      warm froze this way with all 3 workers inside new_context()/close().
+    * pw.stop() MUST be called. It looks like the same hazard but is not: it is
+      TRANSPORT teardown (request_stop() closes the pipe; wait_until_stopped()
+      awaits the reader task, which already ended at EOF when the driver died), not
+      a request awaiting a reply. Skipping it leaves the thread's asyncio loop
+      RUNNING -- BaseEventLoop.run_forever only clears asyncio's running-loop marker
+      in its `finally`, so until the loop actually stops the marker stays set and
+      PlaywrightContextManager.__enter__ refuses to start a second one
+      (`if self._loop.is_running(): raise ...Sync API inside the asyncio loop`).
+      The thread is then POISONED for the rest of the run: every later scrape fails
+      instantly as an infra sentinel until the circuit breaker aborts. Measured
+      2026-08-06: 585 infra failures and 5 BrowserDeadError aborts from exactly this.
+
+    So: stop the playwright instance, never touch the browser. If stop() does fail,
+    clear the running-loop marker by hand -- that alone is what lets the next
+    sync_playwright().start() on this thread succeed (the old loop leaks, which
+    beats losing the worker).
     """
     pw = getattr(_POOL, "pw", None)
     _POOL.pw = None
     _POOL.browser = None
     _POOL.driver_proc = None
-    if pw is not None:
-        with _POOL_LOCK:
-            _POOL_REGISTRY[:] = [(p, b) for p, b in _POOL_REGISTRY if p is not pw]
+    if pw is None:
+        return
+    with _POOL_LOCK:
+        _POOL_REGISTRY[:] = [(p, b) for p, b in _POOL_REGISTRY if p is not pw]
+    try:
+        pw.stop()
+    except Exception:  # noqa: BLE001 - the driver is already dead; salvage the THREAD
+        _clear_running_loop()
+
+
+def _clear_running_loop() -> None:
+    """Last-resort un-poisoning: drop asyncio's per-thread running-loop marker.
+
+    Only reached when pw.stop() failed. __enter__ gates on
+    asyncio.get_running_loop(), which reads this marker; clearing it makes the gate
+    fall through to a fresh loop. Private API, so guarded -- if it ever disappears,
+    the thread degrades to the (already handled) infra-sentinel path rather than
+    raising from inside cleanup.
+    """
+    setter = getattr(asyncio, "_set_running_loop", None)
+    if setter is None:
+        return
+    try:
+        setter(None)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def _pooled_browser():
