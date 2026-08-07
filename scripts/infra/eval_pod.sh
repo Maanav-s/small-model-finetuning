@@ -41,6 +41,8 @@
 set -euo pipefail
 
 REPO="${REPO:-/workspace/small-model-finetuning}"
+REPO_URL="${REPO_URL:-https://github.com/Maanav-s/small-model-finetuning.git}"
+BRANCH="${BRANCH:-eval-v2-three-model}"
 WORK="${WORK:-/workspace}"
 CLIENT_VENV="${CLIENT_VENV:-/opt/client}"     # repo deps (tools, eval, corpus) -- NO torch
 VLLM_VENV="${VLLM_VENV:-/opt/vllm}"           # vllm + its own torch; created by serve_teacher.sh
@@ -113,11 +115,16 @@ phase_setup() {
   log "system packages"
   apt-get update -qq && apt-get install -y -qq tmux git curl
 
-  log "repo"
-  if [ ! -d "$REPO/.git" ]; then
-    git clone https://github.com/Maanav-s/small-model-finetuning.git "$REPO"
-  fi
+  log "repo @ $BRANCH"
+  [ -d "$REPO/.git" ] || git clone "$REPO_URL" "$REPO"
   cd "$REPO"
+  git fetch --all --quiet
+  git checkout "$BRANCH"
+  git pull --ff-only
+  git log --oneline -1
+
+  log "GPUs -- the driver MUST be >= 580 / CUDA 13 or vLLM cannot serve Gemma-4 at all"
+  nvidia-smi --query-gpu=index,name,driver_version,memory.total --format=csv
 
   log "client venv ($CLIENT_VENV) -- repo deps only, NO torch"
   # anthropic is required even for the gemma/vllm paths: eval.py imports
