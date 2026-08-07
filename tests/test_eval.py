@@ -79,6 +79,13 @@ def keys(monkeypatch):
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-anthropic")
 
 
+@pytest.fixture(autouse=True)
+def no_wandb(monkeypatch):
+    """W&B logging is key-gated -- unset the key so a developer who happens to have
+    WANDB_API_KEY exported doesn't start a real run (and hit the network) per test."""
+    monkeypatch.delenv("WANDB_API_KEY", raising=False)
+
+
 def _argv(candidate_dir, corpus_path, *extra):
     return [str(candidate_dir), "--model", "claude", "--corpus", str(corpus_path),
             "--cache-path", str(corpus_path.parent / "cache.sqlite"), *extra]
@@ -267,3 +274,85 @@ class TestCacheMiss:
         assert "self-report (no reference)" in out
         assert "--- all (n=2) ---" in out
         assert "schema-valid:   50.0%" in out  # one valid, one empty
+
+
+# ---------------------------------------------------------------------------
+# (e) the report carries HOW it was produced: cache hit rate + run stats
+# ---------------------------------------------------------------------------
+class TestRunAndCacheStats:
+    """A score without its cache hit rate can't be read honestly (a model that ran
+    off the warmed distribution is partly being scored on the cache), so `cache` and
+    `run` travel inside the report JSON -- not just the console."""
+
+    def test_report_carries_cache_and_run_blocks(self, monkeypatch, corpus_path, tmp_path, keys):
+        cand = tmp_path / "cand"
+        monkeypatch.setattr(ev, "claude_run_episode", _make_stub(_menu_by_restaurant()))
+        _run(cand, corpus_path, "--limit", "2", "--conditioned-frac", "0.0", "--workers", "1",
+             "--json", str(tmp_path / "report.json"))
+
+        report = json.loads((tmp_path / "report.json").read_text())
+        cache, run = report["cache"], report["run"]
+        # hit_rate is over LOOKUPS; the stub calls no tools, so there are none -> None
+        # (an honest "unknown", never a misleading 0.0 or 1.0).
+        assert set(cache) >= {"hits", "misses", "writes", "lookups", "hit_rate", "miss_policy"}
+        assert cache["lookups"] == cache["hits"] + cache["misses"]
+        assert cache["hit_rate"] is None
+        assert run["n_completed"] == 2 and run["n_failed"] == 0
+        assert run["n_planned"] == 2 and run["n_todo"] == 2 and run["workers"] == 1
+        assert run["elapsed_s"] > 0 and run["failures"] == []
+
+    def test_hit_rate_is_over_lookups(self):
+        class FakeCache:
+            def stats(self):
+                return {"hits": 3, "misses": 1, "writes": 1, "miss_policy": "live",
+                        "cache_version": 1}
+        got = ev.cache_report(FakeCache())
+        # 3 hits / 4 lookups -- writes are a SUBSET of misses and must not be counted.
+        assert got["lookups"] == 4 and got["hit_rate"] == 0.75
+
+    def test_scoring_only_pass_reports_null_stats(self, monkeypatch, corpus_path, tmp_path, keys):
+        # Re-scoring existing candidates produces no run/cache facts; the report says
+        # so with nulls rather than inventing a 100% hit rate.
+        cand = tmp_path / "cand"
+        monkeypatch.setattr(ev, "claude_run_episode", _make_stub(_menu_by_restaurant()))
+        _run(cand, corpus_path, "--limit", "2", "--conditioned-frac", "0.0", "--workers", "1")
+        _run(cand, corpus_path, "--limit", "2", "--conditioned-frac", "0.0", "--workers", "1",
+             "--json", str(tmp_path / "report.json"))
+        report = json.loads((tmp_path / "report.json").read_text())
+        assert report["run"] is None and report["cache"] is None
+
+
+# ---------------------------------------------------------------------------
+# (f) W&B is key-gated and never fatal
+# ---------------------------------------------------------------------------
+class TestWandb:
+    def test_no_key_is_a_noop(self, monkeypatch, corpus_path, tmp_path):
+        monkeypatch.delenv("WANDB_API_KEY", raising=False)
+        args = ev.parse_args(_argv(tmp_path / "cand", corpus_path))
+        assert ev.init_wandb(args, 10) is None
+
+    def test_disabled_by_flag_even_with_key(self, monkeypatch, corpus_path, tmp_path):
+        monkeypatch.setenv("WANDB_API_KEY", "test-key")
+        args = ev.parse_args(_argv(tmp_path / "cand", corpus_path, "--no-wandb"))
+        assert ev.init_wandb(args, 10) is None
+
+    def test_init_failure_degrades_to_console(self, monkeypatch, capsys, corpus_path, tmp_path):
+        """A telemetry misconfiguration must not kill a metered eval on a paid pod."""
+        monkeypatch.setenv("WANDB_API_KEY", "test-key")
+        fake = type("FakeWandb", (), {"init": staticmethod(
+            lambda **kw: (_ for _ in ()).throw(RuntimeError("boom")))})
+        monkeypatch.setitem(sys.modules, "wandb", fake)
+        args = ev.parse_args(_argv(tmp_path / "cand", corpus_path))
+        assert ev.init_wandb(args, 10) is None
+        assert "init failed" in capsys.readouterr().out
+
+    def test_log_helpers_tolerate_a_broken_run(self, capsys):
+        class BrokenRun:
+            def log(self, *a, **k):
+                raise RuntimeError("network down")
+            summary = property(lambda self: (_ for _ in ()).throw(RuntimeError("nope")))
+        ev.wandb_log(None, {"x": 1})            # None run -> silent no-op
+        ev.wandb_log(BrokenRun(), {"x": 1})     # broken run -> caught, not raised
+        ev.wandb_summarize(BrokenRun(), {"aggregate": {"all": {"found_rate": 1.0}},
+                                         "abstention": {}, "cache": {}, "run": {}})
+        assert "log failed" in capsys.readouterr().out
