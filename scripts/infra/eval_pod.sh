@@ -148,8 +148,12 @@ err = preflight_browser()
 print("browser preflight:", err or "OK")
 sys.exit(1 if err else 0)
 PY
+  # Write the plan out, THEN head the file. Piping python straight into `head`
+  # closes the pipe under it -> BrokenPipeError traceback, and `set -o pipefail`
+  # turns that into a failed setup phase for a run that actually succeeded.
   "$PY" scripts/eval/eval.py "$EVAL_DIR/candidates/_plan" --model vllm --list \
-      --limit "$LIMIT" --conditioned-frac "$COND" --seed "$SEED" | head -5
+      --limit "$LIMIT" --conditioned-frac "$COND" --seed "$SEED" > "$WORK/plan.txt"
+  head -5 "$WORK/plan.txt"
   rmdir "$EVAL_DIR/candidates/_plan" 2>/dev/null || true
   echo "setup OK -- run-set '$RUN_SET'"
 }
