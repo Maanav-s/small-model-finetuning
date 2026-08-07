@@ -13,6 +13,60 @@ Conventions:
 
 ---
 
+## 2026-08-06 — GRPO cache warm COMPLETE (902/902), after a wedged renderer + two self-inflicted hangs
+
+The big `--modes both` GRPO warm finished: **all 902 `grpo`-split restaurants fully
+covered** — 6 query templates × ≤3 URLs × {direct, browser} = **22,454 scrape rows, 0
+gaps**, 41,564 total cache rows, ~199 MB, pushed to `s3://restaurant-menu-corpus/v2/cache.sqlite`.
+Getting there cost two hangs, both caused by the fix for the previous one. Worth reading
+before touching `src/backends.py`.
+
+**Warm config:** `--splits grpo --queries "{name} {city} menu" "{name} menu" "{name} {city}"
+"{name} {city} menu prices" "{name} {city} order online" "{name} restaurant {city} menu"
+--urls-per-query 3 --modes both --workers 3 --sleep 2.0`
+
+**First: the protections moved into the backend.** `warm_cache.py` had accumulated real
+defenses (dead-end domain skips, infra/site error split, preflight) that the LIVE tool path
+did not have — and worse, warm wrapped the RAW `build_scrape()` closure while `setup_tools`
+slimmed before caching, so **warmed rows were stored unslimmed** and served unslimmed on
+every later hit (off the SFT distribution, and junk pages froze as permanent `'ok'` because
+`slim_rows` rewrites text but not `status`). All of it now lives in `build_scrape` itself:
+slim-at-source, `SKIP_DOMAINS`/`SKIP_EXTENSIONS`/Content-Type sentinels, per-host throttle,
+infra circuit breaker. Plus `Cache.reclassify` to repair the stale statuses.
+
+**Hang #1 (2026-07-25) — a wedged renderer parks a worker forever.** All 3 workers idle at
+0% CPU, no sockets, cache untouched for 12+ min. `py-spy dump` showed every worker inside a
+Playwright protocol call. `goto`/`networkidle` have timeouts, but **`page.evaluate` (the
+auto-scroll), `page.content()`, and context open/close do not** — a page whose renderer
+wedges never answers. Killing the `chrome-headless-shell` processes by hand unblocked the
+run in place (sentinels + pooled relaunch recovered it). Fix: `RENDER_WATCHDOG_S` (180s;
+worst legit render ≈100s) kills that thread's node **driver**.
+
+**Hang #2 (2026-08-05) — the watchdog's own zombie, and an UNKILLABLE process.** The kill
+worked and the first call raised, but the dead browser stayed pooled: **`is_connected()` is
+a cached flag** that only a close *event* clears, and a force-kill sends none. The next call
+issued `new_context()` into a dead pipe, where Playwright's sync wrapper spins
+`while not task.done(): fiber.switch()` — pinning a core **and holding the GIL**, so Ctrl+C
+was never delivered (72 min of CPU burned; needed `Stop-Process -Force`). Fix:
+`_forget_thread_browser()` + skip `context.close()` once fired.
+
+**Hang #3 (2026-08-06) — poisoned threads, 585 infra failures.** `_forget_thread_browser`
+skipped `pw.stop()` to dodge hang #2's hazard. But **`stop()` is the one call you must
+make**: it is TRANSPORT teardown (closes the pipe; awaits a reader task already at EOF), not
+a request awaiting a reply. Skipping it leaves the thread's asyncio loop running
+(`run_forever` only clears the running-loop marker in its `finally`), so Playwright refuses a
+second loop on that thread — **poisoning the worker for the whole run**. One wedged page per
+thread poisoned all three: 585 infra failures, 5 `BrowserDeadError` aborts, warm ~89%
+complete. The re-run after the fix filled all 1,498 remaining gaps.
+
+**The generalizable rule:** against a dead Playwright driver, a **protocol** call
+(`browser.close()`, `new_context()`) HANGS; a **transport** call (`pw.stop()`) is safe and
+required. Conflating them cost two outages in opposite directions.
+
+**No data was ever corrupted.** `store_if=is_cacheable` kept all 585 infra failures out of
+the DB — verified 0 `asyncio loop` rows, 0 launch-failure rows. Infra failures are facts
+about the machine, not the web; the URLs were simply left absent and re-fetched later.
+
 ## 2026-07-19 — first vLLM-teacher corpus build (50 sft) + context-overflow fix
 
 Ran the 235B teacher over 50 sft restaurants (4×H100, free episodes) to calibrate cache
