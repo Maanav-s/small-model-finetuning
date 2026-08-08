@@ -1,0 +1,4554 @@
+{
+  "mode": "self-report",
+  "model": "vllm",
+  "model_id": "Qwen/Qwen3-235B-A22B-Instruct-2507-FP8",
+  "checkpoint": {
+    "model": "vllm",
+    "label": "Qwen/Qwen3-235B-A22B-Instruct-2507-FP8",
+    "path": null,
+    "run_id": null,
+    "md5": null,
+    "meta": null
+  },
+  "split": "eval",
+  "candidate_dir": "/workspace/small-model-finetuning/data/eval/eval500-20260808/candidates/teacher",
+  "corpus": "/workspace/small-model-finetuning/data/corpus.sqlite",
+  "cache_policy": "live",
+  "aggregate": {
+    "all": {
+      "n_episodes": 500,
+      "schema_valid_rate": 0.996,
+      "found_rate": 0.82,
+      "mean_sections": 4.94,
+      "mean_items": 34.526,
+      "price_coverage_mean": 0.7215863781942972,
+      "price_coverage_n": 404
+    },
+    "free": {
+      "n_episodes": 300,
+      "schema_valid_rate": 1.0,
+      "found_rate": 0.8566666666666667,
+      "mean_sections": 5.3533333333333335,
+      "mean_items": 39.69,
+      "price_coverage_mean": 0.7003527607901474,
+      "price_coverage_n": 255
+    },
+    "conditioned": {
+      "n_episodes": 200,
+      "schema_valid_rate": 0.99,
+      "found_rate": 0.765,
+      "mean_sections": 4.32,
+      "mean_items": 26.78,
+      "price_coverage_mean": 0.757925790530258,
+      "price_coverage_n": 149
+    }
+  },
+  "episodes": {
+    "00ad27ad806c8518": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 5,
+      "n_items": 33,
+      "n_priced_items": 0,
+      "price_coverage": 0.0,
+      "conditioned": false
+    },
+    "014a1c7a49bc3670": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 4,
+      "n_items": 26,
+      "n_priced_items": 0,
+      "price_coverage": 0.0,
+      "conditioned": false
+    },
+    "036c06bcac906ed6": {
+      "schema_valid": true,
+      "found": false,
+      "n_sections": 0,
+      "n_items": 0,
+      "n_priced_items": 0,
+      "price_coverage": null,
+      "conditioned": false
+    },
+    "036c06bcac906ed6__kosher": {
+      "schema_valid": true,
+      "found": false,
+      "n_sections": 0,
+      "n_items": 0,
+      "n_priced_items": 0,
+      "price_coverage": null,
+      "conditioned": true
+    },
+    "04742aa5e5e617f1": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 5,
+      "n_items": 54,
+      "n_priced_items": 21,
+      "price_coverage": 0.3888888888888889,
+      "conditioned": false
+    },
+    "04742aa5e5e617f1__vegetarian": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 4,
+      "n_items": 12,
+      "n_priced_items": 1,
+      "price_coverage": 0.08333333333333333,
+      "conditioned": true
+    },
+    "0474323ce6f4d77f": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 9,
+      "n_items": 35,
+      "n_priced_items": 35,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "0474323ce6f4d77f__kosher": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 9,
+      "n_items": 35,
+      "n_priced_items": 35,
+      "price_coverage": 1.0,
+      "conditioned": true
+    },
+    "054cc43b147ba55d": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 5,
+      "n_items": 25,
+      "n_priced_items": 25,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "0611d35705c446ca": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 4,
+      "n_items": 26,
+      "n_priced_items": 25,
+      "price_coverage": 0.9615384615384616,
+      "conditioned": false
+    },
+    "0611d35705c446ca__gluten-free": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 1,
+      "n_items": 3,
+      "n_priced_items": 3,
+      "price_coverage": 1.0,
+      "conditioned": true
+    },
+    "08450047e3dfd1a7": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 12,
+      "n_items": 128,
+      "n_priced_items": 128,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "08450047e3dfd1a7__dairy-free": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 5,
+      "n_items": 45,
+      "n_priced_items": 45,
+      "price_coverage": 1.0,
+      "conditioned": true
+    },
+    "09cfa47faa087a91": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 12,
+      "n_items": 57,
+      "n_priced_items": 57,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "0a1da7cfd8561749": {
+      "schema_valid": true,
+      "found": false,
+      "n_sections": 0,
+      "n_items": 0,
+      "n_priced_items": 0,
+      "price_coverage": null,
+      "conditioned": false
+    },
+    "0a31fd9cf2d9e8bd": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 5,
+      "n_items": 31,
+      "n_priced_items": 31,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "0a31fd9cf2d9e8bd__gluten-free-dairy-free": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 5,
+      "n_items": 31,
+      "n_priced_items": 31,
+      "price_coverage": 1.0,
+      "conditioned": true
+    },
+    "0a44f8edc5629e9e": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 1,
+      "n_items": 2,
+      "n_priced_items": 0,
+      "price_coverage": 0.0,
+      "conditioned": false
+    },
+    "0a90d133410eaa80": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 2,
+      "n_items": 10,
+      "n_priced_items": 0,
+      "price_coverage": 0.0,
+      "conditioned": false
+    },
+    "0a90d133410eaa80__vegetarian": {
+      "schema_valid": false,
+      "found": false,
+      "n_sections": 0,
+      "n_items": 0,
+      "n_priced_items": 0,
+      "price_coverage": null,
+      "conditioned": true
+    },
+    "0abc66659097d3dc": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 4,
+      "n_items": 34,
+      "n_priced_items": 34,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "0abc66659097d3dc__gluten-free-dairy-free": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 3,
+      "n_items": 10,
+      "n_priced_items": 10,
+      "price_coverage": 1.0,
+      "conditioned": true
+    },
+    "0bca3a369fdcf93f": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 15,
+      "n_items": 169,
+      "n_priced_items": 168,
+      "price_coverage": 0.9940828402366864,
+      "conditioned": false
+    },
+    "0bca3a369fdcf93f__no-peanuts": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 15,
+      "n_items": 169,
+      "n_priced_items": 168,
+      "price_coverage": 0.9940828402366864,
+      "conditioned": true
+    },
+    "0c19a809b7dc524f": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 12,
+      "n_items": 61,
+      "n_priced_items": 61,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "0da9de400f7739ec": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 1,
+      "n_items": 4,
+      "n_priced_items": 0,
+      "price_coverage": 0.0,
+      "conditioned": false
+    },
+    "0da9de400f7739ec__vegetarian": {
+      "schema_valid": true,
+      "found": false,
+      "n_sections": 0,
+      "n_items": 0,
+      "n_priced_items": 0,
+      "price_coverage": null,
+      "conditioned": true
+    },
+    "0fb2e6be8077a597": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 3,
+      "n_items": 4,
+      "n_priced_items": 1,
+      "price_coverage": 0.25,
+      "conditioned": false
+    },
+    "10c808f4c98b0e8c": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 4,
+      "n_items": 22,
+      "n_priced_items": 22,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "12a1c10dd1a86bd1": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 12,
+      "n_items": 85,
+      "n_priced_items": 85,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "12ce60313f6aab87": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 9,
+      "n_items": 47,
+      "n_priced_items": 31,
+      "price_coverage": 0.6595744680851063,
+      "conditioned": false
+    },
+    "146220509214a86f": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 8,
+      "n_items": 77,
+      "n_priced_items": 74,
+      "price_coverage": 0.961038961038961,
+      "conditioned": false
+    },
+    "146220509214a86f__no-nuts-peanuts-or-tree-nuts": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 13,
+      "n_items": 77,
+      "n_priced_items": 75,
+      "price_coverage": 0.974025974025974,
+      "conditioned": true
+    },
+    "1554eacbce42259e": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 3,
+      "n_items": 4,
+      "n_priced_items": 4,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "1554eacbce42259e__gluten-free-dairy-free": {
+      "schema_valid": true,
+      "found": false,
+      "n_sections": 0,
+      "n_items": 0,
+      "n_priced_items": 0,
+      "price_coverage": null,
+      "conditioned": true
+    },
+    "167eec06c0e53fd4": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 14,
+      "n_items": 164,
+      "n_priced_items": 164,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "167eec06c0e53fd4__vegetarian-no-peanuts": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 7,
+      "n_items": 52,
+      "n_priced_items": 52,
+      "price_coverage": 1.0,
+      "conditioned": true
+    },
+    "16fd210d7880032f": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 3,
+      "n_items": 29,
+      "n_priced_items": 29,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "1731f3fdfcb32dd7": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 2,
+      "n_items": 4,
+      "n_priced_items": 4,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "18a2d92e1ef6edaf": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 7,
+      "n_items": 41,
+      "n_priced_items": 41,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "18a2d92e1ef6edaf__dairy-free": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 7,
+      "n_items": 38,
+      "n_priced_items": 38,
+      "price_coverage": 1.0,
+      "conditioned": true
+    },
+    "18a5a82698539d0e": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 3,
+      "n_items": 8,
+      "n_priced_items": 0,
+      "price_coverage": 0.0,
+      "conditioned": false
+    },
+    "18a5a82698539d0e__vegan": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 2,
+      "n_items": 1,
+      "n_priced_items": 0,
+      "price_coverage": 0.0,
+      "conditioned": true
+    },
+    "19455131bc6d883c": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 10,
+      "n_items": 62,
+      "n_priced_items": 61,
+      "price_coverage": 0.9838709677419355,
+      "conditioned": false
+    },
+    "1998d22f27747d42": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 1,
+      "n_items": 8,
+      "n_priced_items": 8,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "1998d22f27747d42__kosher": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 1,
+      "n_items": 8,
+      "n_priced_items": 8,
+      "price_coverage": 1.0,
+      "conditioned": true
+    },
+    "1a1ad0773ae2e27a": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 1,
+      "n_items": 3,
+      "n_priced_items": 0,
+      "price_coverage": 0.0,
+      "conditioned": false
+    },
+    "1a1ad0773ae2e27a__gluten-free": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 1,
+      "n_items": 4,
+      "n_priced_items": 0,
+      "price_coverage": 0.0,
+      "conditioned": true
+    },
+    "1b748628391fb47d": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 5,
+      "n_items": 45,
+      "n_priced_items": 45,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "1b748628391fb47d__no-nuts-peanuts-or-tree-nuts": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 6,
+      "n_items": 38,
+      "n_priced_items": 36,
+      "price_coverage": 0.9473684210526315,
+      "conditioned": true
+    },
+    "1be91a1b5f30955f": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 7,
+      "n_items": 41,
+      "n_priced_items": 41,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "1cc9c9f100129ee2": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 7,
+      "n_items": 29,
+      "n_priced_items": 29,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "1ed035df6640077e": {
+      "schema_valid": true,
+      "found": false,
+      "n_sections": 0,
+      "n_items": 0,
+      "n_priced_items": 0,
+      "price_coverage": null,
+      "conditioned": false
+    },
+    "1ed035df6640077e__vegetarian-no-peanuts": {
+      "schema_valid": true,
+      "found": false,
+      "n_sections": 0,
+      "n_items": 0,
+      "n_priced_items": 0,
+      "price_coverage": null,
+      "conditioned": true
+    },
+    "1f3ebc575e59bece": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 6,
+      "n_items": 37,
+      "n_priced_items": 37,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "1f3ebc575e59bece__vegan": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 5,
+      "n_items": 18,
+      "n_priced_items": 18,
+      "price_coverage": 1.0,
+      "conditioned": true
+    },
+    "207d9593b89d5c4d": {
+      "schema_valid": true,
+      "found": false,
+      "n_sections": 0,
+      "n_items": 0,
+      "n_priced_items": 0,
+      "price_coverage": null,
+      "conditioned": false
+    },
+    "2101d1008267784d": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 14,
+      "n_items": 94,
+      "n_priced_items": 94,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "213b6e2928491497": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 1,
+      "n_items": 1,
+      "n_priced_items": 1,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "220a689c59430fd8": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 2,
+      "n_items": 68,
+      "n_priced_items": 68,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "220a689c59430fd8__no-shellfish": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 2,
+      "n_items": 65,
+      "n_priced_items": 65,
+      "price_coverage": 1.0,
+      "conditioned": true
+    },
+    "22cc27f0220138bf": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 9,
+      "n_items": 20,
+      "n_priced_items": 20,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "22cc27f0220138bf__pescatarian": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 9,
+      "n_items": 20,
+      "n_priced_items": 20,
+      "price_coverage": 1.0,
+      "conditioned": true
+    },
+    "233dcd38d01453bf": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 1,
+      "n_items": 10,
+      "n_priced_items": 10,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "23b2940fc6edae79": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 1,
+      "n_items": 4,
+      "n_priced_items": 0,
+      "price_coverage": 0.0,
+      "conditioned": false
+    },
+    "23b2940fc6edae79__dairy-free": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 2,
+      "n_items": 2,
+      "n_priced_items": 0,
+      "price_coverage": 0.0,
+      "conditioned": true
+    },
+    "23c5dc7c15cd0970": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 4,
+      "n_items": 7,
+      "n_priced_items": 6,
+      "price_coverage": 0.8571428571428571,
+      "conditioned": false
+    },
+    "23c5dc7c15cd0970__no-shellfish": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 4,
+      "n_items": 7,
+      "n_priced_items": 6,
+      "price_coverage": 0.8571428571428571,
+      "conditioned": true
+    },
+    "24900e4e19cd7606": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 15,
+      "n_items": 106,
+      "n_priced_items": 106,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "24900e4e19cd7606__keto-low-carb": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 11,
+      "n_items": 91,
+      "n_priced_items": 91,
+      "price_coverage": 1.0,
+      "conditioned": true
+    },
+    "25abda5aa52e291d": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 5,
+      "n_items": 20,
+      "n_priced_items": 20,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "25abda5aa52e291d__halal": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 5,
+      "n_items": 20,
+      "n_priced_items": 20,
+      "price_coverage": 1.0,
+      "conditioned": true
+    },
+    "2754a81044a8ab72": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 1,
+      "n_items": 5,
+      "n_priced_items": 5,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "2754a81044a8ab72__dairy-free": {
+      "schema_valid": true,
+      "found": false,
+      "n_sections": 0,
+      "n_items": 0,
+      "n_priced_items": 0,
+      "price_coverage": null,
+      "conditioned": true
+    },
+    "2a6a93aab927d59a": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 3,
+      "n_items": 17,
+      "n_priced_items": 0,
+      "price_coverage": 0.0,
+      "conditioned": false
+    },
+    "2a6a93aab927d59a__vegetarian-no-peanuts": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 2,
+      "n_items": 15,
+      "n_priced_items": 0,
+      "price_coverage": 0.0,
+      "conditioned": true
+    },
+    "2aa2275d38789381": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 2,
+      "n_items": 6,
+      "n_priced_items": 0,
+      "price_coverage": 0.0,
+      "conditioned": false
+    },
+    "2aa2275d38789381__no-peanuts": {
+      "schema_valid": true,
+      "found": false,
+      "n_sections": 0,
+      "n_items": 0,
+      "n_priced_items": 0,
+      "price_coverage": null,
+      "conditioned": true
+    },
+    "2be7cea383777371": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 11,
+      "n_items": 121,
+      "n_priced_items": 0,
+      "price_coverage": 0.0,
+      "conditioned": false
+    },
+    "2be7cea383777371__halal": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 11,
+      "n_items": 127,
+      "n_priced_items": 127,
+      "price_coverage": 1.0,
+      "conditioned": true
+    },
+    "2cde457a0e8d4f15": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 11,
+      "n_items": 35,
+      "n_priced_items": 35,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "2cde457a0e8d4f15__dairy-free": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 4,
+      "n_items": 6,
+      "n_priced_items": 6,
+      "price_coverage": 1.0,
+      "conditioned": true
+    },
+    "2cf14672cd13edba": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 2,
+      "n_items": 15,
+      "n_priced_items": 15,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "2dd3f6aea5e5addb": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 1,
+      "n_items": 1,
+      "n_priced_items": 1,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "2dd3f6aea5e5addb__no-shellfish": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 1,
+      "n_items": 1,
+      "n_priced_items": 1,
+      "price_coverage": 1.0,
+      "conditioned": true
+    },
+    "2e43503df8f2251f": {
+      "schema_valid": true,
+      "found": false,
+      "n_sections": 0,
+      "n_items": 0,
+      "n_priced_items": 0,
+      "price_coverage": null,
+      "conditioned": false
+    },
+    "2e43503df8f2251f__dairy-free": {
+      "schema_valid": true,
+      "found": false,
+      "n_sections": 0,
+      "n_items": 0,
+      "n_priced_items": 0,
+      "price_coverage": null,
+      "conditioned": true
+    },
+    "2ed2f5db9367175e": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 2,
+      "n_items": 5,
+      "n_priced_items": 0,
+      "price_coverage": 0.0,
+      "conditioned": false
+    },
+    "2ed2f5db9367175e__keto-low-carb": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 1,
+      "n_items": 4,
+      "n_priced_items": 0,
+      "price_coverage": 0.0,
+      "conditioned": true
+    },
+    "2fef99fa9ae23c56": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 10,
+      "n_items": 57,
+      "n_priced_items": 57,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "2fef99fa9ae23c56__vegetarian-no-peanuts": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 8,
+      "n_items": 18,
+      "n_priced_items": 18,
+      "price_coverage": 1.0,
+      "conditioned": true
+    },
+    "3058c9f357560d20": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 10,
+      "n_items": 69,
+      "n_priced_items": 20,
+      "price_coverage": 0.2898550724637681,
+      "conditioned": false
+    },
+    "33d7a73c1ef108a5": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 3,
+      "n_items": 57,
+      "n_priced_items": 57,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "36df00100acb5c00": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 4,
+      "n_items": 14,
+      "n_priced_items": 14,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "370cedc067246d00": {
+      "schema_valid": true,
+      "found": false,
+      "n_sections": 0,
+      "n_items": 0,
+      "n_priced_items": 0,
+      "price_coverage": null,
+      "conditioned": false
+    },
+    "370cedc067246d00__no-shellfish": {
+      "schema_valid": true,
+      "found": false,
+      "n_sections": 0,
+      "n_items": 0,
+      "n_priced_items": 0,
+      "price_coverage": null,
+      "conditioned": true
+    },
+    "3806397a474d86a9": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 1,
+      "n_items": 6,
+      "n_priced_items": 0,
+      "price_coverage": 0.0,
+      "conditioned": false
+    },
+    "3806397a474d86a9__gluten-free-dairy-free": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 2,
+      "n_items": 12,
+      "n_priced_items": 0,
+      "price_coverage": 0.0,
+      "conditioned": true
+    },
+    "381b09d1c2de3f2f": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 6,
+      "n_items": 67,
+      "n_priced_items": 67,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "381b09d1c2de3f2f__halal": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 5,
+      "n_items": 64,
+      "n_priced_items": 64,
+      "price_coverage": 1.0,
+      "conditioned": true
+    },
+    "38254f1f7bd90a80": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 1,
+      "n_items": 6,
+      "n_priced_items": 0,
+      "price_coverage": 0.0,
+      "conditioned": false
+    },
+    "38a1b94c8820062e": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 1,
+      "n_items": 7,
+      "n_priced_items": 0,
+      "price_coverage": 0.0,
+      "conditioned": false
+    },
+    "392b8f488a90c31d": {
+      "schema_valid": true,
+      "found": false,
+      "n_sections": 0,
+      "n_items": 0,
+      "n_priced_items": 0,
+      "price_coverage": null,
+      "conditioned": false
+    },
+    "392b8f488a90c31d__vegan": {
+      "schema_valid": true,
+      "found": false,
+      "n_sections": 0,
+      "n_items": 0,
+      "n_priced_items": 0,
+      "price_coverage": null,
+      "conditioned": true
+    },
+    "399444c3b4eb4721": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 10,
+      "n_items": 58,
+      "n_priced_items": 58,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "3996cec94dbfa5a7": {
+      "schema_valid": true,
+      "found": false,
+      "n_sections": 0,
+      "n_items": 0,
+      "n_priced_items": 0,
+      "price_coverage": null,
+      "conditioned": false
+    },
+    "3996cec94dbfa5a7__keto-low-carb": {
+      "schema_valid": true,
+      "found": false,
+      "n_sections": 0,
+      "n_items": 0,
+      "n_priced_items": 0,
+      "price_coverage": null,
+      "conditioned": true
+    },
+    "3a0c337ea8b7e225": {
+      "schema_valid": true,
+      "found": false,
+      "n_sections": 0,
+      "n_items": 0,
+      "n_priced_items": 0,
+      "price_coverage": null,
+      "conditioned": false
+    },
+    "3b03bc7d93a4b854": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 3,
+      "n_items": 14,
+      "n_priced_items": 14,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "3b03bc7d93a4b854__gluten-free": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 3,
+      "n_items": 14,
+      "n_priced_items": 14,
+      "price_coverage": 1.0,
+      "conditioned": true
+    },
+    "3b6df5bb082b353d": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 10,
+      "n_items": 56,
+      "n_priced_items": 56,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "3c697c0581a31261": {
+      "schema_valid": true,
+      "found": false,
+      "n_sections": 0,
+      "n_items": 0,
+      "n_priced_items": 0,
+      "price_coverage": null,
+      "conditioned": false
+    },
+    "3c697c0581a31261__no-shellfish": {
+      "schema_valid": true,
+      "found": false,
+      "n_sections": 0,
+      "n_items": 0,
+      "n_priced_items": 0,
+      "price_coverage": null,
+      "conditioned": true
+    },
+    "3e1ab36b19abc7b7": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 9,
+      "n_items": 42,
+      "n_priced_items": 30,
+      "price_coverage": 0.7142857142857143,
+      "conditioned": false
+    },
+    "3e1ab36b19abc7b7__gluten-free": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 9,
+      "n_items": 42,
+      "n_priced_items": 30,
+      "price_coverage": 0.7142857142857143,
+      "conditioned": true
+    },
+    "3ecdd52f9e78d9a3": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 8,
+      "n_items": 43,
+      "n_priced_items": 43,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "3ecdd52f9e78d9a3__no-shellfish": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 8,
+      "n_items": 42,
+      "n_priced_items": 42,
+      "price_coverage": 1.0,
+      "conditioned": true
+    },
+    "3f5df7480935b1ca": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 7,
+      "n_items": 45,
+      "n_priced_items": 0,
+      "price_coverage": 0.0,
+      "conditioned": false
+    },
+    "3f5df7480935b1ca__no-shellfish": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 4,
+      "n_items": 43,
+      "n_priced_items": 43,
+      "price_coverage": 1.0,
+      "conditioned": true
+    },
+    "3fdc9fd4d6af81ec": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 7,
+      "n_items": 68,
+      "n_priced_items": 68,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "42afe1222b5dc546": {
+      "schema_valid": true,
+      "found": false,
+      "n_sections": 0,
+      "n_items": 0,
+      "n_priced_items": 0,
+      "price_coverage": null,
+      "conditioned": false
+    },
+    "437e4b5ced4bcf80": {
+      "schema_valid": true,
+      "found": false,
+      "n_sections": 0,
+      "n_items": 0,
+      "n_priced_items": 0,
+      "price_coverage": null,
+      "conditioned": false
+    },
+    "438d8f091a121ad7": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 7,
+      "n_items": 48,
+      "n_priced_items": 32,
+      "price_coverage": 0.6666666666666666,
+      "conditioned": false
+    },
+    "438d8f091a121ad7__pescatarian": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 6,
+      "n_items": 42,
+      "n_priced_items": 26,
+      "price_coverage": 0.6190476190476191,
+      "conditioned": true
+    },
+    "43904146933e77f6": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 5,
+      "n_items": 36,
+      "n_priced_items": 0,
+      "price_coverage": 0.0,
+      "conditioned": false
+    },
+    "43fea84c84e61b95": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 1,
+      "n_items": 3,
+      "n_priced_items": 0,
+      "price_coverage": 0.0,
+      "conditioned": false
+    },
+    "43fea84c84e61b95__dairy-free": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 1,
+      "n_items": 3,
+      "n_priced_items": 0,
+      "price_coverage": 0.0,
+      "conditioned": true
+    },
+    "44a2d8eff2e4372e": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 4,
+      "n_items": 21,
+      "n_priced_items": 21,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "452e17eccba9d432": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 5,
+      "n_items": 30,
+      "n_priced_items": 30,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "45f0cf56c288b657": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 11,
+      "n_items": 127,
+      "n_priced_items": 127,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "47362db150ece90a": {
+      "schema_valid": true,
+      "found": false,
+      "n_sections": 0,
+      "n_items": 0,
+      "n_priced_items": 0,
+      "price_coverage": null,
+      "conditioned": false
+    },
+    "47362db150ece90a__no-shellfish": {
+      "schema_valid": true,
+      "found": false,
+      "n_sections": 0,
+      "n_items": 0,
+      "n_priced_items": 0,
+      "price_coverage": null,
+      "conditioned": true
+    },
+    "492b0f785b91bfd0": {
+      "schema_valid": true,
+      "found": false,
+      "n_sections": 0,
+      "n_items": 0,
+      "n_priced_items": 0,
+      "price_coverage": null,
+      "conditioned": false
+    },
+    "492b0f785b91bfd0__no-peanuts": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 3,
+      "n_items": 7,
+      "n_priced_items": 0,
+      "price_coverage": 0.0,
+      "conditioned": true
+    },
+    "4abe033068133b9b": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 8,
+      "n_items": 64,
+      "n_priced_items": 64,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "4acfc698aa32fcd6": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 5,
+      "n_items": 86,
+      "n_priced_items": 83,
+      "price_coverage": 0.9651162790697675,
+      "conditioned": false
+    },
+    "4acfc698aa32fcd6__halal": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 4,
+      "n_items": 73,
+      "n_priced_items": 70,
+      "price_coverage": 0.958904109589041,
+      "conditioned": true
+    },
+    "4afd92918760482b": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 1,
+      "n_items": 6,
+      "n_priced_items": 0,
+      "price_coverage": 0.0,
+      "conditioned": false
+    },
+    "4afd92918760482b__vegan": {
+      "schema_valid": true,
+      "found": false,
+      "n_sections": 0,
+      "n_items": 0,
+      "n_priced_items": 0,
+      "price_coverage": null,
+      "conditioned": true
+    },
+    "4b952bd0a64a763a": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 11,
+      "n_items": 39,
+      "n_priced_items": 39,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "4b952bd0a64a763a__vegetarian-no-peanuts": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 7,
+      "n_items": 19,
+      "n_priced_items": 19,
+      "price_coverage": 1.0,
+      "conditioned": true
+    },
+    "4c19c95ac01b1d54": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 5,
+      "n_items": 9,
+      "n_priced_items": 0,
+      "price_coverage": 0.0,
+      "conditioned": false
+    },
+    "4c19c95ac01b1d54__vegan": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 5,
+      "n_items": 0,
+      "n_priced_items": 0,
+      "price_coverage": null,
+      "conditioned": true
+    },
+    "4c7ffacc66e0ba89": {
+      "schema_valid": true,
+      "found": false,
+      "n_sections": 0,
+      "n_items": 0,
+      "n_priced_items": 0,
+      "price_coverage": null,
+      "conditioned": false
+    },
+    "4c7ffacc66e0ba89__vegetarian-no-peanuts": {
+      "schema_valid": true,
+      "found": false,
+      "n_sections": 0,
+      "n_items": 0,
+      "n_priced_items": 0,
+      "price_coverage": null,
+      "conditioned": true
+    },
+    "4da1c772cada08be": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 9,
+      "n_items": 51,
+      "n_priced_items": 50,
+      "price_coverage": 0.9803921568627451,
+      "conditioned": false
+    },
+    "4da1c772cada08be__gluten-free": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 9,
+      "n_items": 54,
+      "n_priced_items": 54,
+      "price_coverage": 1.0,
+      "conditioned": true
+    },
+    "4e523f08021dab0a": {
+      "schema_valid": true,
+      "found": false,
+      "n_sections": 0,
+      "n_items": 0,
+      "n_priced_items": 0,
+      "price_coverage": null,
+      "conditioned": false
+    },
+    "4e8460b2e3dd7326": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 1,
+      "n_items": 3,
+      "n_priced_items": 3,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "4e8460b2e3dd7326__gluten-free": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 1,
+      "n_items": 14,
+      "n_priced_items": 14,
+      "price_coverage": 1.0,
+      "conditioned": true
+    },
+    "4eac8baf5c2ee650": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 7,
+      "n_items": 51,
+      "n_priced_items": 49,
+      "price_coverage": 0.9607843137254902,
+      "conditioned": false
+    },
+    "4ed69f8151bde21d": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 1,
+      "n_items": 6,
+      "n_priced_items": 0,
+      "price_coverage": 0.0,
+      "conditioned": false
+    },
+    "4ed69f8151bde21d__no-nuts-peanuts-or-tree-nuts": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 1,
+      "n_items": 5,
+      "n_priced_items": 0,
+      "price_coverage": 0.0,
+      "conditioned": true
+    },
+    "50237b50396938c4": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 3,
+      "n_items": 17,
+      "n_priced_items": 17,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "50237b50396938c4__vegetarian": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 3,
+      "n_items": 7,
+      "n_priced_items": 7,
+      "price_coverage": 1.0,
+      "conditioned": true
+    },
+    "502b5f21d3dc8b2a": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 3,
+      "n_items": 19,
+      "n_priced_items": 19,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "502b5f21d3dc8b2a__no-nuts-peanuts-or-tree-nuts": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 3,
+      "n_items": 18,
+      "n_priced_items": 18,
+      "price_coverage": 1.0,
+      "conditioned": true
+    },
+    "506e2ebccf9c00a7": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 1,
+      "n_items": 5,
+      "n_priced_items": 0,
+      "price_coverage": 0.0,
+      "conditioned": false
+    },
+    "506e2ebccf9c00a7__gluten-free": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 1,
+      "n_items": 5,
+      "n_priced_items": 0,
+      "price_coverage": 0.0,
+      "conditioned": true
+    },
+    "515bdf2ad1284127": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 10,
+      "n_items": 45,
+      "n_priced_items": 0,
+      "price_coverage": 0.0,
+      "conditioned": false
+    },
+    "515bdf2ad1284127__vegetarian": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 4,
+      "n_items": 4,
+      "n_priced_items": 0,
+      "price_coverage": 0.0,
+      "conditioned": true
+    },
+    "51724c4b94a363c3": {
+      "schema_valid": true,
+      "found": false,
+      "n_sections": 0,
+      "n_items": 0,
+      "n_priced_items": 0,
+      "price_coverage": null,
+      "conditioned": false
+    },
+    "5244905d5f8fc089": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 17,
+      "n_items": 102,
+      "n_priced_items": 102,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "5244905d5f8fc089__vegetarian": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 10,
+      "n_items": 49,
+      "n_priced_items": 49,
+      "price_coverage": 1.0,
+      "conditioned": true
+    },
+    "5267a6a994ff88c4": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 8,
+      "n_items": 13,
+      "n_priced_items": 6,
+      "price_coverage": 0.46153846153846156,
+      "conditioned": false
+    },
+    "5267a6a994ff88c4__kosher": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 8,
+      "n_items": 15,
+      "n_priced_items": 15,
+      "price_coverage": 1.0,
+      "conditioned": true
+    },
+    "548e282bfd25dce6": {
+      "schema_valid": true,
+      "found": false,
+      "n_sections": 0,
+      "n_items": 0,
+      "n_priced_items": 0,
+      "price_coverage": null,
+      "conditioned": false
+    },
+    "548e282bfd25dce6__no-nuts-peanuts-or-tree-nuts": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 3,
+      "n_items": 30,
+      "n_priced_items": 30,
+      "price_coverage": 1.0,
+      "conditioned": true
+    },
+    "551c76de3f803f58": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 1,
+      "n_items": 4,
+      "n_priced_items": 0,
+      "price_coverage": 0.0,
+      "conditioned": false
+    },
+    "551c76de3f803f58__kosher": {
+      "schema_valid": true,
+      "found": false,
+      "n_sections": 0,
+      "n_items": 0,
+      "n_priced_items": 0,
+      "price_coverage": null,
+      "conditioned": true
+    },
+    "55898aa5ac120ff2": {
+      "schema_valid": true,
+      "found": false,
+      "n_sections": 0,
+      "n_items": 0,
+      "n_priced_items": 0,
+      "price_coverage": null,
+      "conditioned": false
+    },
+    "55898aa5ac120ff2__vegan": {
+      "schema_valid": false,
+      "found": false,
+      "n_sections": 0,
+      "n_items": 0,
+      "n_priced_items": 0,
+      "price_coverage": null,
+      "conditioned": true
+    },
+    "55e1b0bc1afc8b8a": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 5,
+      "n_items": 30,
+      "n_priced_items": 30,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "5791dd8abc010536": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 3,
+      "n_items": 9,
+      "n_priced_items": 0,
+      "price_coverage": 0.0,
+      "conditioned": false
+    },
+    "5791dd8abc010536__gluten-free-dairy-free": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 2,
+      "n_items": 8,
+      "n_priced_items": 0,
+      "price_coverage": 0.0,
+      "conditioned": true
+    },
+    "58416da0d06761b1": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 6,
+      "n_items": 65,
+      "n_priced_items": 65,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "58af525bd656d632": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 3,
+      "n_items": 9,
+      "n_priced_items": 1,
+      "price_coverage": 0.1111111111111111,
+      "conditioned": false
+    },
+    "58af525bd656d632__halal": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 2,
+      "n_items": 16,
+      "n_priced_items": 16,
+      "price_coverage": 1.0,
+      "conditioned": true
+    },
+    "58d0a793e7abd71d": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 6,
+      "n_items": 21,
+      "n_priced_items": 17,
+      "price_coverage": 0.8095238095238095,
+      "conditioned": false
+    },
+    "58d0a793e7abd71d__halal": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 6,
+      "n_items": 22,
+      "n_priced_items": 21,
+      "price_coverage": 0.9545454545454546,
+      "conditioned": true
+    },
+    "58f1b11af3166daa": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 4,
+      "n_items": 19,
+      "n_priced_items": 19,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "5970b711cd819632": {
+      "schema_valid": true,
+      "found": false,
+      "n_sections": 0,
+      "n_items": 0,
+      "n_priced_items": 0,
+      "price_coverage": null,
+      "conditioned": false
+    },
+    "5970b711cd819632__no-nuts-peanuts-or-tree-nuts": {
+      "schema_valid": true,
+      "found": false,
+      "n_sections": 0,
+      "n_items": 0,
+      "n_priced_items": 0,
+      "price_coverage": null,
+      "conditioned": true
+    },
+    "59e6fd18520eb4bb": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 9,
+      "n_items": 54,
+      "n_priced_items": 54,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "59e6fd18520eb4bb__dairy-free": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 9,
+      "n_items": 54,
+      "n_priced_items": 54,
+      "price_coverage": 1.0,
+      "conditioned": true
+    },
+    "5a8c7575c3e3feed": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 3,
+      "n_items": 22,
+      "n_priced_items": 21,
+      "price_coverage": 0.9545454545454546,
+      "conditioned": false
+    },
+    "5a8c7575c3e3feed__halal": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 3,
+      "n_items": 8,
+      "n_priced_items": 7,
+      "price_coverage": 0.875,
+      "conditioned": true
+    },
+    "5ecf6ca7204b03bc": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 2,
+      "n_items": 6,
+      "n_priced_items": 5,
+      "price_coverage": 0.8333333333333334,
+      "conditioned": false
+    },
+    "5ecf6ca7204b03bc__vegan": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 2,
+      "n_items": 0,
+      "n_priced_items": 0,
+      "price_coverage": null,
+      "conditioned": true
+    },
+    "5f62501915e82c1b": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 7,
+      "n_items": 46,
+      "n_priced_items": 46,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "5f62501915e82c1b__gluten-free": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 6,
+      "n_items": 23,
+      "n_priced_items": 23,
+      "price_coverage": 1.0,
+      "conditioned": true
+    },
+    "6025f5b25516c693": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 4,
+      "n_items": 5,
+      "n_priced_items": 0,
+      "price_coverage": 0.0,
+      "conditioned": false
+    },
+    "6025f5b25516c693__vegan": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 3,
+      "n_items": 4,
+      "n_priced_items": 0,
+      "price_coverage": 0.0,
+      "conditioned": true
+    },
+    "60c02a4a55feda86": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 1,
+      "n_items": 7,
+      "n_priced_items": 0,
+      "price_coverage": 0.0,
+      "conditioned": false
+    },
+    "60c02a4a55feda86__no-peanuts": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 6,
+      "n_items": 7,
+      "n_priced_items": 0,
+      "price_coverage": 0.0,
+      "conditioned": true
+    },
+    "61fea8b05d6b0ed2": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 5,
+      "n_items": 17,
+      "n_priced_items": 0,
+      "price_coverage": 0.0,
+      "conditioned": false
+    },
+    "61fea8b05d6b0ed2__gluten-free-dairy-free": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 5,
+      "n_items": 17,
+      "n_priced_items": 0,
+      "price_coverage": 0.0,
+      "conditioned": true
+    },
+    "62cc2de49af36198": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 2,
+      "n_items": 21,
+      "n_priced_items": 0,
+      "price_coverage": 0.0,
+      "conditioned": false
+    },
+    "62cc2de49af36198__no-nuts-peanuts-or-tree-nuts": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 2,
+      "n_items": 25,
+      "n_priced_items": 0,
+      "price_coverage": 0.0,
+      "conditioned": true
+    },
+    "6433b87ea20189aa": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 7,
+      "n_items": 22,
+      "n_priced_items": 21,
+      "price_coverage": 0.9545454545454546,
+      "conditioned": false
+    },
+    "64703a5100443891": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 15,
+      "n_items": 115,
+      "n_priced_items": 96,
+      "price_coverage": 0.8347826086956521,
+      "conditioned": false
+    },
+    "64a50e1c41f9a3c3": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 8,
+      "n_items": 60,
+      "n_priced_items": 0,
+      "price_coverage": 0.0,
+      "conditioned": false
+    },
+    "64f6ac1f1c314bf4": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 5,
+      "n_items": 32,
+      "n_priced_items": 32,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "66949d5fcbe1e714": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 1,
+      "n_items": 4,
+      "n_priced_items": 0,
+      "price_coverage": 0.0,
+      "conditioned": false
+    },
+    "66949d5fcbe1e714__no-nuts-peanuts-or-tree-nuts": {
+      "schema_valid": true,
+      "found": false,
+      "n_sections": 0,
+      "n_items": 0,
+      "n_priced_items": 0,
+      "price_coverage": null,
+      "conditioned": true
+    },
+    "675a0e427420abe0": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 4,
+      "n_items": 14,
+      "n_priced_items": 0,
+      "price_coverage": 0.0,
+      "conditioned": false
+    },
+    "675a0e427420abe0__halal": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 4,
+      "n_items": 14,
+      "n_priced_items": 0,
+      "price_coverage": 0.0,
+      "conditioned": true
+    },
+    "676bcd71ecdf95a5": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 1,
+      "n_items": 3,
+      "n_priced_items": 0,
+      "price_coverage": 0.0,
+      "conditioned": false
+    },
+    "676bcd71ecdf95a5__vegetarian": {
+      "schema_valid": true,
+      "found": false,
+      "n_sections": 0,
+      "n_items": 0,
+      "n_priced_items": 0,
+      "price_coverage": null,
+      "conditioned": true
+    },
+    "67bfa0e9e2dbfa3e": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 6,
+      "n_items": 39,
+      "n_priced_items": 39,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "67bfa0e9e2dbfa3e__pescatarian": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 6,
+      "n_items": 39,
+      "n_priced_items": 39,
+      "price_coverage": 1.0,
+      "conditioned": true
+    },
+    "69c2aaef9782aec6": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 6,
+      "n_items": 47,
+      "n_priced_items": 47,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "69deb84a809e8f3e": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 12,
+      "n_items": 112,
+      "n_priced_items": 112,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "69deb84a809e8f3e__no-peanuts": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 11,
+      "n_items": 114,
+      "n_priced_items": 114,
+      "price_coverage": 1.0,
+      "conditioned": true
+    },
+    "6b6a52eb63384969": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 9,
+      "n_items": 53,
+      "n_priced_items": 53,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "6ba68b9165081468": {
+      "schema_valid": true,
+      "found": false,
+      "n_sections": 0,
+      "n_items": 0,
+      "n_priced_items": 0,
+      "price_coverage": null,
+      "conditioned": false
+    },
+    "6ba68b9165081468__kosher": {
+      "schema_valid": true,
+      "found": false,
+      "n_sections": 0,
+      "n_items": 0,
+      "n_priced_items": 0,
+      "price_coverage": null,
+      "conditioned": true
+    },
+    "6c9dfff1b373e8a9": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 12,
+      "n_items": 91,
+      "n_priced_items": 91,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "6c9dfff1b373e8a9__vegetarian-no-peanuts": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 12,
+      "n_items": 43,
+      "n_priced_items": 43,
+      "price_coverage": 1.0,
+      "conditioned": true
+    },
+    "6d692b74355194c0": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 1,
+      "n_items": 3,
+      "n_priced_items": 3,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "6d692b74355194c0__no-peanuts": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 1,
+      "n_items": 3,
+      "n_priced_items": 3,
+      "price_coverage": 1.0,
+      "conditioned": true
+    },
+    "6dd52361b4e004fe": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 2,
+      "n_items": 52,
+      "n_priced_items": 52,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "6eb43608b55a6a8d": {
+      "schema_valid": true,
+      "found": false,
+      "n_sections": 0,
+      "n_items": 0,
+      "n_priced_items": 0,
+      "price_coverage": null,
+      "conditioned": false
+    },
+    "6f9f2cbd887d2a39": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 15,
+      "n_items": 94,
+      "n_priced_items": 94,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "6f9f2cbd887d2a39__keto-low-carb": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 14,
+      "n_items": 83,
+      "n_priced_items": 83,
+      "price_coverage": 1.0,
+      "conditioned": true
+    },
+    "7296463c74dba08e": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 5,
+      "n_items": 9,
+      "n_priced_items": 0,
+      "price_coverage": 0.0,
+      "conditioned": false
+    },
+    "72cc3d857da05893": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 11,
+      "n_items": 46,
+      "n_priced_items": 46,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "72cc3d857da05893__vegetarian-no-peanuts": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 11,
+      "n_items": 27,
+      "n_priced_items": 27,
+      "price_coverage": 1.0,
+      "conditioned": true
+    },
+    "72e356e4eea8eb75": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 1,
+      "n_items": 4,
+      "n_priced_items": 0,
+      "price_coverage": 0.0,
+      "conditioned": false
+    },
+    "72e356e4eea8eb75__pescatarian": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 1,
+      "n_items": 4,
+      "n_priced_items": 0,
+      "price_coverage": 0.0,
+      "conditioned": true
+    },
+    "7336c0ab42d34143": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 5,
+      "n_items": 62,
+      "n_priced_items": 62,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "74ec29256bda4712": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 10,
+      "n_items": 32,
+      "n_priced_items": 31,
+      "price_coverage": 0.96875,
+      "conditioned": false
+    },
+    "761d45d8fb4884b7": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 15,
+      "n_items": 208,
+      "n_priced_items": 208,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "761d45d8fb4884b7__no-peanuts": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 9,
+      "n_items": 109,
+      "n_priced_items": 109,
+      "price_coverage": 1.0,
+      "conditioned": true
+    },
+    "76ccf5bc42a70791": {
+      "schema_valid": true,
+      "found": false,
+      "n_sections": 0,
+      "n_items": 0,
+      "n_priced_items": 0,
+      "price_coverage": null,
+      "conditioned": false
+    },
+    "76ccf5bc42a70791__pescatarian": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 1,
+      "n_items": 3,
+      "n_priced_items": 0,
+      "price_coverage": 0.0,
+      "conditioned": true
+    },
+    "777b98c0ee442109": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 9,
+      "n_items": 0,
+      "n_priced_items": 0,
+      "price_coverage": null,
+      "conditioned": false
+    },
+    "782f0e2cd69a443f": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 19,
+      "n_items": 113,
+      "n_priced_items": 113,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "789572a7859b3ac2": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 1,
+      "n_items": 1,
+      "n_priced_items": 1,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "798f6644abf34fd7": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 5,
+      "n_items": 33,
+      "n_priced_items": 33,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "798f6644abf34fd7__no-nuts-peanuts-or-tree-nuts": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 5,
+      "n_items": 28,
+      "n_priced_items": 28,
+      "price_coverage": 1.0,
+      "conditioned": true
+    },
+    "79de4a3e4c04cb99": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 23,
+      "n_items": 213,
+      "n_priced_items": 213,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "79de4a3e4c04cb99__gluten-free-dairy-free": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 18,
+      "n_items": 47,
+      "n_priced_items": 47,
+      "price_coverage": 1.0,
+      "conditioned": true
+    },
+    "7b103b47c21acdf4": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 7,
+      "n_items": 27,
+      "n_priced_items": 27,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "7b103b47c21acdf4__vegan": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 7,
+      "n_items": 9,
+      "n_priced_items": 9,
+      "price_coverage": 1.0,
+      "conditioned": true
+    },
+    "7e468972200cd11e": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 3,
+      "n_items": 20,
+      "n_priced_items": 20,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "7eccdb3cbdbf35f2": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 9,
+      "n_items": 50,
+      "n_priced_items": 50,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "7eccdb3cbdbf35f2__no-peanuts": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 9,
+      "n_items": 50,
+      "n_priced_items": 50,
+      "price_coverage": 1.0,
+      "conditioned": true
+    },
+    "7f78e2a693f8ceac": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 1,
+      "n_items": 5,
+      "n_priced_items": 0,
+      "price_coverage": 0.0,
+      "conditioned": false
+    },
+    "7f78e2a693f8ceac__no-shellfish": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 1,
+      "n_items": 5,
+      "n_priced_items": 0,
+      "price_coverage": 0.0,
+      "conditioned": true
+    },
+    "80c4110fca1c00ea": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 2,
+      "n_items": 8,
+      "n_priced_items": 0,
+      "price_coverage": 0.0,
+      "conditioned": false
+    },
+    "80c4110fca1c00ea__keto-low-carb": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 2,
+      "n_items": 7,
+      "n_priced_items": 0,
+      "price_coverage": 0.0,
+      "conditioned": true
+    },
+    "80fd2f8912f177d1": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 1,
+      "n_items": 3,
+      "n_priced_items": 0,
+      "price_coverage": 0.0,
+      "conditioned": false
+    },
+    "80fd2f8912f177d1__dairy-free": {
+      "schema_valid": true,
+      "found": false,
+      "n_sections": 0,
+      "n_items": 0,
+      "n_priced_items": 0,
+      "price_coverage": null,
+      "conditioned": true
+    },
+    "81d3b575ba582e02": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 4,
+      "n_items": 49,
+      "n_priced_items": 49,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "81d3b575ba582e02__dairy-free": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 5,
+      "n_items": 16,
+      "n_priced_items": 16,
+      "price_coverage": 1.0,
+      "conditioned": true
+    },
+    "830bf7e762077d14": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 10,
+      "n_items": 70,
+      "n_priced_items": 69,
+      "price_coverage": 0.9857142857142858,
+      "conditioned": false
+    },
+    "830bf7e762077d14__vegetarian": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 6,
+      "n_items": 38,
+      "n_priced_items": 38,
+      "price_coverage": 1.0,
+      "conditioned": true
+    },
+    "831394f7562b0d45": {
+      "schema_valid": true,
+      "found": false,
+      "n_sections": 0,
+      "n_items": 0,
+      "n_priced_items": 0,
+      "price_coverage": null,
+      "conditioned": false
+    },
+    "831394f7562b0d45__vegetarian-no-peanuts": {
+      "schema_valid": true,
+      "found": false,
+      "n_sections": 0,
+      "n_items": 0,
+      "n_priced_items": 0,
+      "price_coverage": null,
+      "conditioned": true
+    },
+    "831a55ab0ac8acbe": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 17,
+      "n_items": 122,
+      "n_priced_items": 122,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "831a55ab0ac8acbe__pescatarian": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 7,
+      "n_items": 37,
+      "n_priced_items": 37,
+      "price_coverage": 1.0,
+      "conditioned": true
+    },
+    "84abe5389dd416ad": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 14,
+      "n_items": 104,
+      "n_priced_items": 103,
+      "price_coverage": 0.9903846153846154,
+      "conditioned": false
+    },
+    "84abe5389dd416ad__pescatarian": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 12,
+      "n_items": 67,
+      "n_priced_items": 66,
+      "price_coverage": 0.9850746268656716,
+      "conditioned": true
+    },
+    "84c3fc506bf2bb80": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 7,
+      "n_items": 46,
+      "n_priced_items": 46,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "84c3fc506bf2bb80__no-peanuts": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 7,
+      "n_items": 46,
+      "n_priced_items": 46,
+      "price_coverage": 1.0,
+      "conditioned": true
+    },
+    "850bc3d755cee412": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 2,
+      "n_items": 2,
+      "n_priced_items": 2,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "850bc3d755cee412__vegetarian": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 1,
+      "n_items": 0,
+      "n_priced_items": 0,
+      "price_coverage": null,
+      "conditioned": true
+    },
+    "861cb2e5979ac1bb": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 5,
+      "n_items": 49,
+      "n_priced_items": 0,
+      "price_coverage": 0.0,
+      "conditioned": false
+    },
+    "8664f67d04a2df29": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 7,
+      "n_items": 65,
+      "n_priced_items": 60,
+      "price_coverage": 0.9230769230769231,
+      "conditioned": false
+    },
+    "8664f67d04a2df29__kosher": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 7,
+      "n_items": 55,
+      "n_priced_items": 50,
+      "price_coverage": 0.9090909090909091,
+      "conditioned": true
+    },
+    "8922229b1716e940": {
+      "schema_valid": true,
+      "found": false,
+      "n_sections": 0,
+      "n_items": 0,
+      "n_priced_items": 0,
+      "price_coverage": null,
+      "conditioned": false
+    },
+    "8922229b1716e940__vegan": {
+      "schema_valid": true,
+      "found": false,
+      "n_sections": 0,
+      "n_items": 0,
+      "n_priced_items": 0,
+      "price_coverage": null,
+      "conditioned": true
+    },
+    "8969a97fda1e8135": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 2,
+      "n_items": 5,
+      "n_priced_items": 0,
+      "price_coverage": 0.0,
+      "conditioned": false
+    },
+    "8969a97fda1e8135__pescatarian": {
+      "schema_valid": true,
+      "found": false,
+      "n_sections": 0,
+      "n_items": 0,
+      "n_priced_items": 0,
+      "price_coverage": null,
+      "conditioned": true
+    },
+    "89ee4805693584ce": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 7,
+      "n_items": 68,
+      "n_priced_items": 0,
+      "price_coverage": 0.0,
+      "conditioned": false
+    },
+    "89ee4805693584ce__gluten-free-dairy-free": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 5,
+      "n_items": 22,
+      "n_priced_items": 0,
+      "price_coverage": 0.0,
+      "conditioned": true
+    },
+    "8bf0a87471c155ec": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 6,
+      "n_items": 73,
+      "n_priced_items": 73,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "8bf0a87471c155ec__kosher": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 6,
+      "n_items": 73,
+      "n_priced_items": 73,
+      "price_coverage": 1.0,
+      "conditioned": true
+    },
+    "8d63fc2477533faa": {
+      "schema_valid": true,
+      "found": false,
+      "n_sections": 0,
+      "n_items": 0,
+      "n_priced_items": 0,
+      "price_coverage": null,
+      "conditioned": false
+    },
+    "8ea22b2d908d07f9": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 4,
+      "n_items": 34,
+      "n_priced_items": 1,
+      "price_coverage": 0.029411764705882353,
+      "conditioned": false
+    },
+    "8ea22b2d908d07f9__pescatarian": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 5,
+      "n_items": 29,
+      "n_priced_items": 1,
+      "price_coverage": 0.034482758620689655,
+      "conditioned": true
+    },
+    "8eda9b22c9d9c0fa": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 2,
+      "n_items": 14,
+      "n_priced_items": 14,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "8fe63b5a23d4e53e": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 8,
+      "n_items": 31,
+      "n_priced_items": 31,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "8fe63b5a23d4e53e__vegan": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 1,
+      "n_items": 2,
+      "n_priced_items": 2,
+      "price_coverage": 1.0,
+      "conditioned": true
+    },
+    "8ff1c1d99e61707c": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 13,
+      "n_items": 136,
+      "n_priced_items": 136,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "8ff1c1d99e61707c__no-shellfish": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 14,
+      "n_items": 146,
+      "n_priced_items": 146,
+      "price_coverage": 1.0,
+      "conditioned": true
+    },
+    "906186824ec8da22": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 1,
+      "n_items": 7,
+      "n_priced_items": 0,
+      "price_coverage": 0.0,
+      "conditioned": false
+    },
+    "9218cd831a5a11a9": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 5,
+      "n_items": 26,
+      "n_priced_items": 0,
+      "price_coverage": 0.0,
+      "conditioned": false
+    },
+    "9218cd831a5a11a9__keto-low-carb": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 4,
+      "n_items": 25,
+      "n_priced_items": 0,
+      "price_coverage": 0.0,
+      "conditioned": true
+    },
+    "92cf507093e50858": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 3,
+      "n_items": 31,
+      "n_priced_items": 30,
+      "price_coverage": 0.967741935483871,
+      "conditioned": false
+    },
+    "92cf507093e50858__no-shellfish": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 3,
+      "n_items": 26,
+      "n_priced_items": 26,
+      "price_coverage": 1.0,
+      "conditioned": true
+    },
+    "92ea3845c6c9cf2b": {
+      "schema_valid": true,
+      "found": false,
+      "n_sections": 0,
+      "n_items": 0,
+      "n_priced_items": 0,
+      "price_coverage": null,
+      "conditioned": false
+    },
+    "964ea46b86881b68": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 6,
+      "n_items": 31,
+      "n_priced_items": 30,
+      "price_coverage": 0.967741935483871,
+      "conditioned": false
+    },
+    "964ea46b86881b68__gluten-free": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 2,
+      "n_items": 2,
+      "n_priced_items": 2,
+      "price_coverage": 1.0,
+      "conditioned": true
+    },
+    "9664c4bce2b2421f": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 2,
+      "n_items": 5,
+      "n_priced_items": 0,
+      "price_coverage": 0.0,
+      "conditioned": false
+    },
+    "9672fda62ba652f2": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 5,
+      "n_items": 18,
+      "n_priced_items": 18,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "97e95b2712479b2e": {
+      "schema_valid": true,
+      "found": false,
+      "n_sections": 0,
+      "n_items": 0,
+      "n_priced_items": 0,
+      "price_coverage": null,
+      "conditioned": false
+    },
+    "97e95b2712479b2e__halal": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 3,
+      "n_items": 10,
+      "n_priced_items": 10,
+      "price_coverage": 1.0,
+      "conditioned": true
+    },
+    "98f00cce6f0c097b": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 1,
+      "n_items": 5,
+      "n_priced_items": 0,
+      "price_coverage": 0.0,
+      "conditioned": false
+    },
+    "99d12f6112cf04dc": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 3,
+      "n_items": 8,
+      "n_priced_items": 0,
+      "price_coverage": 0.0,
+      "conditioned": false
+    },
+    "9bb99d205ec41e87": {
+      "schema_valid": true,
+      "found": false,
+      "n_sections": 0,
+      "n_items": 0,
+      "n_priced_items": 0,
+      "price_coverage": null,
+      "conditioned": false
+    },
+    "9bb99d205ec41e87__pescatarian": {
+      "schema_valid": true,
+      "found": false,
+      "n_sections": 0,
+      "n_items": 0,
+      "n_priced_items": 0,
+      "price_coverage": null,
+      "conditioned": true
+    },
+    "9c82e0e386bf3713": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 14,
+      "n_items": 245,
+      "n_priced_items": 176,
+      "price_coverage": 0.7183673469387755,
+      "conditioned": false
+    },
+    "9de1e2329ddc371f": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 12,
+      "n_items": 85,
+      "n_priced_items": 85,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "9de1e2329ddc371f__vegetarian": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 2,
+      "n_items": 5,
+      "n_priced_items": 5,
+      "price_coverage": 1.0,
+      "conditioned": true
+    },
+    "9ed6d8fe57bf317d": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 1,
+      "n_items": 4,
+      "n_priced_items": 0,
+      "price_coverage": 0.0,
+      "conditioned": false
+    },
+    "9ed6d8fe57bf317d__gluten-free": {
+      "schema_valid": true,
+      "found": false,
+      "n_sections": 0,
+      "n_items": 0,
+      "n_priced_items": 0,
+      "price_coverage": null,
+      "conditioned": true
+    },
+    "9fa15288bc321b4d": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 20,
+      "n_items": 36,
+      "n_priced_items": 36,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "9fa15288bc321b4d__vegan": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 5,
+      "n_items": 11,
+      "n_priced_items": 11,
+      "price_coverage": 1.0,
+      "conditioned": true
+    },
+    "a022bb003b8020bf": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 11,
+      "n_items": 201,
+      "n_priced_items": 201,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "a022bb003b8020bf__halal": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 11,
+      "n_items": 200,
+      "n_priced_items": 200,
+      "price_coverage": 1.0,
+      "conditioned": true
+    },
+    "a094b8818cf6b9e8": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 15,
+      "n_items": 201,
+      "n_priced_items": 201,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "a28c632f0e8eeab3": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 5,
+      "n_items": 87,
+      "n_priced_items": 5,
+      "price_coverage": 0.05747126436781609,
+      "conditioned": false
+    },
+    "a28c632f0e8eeab3__pescatarian": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 4,
+      "n_items": 69,
+      "n_priced_items": 5,
+      "price_coverage": 0.07246376811594203,
+      "conditioned": true
+    },
+    "a3104824e78f388f": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 4,
+      "n_items": 13,
+      "n_priced_items": 0,
+      "price_coverage": 0.0,
+      "conditioned": false
+    },
+    "a3104824e78f388f__vegetarian-no-peanuts": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 4,
+      "n_items": 12,
+      "n_priced_items": 0,
+      "price_coverage": 0.0,
+      "conditioned": true
+    },
+    "a3273ae67b72c9ec": {
+      "schema_valid": true,
+      "found": false,
+      "n_sections": 0,
+      "n_items": 0,
+      "n_priced_items": 0,
+      "price_coverage": null,
+      "conditioned": false
+    },
+    "a3273ae67b72c9ec__dairy-free": {
+      "schema_valid": true,
+      "found": false,
+      "n_sections": 0,
+      "n_items": 0,
+      "n_priced_items": 0,
+      "price_coverage": null,
+      "conditioned": true
+    },
+    "a37e0c7dac2f0bca": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 1,
+      "n_items": 6,
+      "n_priced_items": 6,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "a37e0c7dac2f0bca__no-peanuts": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 1,
+      "n_items": 6,
+      "n_priced_items": 6,
+      "price_coverage": 1.0,
+      "conditioned": true
+    },
+    "a5172922d3c6531f": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 8,
+      "n_items": 42,
+      "n_priced_items": 0,
+      "price_coverage": 0.0,
+      "conditioned": false
+    },
+    "a5172922d3c6531f__gluten-free": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 1,
+      "n_items": 3,
+      "n_priced_items": 0,
+      "price_coverage": 0.0,
+      "conditioned": true
+    },
+    "a55b64addb370ab1": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 2,
+      "n_items": 4,
+      "n_priced_items": 0,
+      "price_coverage": 0.0,
+      "conditioned": false
+    },
+    "a55b64addb370ab1__keto-low-carb": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 2,
+      "n_items": 4,
+      "n_priced_items": 0,
+      "price_coverage": 0.0,
+      "conditioned": true
+    },
+    "a5982b0989973992": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 6,
+      "n_items": 35,
+      "n_priced_items": 35,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "a5982b0989973992__gluten-free": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 3,
+      "n_items": 14,
+      "n_priced_items": 14,
+      "price_coverage": 1.0,
+      "conditioned": true
+    },
+    "a97dce8c822a8106": {
+      "schema_valid": true,
+      "found": false,
+      "n_sections": 0,
+      "n_items": 0,
+      "n_priced_items": 0,
+      "price_coverage": null,
+      "conditioned": false
+    },
+    "a99577ecac6fb097": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 9,
+      "n_items": 184,
+      "n_priced_items": 184,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "a99577ecac6fb097__gluten-free-dairy-free": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 5,
+      "n_items": 67,
+      "n_priced_items": 67,
+      "price_coverage": 1.0,
+      "conditioned": true
+    },
+    "aa647123715d37dd": {
+      "schema_valid": true,
+      "found": false,
+      "n_sections": 0,
+      "n_items": 0,
+      "n_priced_items": 0,
+      "price_coverage": null,
+      "conditioned": false
+    },
+    "aa647123715d37dd__kosher": {
+      "schema_valid": true,
+      "found": false,
+      "n_sections": 0,
+      "n_items": 0,
+      "n_priced_items": 0,
+      "price_coverage": null,
+      "conditioned": true
+    },
+    "abc4bd92f9647b44": {
+      "schema_valid": true,
+      "found": false,
+      "n_sections": 0,
+      "n_items": 0,
+      "n_priced_items": 0,
+      "price_coverage": null,
+      "conditioned": false
+    },
+    "abc4bd92f9647b44__no-peanuts": {
+      "schema_valid": true,
+      "found": false,
+      "n_sections": 0,
+      "n_items": 0,
+      "n_priced_items": 0,
+      "price_coverage": null,
+      "conditioned": true
+    },
+    "aed9bc144a14ab15": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 13,
+      "n_items": 91,
+      "n_priced_items": 84,
+      "price_coverage": 0.9230769230769231,
+      "conditioned": false
+    },
+    "aff93cf484fe6224": {
+      "schema_valid": true,
+      "found": false,
+      "n_sections": 0,
+      "n_items": 0,
+      "n_priced_items": 0,
+      "price_coverage": null,
+      "conditioned": false
+    },
+    "aff93cf484fe6224__dairy-free": {
+      "schema_valid": true,
+      "found": false,
+      "n_sections": 0,
+      "n_items": 0,
+      "n_priced_items": 0,
+      "price_coverage": null,
+      "conditioned": true
+    },
+    "b093f33a2c370edc": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 2,
+      "n_items": 13,
+      "n_priced_items": 1,
+      "price_coverage": 0.07692307692307693,
+      "conditioned": false
+    },
+    "b093f33a2c370edc__vegetarian": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 7,
+      "n_items": 34,
+      "n_priced_items": 34,
+      "price_coverage": 1.0,
+      "conditioned": true
+    },
+    "b0e6dbec3e431d74": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 2,
+      "n_items": 31,
+      "n_priced_items": 31,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "b0f9b8f03c200646": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 6,
+      "n_items": 44,
+      "n_priced_items": 44,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "b0f9b8f03c200646__gluten-free-dairy-free": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 6,
+      "n_items": 15,
+      "n_priced_items": 15,
+      "price_coverage": 1.0,
+      "conditioned": true
+    },
+    "b115765880835396": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 4,
+      "n_items": 36,
+      "n_priced_items": 36,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "b115765880835396__vegan": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 4,
+      "n_items": 36,
+      "n_priced_items": 36,
+      "price_coverage": 1.0,
+      "conditioned": true
+    },
+    "b1cc29b28096b684": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 9,
+      "n_items": 71,
+      "n_priced_items": 71,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "b1eef7c1afd6b2cc": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 6,
+      "n_items": 33,
+      "n_priced_items": 33,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "b2170b23b598108c": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 18,
+      "n_items": 211,
+      "n_priced_items": 211,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "b2170b23b598108c__no-peanuts": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 6,
+      "n_items": 82,
+      "n_priced_items": 82,
+      "price_coverage": 1.0,
+      "conditioned": true
+    },
+    "b2fd0e7364fb4202": {
+      "schema_valid": true,
+      "found": false,
+      "n_sections": 0,
+      "n_items": 0,
+      "n_priced_items": 0,
+      "price_coverage": null,
+      "conditioned": false
+    },
+    "b2fd0e7364fb4202__dairy-free": {
+      "schema_valid": true,
+      "found": false,
+      "n_sections": 0,
+      "n_items": 0,
+      "n_priced_items": 0,
+      "price_coverage": null,
+      "conditioned": true
+    },
+    "b35937c56788283b": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 4,
+      "n_items": 27,
+      "n_priced_items": 0,
+      "price_coverage": 0.0,
+      "conditioned": false
+    },
+    "b35937c56788283b__kosher": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 6,
+      "n_items": 27,
+      "n_priced_items": 0,
+      "price_coverage": 0.0,
+      "conditioned": true
+    },
+    "b3823c1602112466": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 8,
+      "n_items": 130,
+      "n_priced_items": 130,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "b3823c1602112466__no-shellfish": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 6,
+      "n_items": 108,
+      "n_priced_items": 108,
+      "price_coverage": 1.0,
+      "conditioned": true
+    },
+    "b46891ddf7045d0b": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 14,
+      "n_items": 69,
+      "n_priced_items": 66,
+      "price_coverage": 0.9565217391304348,
+      "conditioned": false
+    },
+    "b46891ddf7045d0b__kosher": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 12,
+      "n_items": 56,
+      "n_priced_items": 56,
+      "price_coverage": 1.0,
+      "conditioned": true
+    },
+    "b58a627810e412f0": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 13,
+      "n_items": 164,
+      "n_priced_items": 164,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "b58a627810e412f0__gluten-free": {
+      "schema_valid": true,
+      "found": false,
+      "n_sections": 0,
+      "n_items": 0,
+      "n_priced_items": 0,
+      "price_coverage": null,
+      "conditioned": true
+    },
+    "b691f4e2b871e9c8": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 8,
+      "n_items": 73,
+      "n_priced_items": 73,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "b73c410d2ee85cac": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 11,
+      "n_items": 79,
+      "n_priced_items": 77,
+      "price_coverage": 0.9746835443037974,
+      "conditioned": false
+    },
+    "b73c410d2ee85cac__vegetarian-no-peanuts": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 9,
+      "n_items": 24,
+      "n_priced_items": 24,
+      "price_coverage": 1.0,
+      "conditioned": true
+    },
+    "b9ab9e0c9f3bbc72": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 7,
+      "n_items": 37,
+      "n_priced_items": 0,
+      "price_coverage": 0.0,
+      "conditioned": false
+    },
+    "b9ab9e0c9f3bbc72__gluten-free": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 5,
+      "n_items": 40,
+      "n_priced_items": 0,
+      "price_coverage": 0.0,
+      "conditioned": true
+    },
+    "b9c1ad3898449e6d": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 9,
+      "n_items": 68,
+      "n_priced_items": 68,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "b9c1ad3898449e6d__vegetarian-no-peanuts": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 7,
+      "n_items": 39,
+      "n_priced_items": 39,
+      "price_coverage": 1.0,
+      "conditioned": true
+    },
+    "ba1d9cf853d21e18": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 4,
+      "n_items": 22,
+      "n_priced_items": 22,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "ba1d9cf853d21e18__vegetarian": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 4,
+      "n_items": 11,
+      "n_priced_items": 11,
+      "price_coverage": 1.0,
+      "conditioned": true
+    },
+    "baf76103d3b58318": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 4,
+      "n_items": 153,
+      "n_priced_items": 150,
+      "price_coverage": 0.9803921568627451,
+      "conditioned": false
+    },
+    "bc4a3afa09283633": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 2,
+      "n_items": 46,
+      "n_priced_items": 46,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "bc81d9af09741938": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 10,
+      "n_items": 57,
+      "n_priced_items": 26,
+      "price_coverage": 0.45614035087719296,
+      "conditioned": false
+    },
+    "bcb0ef240cc5ed33": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 8,
+      "n_items": 73,
+      "n_priced_items": 73,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "bcb0ef240cc5ed33__no-nuts-peanuts-or-tree-nuts": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 6,
+      "n_items": 63,
+      "n_priced_items": 63,
+      "price_coverage": 1.0,
+      "conditioned": true
+    },
+    "bd48cb5eb7a0de8b": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 5,
+      "n_items": 0,
+      "n_priced_items": 0,
+      "price_coverage": null,
+      "conditioned": false
+    },
+    "bd48cb5eb7a0de8b__no-nuts-peanuts-or-tree-nuts": {
+      "schema_valid": true,
+      "found": false,
+      "n_sections": 0,
+      "n_items": 0,
+      "n_priced_items": 0,
+      "price_coverage": null,
+      "conditioned": true
+    },
+    "bd86dd64f9f5ca57": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 4,
+      "n_items": 36,
+      "n_priced_items": 36,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "bd86dd64f9f5ca57__gluten-free-dairy-free": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 4,
+      "n_items": 36,
+      "n_priced_items": 36,
+      "price_coverage": 1.0,
+      "conditioned": true
+    },
+    "bdfa92409bee4609": {
+      "schema_valid": true,
+      "found": false,
+      "n_sections": 0,
+      "n_items": 0,
+      "n_priced_items": 0,
+      "price_coverage": null,
+      "conditioned": false
+    },
+    "bdfa92409bee4609__keto-low-carb": {
+      "schema_valid": true,
+      "found": false,
+      "n_sections": 0,
+      "n_items": 0,
+      "n_priced_items": 0,
+      "price_coverage": null,
+      "conditioned": true
+    },
+    "bf3ffc1abedda87b": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 11,
+      "n_items": 94,
+      "n_priced_items": 94,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "bf3ffc1abedda87b__pescatarian": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 15,
+      "n_items": 94,
+      "n_priced_items": 94,
+      "price_coverage": 1.0,
+      "conditioned": true
+    },
+    "c09eb1af6fb61a86": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 5,
+      "n_items": 30,
+      "n_priced_items": 30,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "c0c46d4037de9bec": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 2,
+      "n_items": 33,
+      "n_priced_items": 33,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "c1aeb4875a51b7bb": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 2,
+      "n_items": 160,
+      "n_priced_items": 135,
+      "price_coverage": 0.84375,
+      "conditioned": false
+    },
+    "c1aeb4875a51b7bb__keto-low-carb": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 26,
+      "n_items": 108,
+      "n_priced_items": 108,
+      "price_coverage": 1.0,
+      "conditioned": true
+    },
+    "c3335b0d3c74895c": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 8,
+      "n_items": 72,
+      "n_priced_items": 72,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "c3335b0d3c74895c__kosher": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 8,
+      "n_items": 72,
+      "n_priced_items": 72,
+      "price_coverage": 1.0,
+      "conditioned": true
+    },
+    "c33ca58607227a88": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 4,
+      "n_items": 14,
+      "n_priced_items": 0,
+      "price_coverage": 0.0,
+      "conditioned": false
+    },
+    "c33ca58607227a88__no-peanuts": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 4,
+      "n_items": 14,
+      "n_priced_items": 0,
+      "price_coverage": 0.0,
+      "conditioned": true
+    },
+    "c367c0f73cac8754": {
+      "schema_valid": true,
+      "found": false,
+      "n_sections": 0,
+      "n_items": 0,
+      "n_priced_items": 0,
+      "price_coverage": null,
+      "conditioned": false
+    },
+    "c367c0f73cac8754__keto-low-carb": {
+      "schema_valid": true,
+      "found": false,
+      "n_sections": 0,
+      "n_items": 0,
+      "n_priced_items": 0,
+      "price_coverage": null,
+      "conditioned": true
+    },
+    "c3e794bd58c5d360": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 14,
+      "n_items": 92,
+      "n_priced_items": 92,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "c4329a271b829108": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 7,
+      "n_items": 48,
+      "n_priced_items": 47,
+      "price_coverage": 0.9791666666666666,
+      "conditioned": false
+    },
+    "c4329a271b829108__no-nuts-peanuts-or-tree-nuts": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 9,
+      "n_items": 59,
+      "n_priced_items": 58,
+      "price_coverage": 0.9830508474576272,
+      "conditioned": true
+    },
+    "c483186d934af874": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 2,
+      "n_items": 9,
+      "n_priced_items": 9,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "c624af4ca6b93d0d": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 19,
+      "n_items": 117,
+      "n_priced_items": 113,
+      "price_coverage": 0.9658119658119658,
+      "conditioned": false
+    },
+    "c624af4ca6b93d0d__halal": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 11,
+      "n_items": 37,
+      "n_priced_items": 37,
+      "price_coverage": 1.0,
+      "conditioned": true
+    },
+    "c6cdf7491140ecce": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 13,
+      "n_items": 78,
+      "n_priced_items": 78,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "c6cdf7491140ecce__no-shellfish": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 12,
+      "n_items": 73,
+      "n_priced_items": 73,
+      "price_coverage": 1.0,
+      "conditioned": true
+    },
+    "c758d600aae48ad6": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 1,
+      "n_items": 6,
+      "n_priced_items": 0,
+      "price_coverage": 0.0,
+      "conditioned": false
+    },
+    "c758d600aae48ad6__dairy-free": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 2,
+      "n_items": 6,
+      "n_priced_items": 6,
+      "price_coverage": 1.0,
+      "conditioned": true
+    },
+    "c8d3edd6d5f07eeb": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 8,
+      "n_items": 55,
+      "n_priced_items": 54,
+      "price_coverage": 0.9818181818181818,
+      "conditioned": false
+    },
+    "c8d3edd6d5f07eeb__kosher": {
+      "schema_valid": true,
+      "found": false,
+      "n_sections": 0,
+      "n_items": 0,
+      "n_priced_items": 0,
+      "price_coverage": null,
+      "conditioned": true
+    },
+    "ca5ff134f59ae65c": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 3,
+      "n_items": 4,
+      "n_priced_items": 0,
+      "price_coverage": 0.0,
+      "conditioned": false
+    },
+    "ca5ff134f59ae65c__dairy-free": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 4,
+      "n_items": 40,
+      "n_priced_items": 3,
+      "price_coverage": 0.075,
+      "conditioned": true
+    },
+    "ca998a787875aa9b": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 6,
+      "n_items": 44,
+      "n_priced_items": 44,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "ca998a787875aa9b__vegetarian": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 5,
+      "n_items": 34,
+      "n_priced_items": 34,
+      "price_coverage": 1.0,
+      "conditioned": true
+    },
+    "cab11c5f8c9736e3": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 3,
+      "n_items": 24,
+      "n_priced_items": 24,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "cab11c5f8c9736e3__keto-low-carb": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 3,
+      "n_items": 18,
+      "n_priced_items": 18,
+      "price_coverage": 1.0,
+      "conditioned": true
+    },
+    "cc9430aace6fd23e": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 4,
+      "n_items": 20,
+      "n_priced_items": 20,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "cc9430aace6fd23e__vegetarian-no-peanuts": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 2,
+      "n_items": 13,
+      "n_priced_items": 13,
+      "price_coverage": 1.0,
+      "conditioned": true
+    },
+    "ccffb8d5766508a3": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 2,
+      "n_items": 2,
+      "n_priced_items": 0,
+      "price_coverage": 0.0,
+      "conditioned": false
+    },
+    "ccffb8d5766508a3__vegetarian-no-peanuts": {
+      "schema_valid": true,
+      "found": false,
+      "n_sections": 0,
+      "n_items": 0,
+      "n_priced_items": 0,
+      "price_coverage": null,
+      "conditioned": true
+    },
+    "cd78b36cd220cb87": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 4,
+      "n_items": 34,
+      "n_priced_items": 1,
+      "price_coverage": 0.029411764705882353,
+      "conditioned": false
+    },
+    "cd78b36cd220cb87__gluten-free-dairy-free": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 4,
+      "n_items": 33,
+      "n_priced_items": 1,
+      "price_coverage": 0.030303030303030304,
+      "conditioned": true
+    },
+    "cefcdec4b5fc0f9a": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 4,
+      "n_items": 70,
+      "n_priced_items": 70,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "cefcdec4b5fc0f9a__kosher": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 4,
+      "n_items": 68,
+      "n_priced_items": 68,
+      "price_coverage": 1.0,
+      "conditioned": true
+    },
+    "cfbe9c3b1920d9b4": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 6,
+      "n_items": 41,
+      "n_priced_items": 41,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "cfbe9c3b1920d9b4__keto-low-carb": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 5,
+      "n_items": 26,
+      "n_priced_items": 26,
+      "price_coverage": 1.0,
+      "conditioned": true
+    },
+    "d08870683ba29050": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 4,
+      "n_items": 25,
+      "n_priced_items": 25,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "d08870683ba29050__vegetarian-no-peanuts": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 2,
+      "n_items": 11,
+      "n_priced_items": 11,
+      "price_coverage": 1.0,
+      "conditioned": true
+    },
+    "d0bd24ae4aab2620": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 1,
+      "n_items": 2,
+      "n_priced_items": 0,
+      "price_coverage": 0.0,
+      "conditioned": false
+    },
+    "d10854110d5e1edf": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 5,
+      "n_items": 18,
+      "n_priced_items": 18,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "d10854110d5e1edf__vegan": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 5,
+      "n_items": 18,
+      "n_priced_items": 18,
+      "price_coverage": 1.0,
+      "conditioned": true
+    },
+    "d2f9ffd44c71718d": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 1,
+      "n_items": 2,
+      "n_priced_items": 0,
+      "price_coverage": 0.0,
+      "conditioned": false
+    },
+    "d2f9ffd44c71718d__halal": {
+      "schema_valid": true,
+      "found": false,
+      "n_sections": 0,
+      "n_items": 0,
+      "n_priced_items": 0,
+      "price_coverage": null,
+      "conditioned": true
+    },
+    "d3da6bc446e6a7ee": {
+      "schema_valid": true,
+      "found": false,
+      "n_sections": 0,
+      "n_items": 0,
+      "n_priced_items": 0,
+      "price_coverage": null,
+      "conditioned": false
+    },
+    "d407c0d491a5c9a4": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 7,
+      "n_items": 53,
+      "n_priced_items": 53,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "d408f1ae51b330a4": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 8,
+      "n_items": 38,
+      "n_priced_items": 38,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "d408f1ae51b330a4__gluten-free-dairy-free": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 8,
+      "n_items": 18,
+      "n_priced_items": 18,
+      "price_coverage": 1.0,
+      "conditioned": true
+    },
+    "d4e3e61449294219": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 7,
+      "n_items": 44,
+      "n_priced_items": 44,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "d4e3e61449294219__gluten-free": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 7,
+      "n_items": 35,
+      "n_priced_items": 35,
+      "price_coverage": 1.0,
+      "conditioned": true
+    },
+    "d62c61f28501ab08": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 1,
+      "n_items": 4,
+      "n_priced_items": 0,
+      "price_coverage": 0.0,
+      "conditioned": false
+    },
+    "d63315cbbc580cc2": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 4,
+      "n_items": 37,
+      "n_priced_items": 37,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "dbd4880b204ce3d7": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 11,
+      "n_items": 61,
+      "n_priced_items": 61,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "dbd4880b204ce3d7__keto-low-carb": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 13,
+      "n_items": 61,
+      "n_priced_items": 61,
+      "price_coverage": 1.0,
+      "conditioned": true
+    },
+    "dd1e05c1ae27759c": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 6,
+      "n_items": 33,
+      "n_priced_items": 33,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "dd1e05c1ae27759c__dairy-free": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 6,
+      "n_items": 32,
+      "n_priced_items": 32,
+      "price_coverage": 1.0,
+      "conditioned": true
+    },
+    "dd2bdeaf83937e62": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 4,
+      "n_items": 22,
+      "n_priced_items": 22,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "dd2bdeaf83937e62__keto-low-carb": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 3,
+      "n_items": 16,
+      "n_priced_items": 16,
+      "price_coverage": 1.0,
+      "conditioned": true
+    },
+    "de839f1bda999dc2": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 5,
+      "n_items": 35,
+      "n_priced_items": 35,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "e00bb416516d6143": {
+      "schema_valid": true,
+      "found": false,
+      "n_sections": 0,
+      "n_items": 0,
+      "n_priced_items": 0,
+      "price_coverage": null,
+      "conditioned": false
+    },
+    "e2098bacda4b0233": {
+      "schema_valid": true,
+      "found": false,
+      "n_sections": 0,
+      "n_items": 0,
+      "n_priced_items": 0,
+      "price_coverage": null,
+      "conditioned": false
+    },
+    "e232ec6515810398": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 12,
+      "n_items": 93,
+      "n_priced_items": 91,
+      "price_coverage": 0.978494623655914,
+      "conditioned": false
+    },
+    "e232ec6515810398__no-peanuts": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 12,
+      "n_items": 93,
+      "n_priced_items": 91,
+      "price_coverage": 0.978494623655914,
+      "conditioned": true
+    },
+    "e2785117a786c52d": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 5,
+      "n_items": 23,
+      "n_priced_items": 0,
+      "price_coverage": 0.0,
+      "conditioned": false
+    },
+    "e2ecdbe66e7e0e45": {
+      "schema_valid": true,
+      "found": false,
+      "n_sections": 0,
+      "n_items": 0,
+      "n_priced_items": 0,
+      "price_coverage": null,
+      "conditioned": false
+    },
+    "e35d04d6635a9d5a": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 8,
+      "n_items": 43,
+      "n_priced_items": 43,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "e35d04d6635a9d5a__pescatarian": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 8,
+      "n_items": 25,
+      "n_priced_items": 25,
+      "price_coverage": 1.0,
+      "conditioned": true
+    },
+    "e45845c91f1722a6": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 7,
+      "n_items": 110,
+      "n_priced_items": 101,
+      "price_coverage": 0.9181818181818182,
+      "conditioned": false
+    },
+    "e45845c91f1722a6__vegetarian": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 7,
+      "n_items": 61,
+      "n_priced_items": 54,
+      "price_coverage": 0.8852459016393442,
+      "conditioned": true
+    },
+    "e55b19ca8425b11f": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 3,
+      "n_items": 56,
+      "n_priced_items": 56,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "e5a4f6c86ed093f0": {
+      "schema_valid": true,
+      "found": false,
+      "n_sections": 0,
+      "n_items": 0,
+      "n_priced_items": 0,
+      "price_coverage": null,
+      "conditioned": false
+    },
+    "e5a4f6c86ed093f0__no-nuts-peanuts-or-tree-nuts": {
+      "schema_valid": true,
+      "found": false,
+      "n_sections": 0,
+      "n_items": 0,
+      "n_priced_items": 0,
+      "price_coverage": null,
+      "conditioned": true
+    },
+    "e6ad440d6d5266df": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 2,
+      "n_items": 2,
+      "n_priced_items": 2,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "e6ad440d6d5266df__vegan": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 1,
+      "n_items": 1,
+      "n_priced_items": 0,
+      "price_coverage": 0.0,
+      "conditioned": true
+    },
+    "e6ed3c0682defb01": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 14,
+      "n_items": 92,
+      "n_priced_items": 0,
+      "price_coverage": 0.0,
+      "conditioned": false
+    },
+    "e72f8dff3a7dd259": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 3,
+      "n_items": 9,
+      "n_priced_items": 4,
+      "price_coverage": 0.4444444444444444,
+      "conditioned": false
+    },
+    "e72f8dff3a7dd259__gluten-free-dairy-free": {
+      "schema_valid": true,
+      "found": false,
+      "n_sections": 0,
+      "n_items": 0,
+      "n_priced_items": 0,
+      "price_coverage": null,
+      "conditioned": true
+    },
+    "e74e89ca8b596890": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 13,
+      "n_items": 178,
+      "n_priced_items": 178,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "e947bcb813cfe4cd": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 11,
+      "n_items": 128,
+      "n_priced_items": 128,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "e947bcb813cfe4cd__no-peanuts": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 11,
+      "n_items": 128,
+      "n_priced_items": 128,
+      "price_coverage": 1.0,
+      "conditioned": true
+    },
+    "ea2b42e67f143746": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 4,
+      "n_items": 21,
+      "n_priced_items": 21,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "ea2b42e67f143746__kosher": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 3,
+      "n_items": 21,
+      "n_priced_items": 21,
+      "price_coverage": 1.0,
+      "conditioned": true
+    },
+    "ea8968ee5e861477": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 6,
+      "n_items": 53,
+      "n_priced_items": 53,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "ea8968ee5e861477__pescatarian": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 8,
+      "n_items": 65,
+      "n_priced_items": 65,
+      "price_coverage": 1.0,
+      "conditioned": true
+    },
+    "ebf259567f4257be": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 6,
+      "n_items": 73,
+      "n_priced_items": 72,
+      "price_coverage": 0.9863013698630136,
+      "conditioned": false
+    },
+    "ebf259567f4257be__no-shellfish": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 7,
+      "n_items": 61,
+      "n_priced_items": 61,
+      "price_coverage": 1.0,
+      "conditioned": true
+    },
+    "ed102425ea25bc64": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 3,
+      "n_items": 9,
+      "n_priced_items": 9,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "ed102425ea25bc64__no-nuts-peanuts-or-tree-nuts": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 3,
+      "n_items": 9,
+      "n_priced_items": 9,
+      "price_coverage": 1.0,
+      "conditioned": true
+    },
+    "ed50fb9fc39e745c": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 6,
+      "n_items": 34,
+      "n_priced_items": 34,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "ed50fb9fc39e745c__no-peanuts": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 6,
+      "n_items": 34,
+      "n_priced_items": 34,
+      "price_coverage": 1.0,
+      "conditioned": true
+    },
+    "ed5d3886acc87857": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 1,
+      "n_items": 1,
+      "n_priced_items": 1,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "ed5d3886acc87857__no-nuts-peanuts-or-tree-nuts": {
+      "schema_valid": true,
+      "found": false,
+      "n_sections": 0,
+      "n_items": 0,
+      "n_priced_items": 0,
+      "price_coverage": null,
+      "conditioned": true
+    },
+    "ed859d74ac352c41": {
+      "schema_valid": true,
+      "found": false,
+      "n_sections": 0,
+      "n_items": 0,
+      "n_priced_items": 0,
+      "price_coverage": null,
+      "conditioned": false
+    },
+    "ed859d74ac352c41__vegetarian": {
+      "schema_valid": true,
+      "found": false,
+      "n_sections": 0,
+      "n_items": 0,
+      "n_priced_items": 0,
+      "price_coverage": null,
+      "conditioned": true
+    },
+    "ed8e5b67321c5739": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 6,
+      "n_items": 24,
+      "n_priced_items": 24,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "ed8e5b67321c5739__halal": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 6,
+      "n_items": 21,
+      "n_priced_items": 21,
+      "price_coverage": 1.0,
+      "conditioned": true
+    },
+    "edea9d50a4297a4a": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 1,
+      "n_items": 3,
+      "n_priced_items": 2,
+      "price_coverage": 0.6666666666666666,
+      "conditioned": false
+    },
+    "edea9d50a4297a4a__no-shellfish": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 9,
+      "n_items": 81,
+      "n_priced_items": 81,
+      "price_coverage": 1.0,
+      "conditioned": true
+    },
+    "ef6a13e549af7b8f": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 15,
+      "n_items": 69,
+      "n_priced_items": 69,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "ef8ffad94a1553bc": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 8,
+      "n_items": 40,
+      "n_priced_items": 40,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "f3b14c31eee72277": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 5,
+      "n_items": 17,
+      "n_priced_items": 0,
+      "price_coverage": 0.0,
+      "conditioned": false
+    },
+    "f3b14c31eee72277__pescatarian": {
+      "schema_valid": true,
+      "found": false,
+      "n_sections": 0,
+      "n_items": 0,
+      "n_priced_items": 0,
+      "price_coverage": null,
+      "conditioned": true
+    },
+    "f3fdb989bc72c9a9": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 1,
+      "n_items": 3,
+      "n_priced_items": 0,
+      "price_coverage": 0.0,
+      "conditioned": false
+    },
+    "f3fdb989bc72c9a9__keto-low-carb": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 0,
+      "n_items": 0,
+      "n_priced_items": 0,
+      "price_coverage": null,
+      "conditioned": true
+    },
+    "f49825a84c50ab53": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 24,
+      "n_items": 255,
+      "n_priced_items": 255,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "f57c63ce286e47f2": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 3,
+      "n_items": 33,
+      "n_priced_items": 33,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "f57c63ce286e47f2__gluten-free": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 3,
+      "n_items": 33,
+      "n_priced_items": 33,
+      "price_coverage": 1.0,
+      "conditioned": true
+    },
+    "f5d8fe1d31a1e807": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 8,
+      "n_items": 42,
+      "n_priced_items": 42,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "f5d8fe1d31a1e807__vegetarian": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 6,
+      "n_items": 30,
+      "n_priced_items": 30,
+      "price_coverage": 1.0,
+      "conditioned": true
+    },
+    "f7bdb5bf79f37e10": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 5,
+      "n_items": 25,
+      "n_priced_items": 25,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "f7bdb5bf79f37e10__gluten-free-dairy-free": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 6,
+      "n_items": 3,
+      "n_priced_items": 3,
+      "price_coverage": 1.0,
+      "conditioned": true
+    },
+    "fa0bbec0737b206f": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 4,
+      "n_items": 4,
+      "n_priced_items": 0,
+      "price_coverage": 0.0,
+      "conditioned": false
+    },
+    "fa0bbec0737b206f__halal": {
+      "schema_valid": true,
+      "found": false,
+      "n_sections": 0,
+      "n_items": 0,
+      "n_priced_items": 0,
+      "price_coverage": null,
+      "conditioned": true
+    },
+    "fa787f3fb119f238": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 8,
+      "n_items": 8,
+      "n_priced_items": 8,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "fbc8f79a88c2f555": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 6,
+      "n_items": 34,
+      "n_priced_items": 34,
+      "price_coverage": 1.0,
+      "conditioned": false
+    },
+    "fd209445f7fa28a6": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 9,
+      "n_items": 51,
+      "n_priced_items": 48,
+      "price_coverage": 0.9411764705882353,
+      "conditioned": false
+    },
+    "fd209445f7fa28a6__halal": {
+      "schema_valid": true,
+      "found": false,
+      "n_sections": 0,
+      "n_items": 0,
+      "n_priced_items": 0,
+      "price_coverage": null,
+      "conditioned": true
+    },
+    "ffe5f70d8e687a62": {
+      "schema_valid": true,
+      "found": true,
+      "n_sections": 3,
+      "n_items": 7,
+      "n_priced_items": 2,
+      "price_coverage": 0.2857142857142857,
+      "conditioned": false
+    },
+    "ffe5f70d8e687a62__vegan": {
+      "schema_valid": true,
+      "found": false,
+      "n_sections": 0,
+      "n_items": 0,
+      "n_priced_items": 0,
+      "price_coverage": null,
+      "conditioned": true
+    }
+  },
+  "unreadable": {
+    "candidate": []
+  },
+  "generated_at": "2026-08-08T00:23:46.121857+00:00",
+  "run": null,
+  "cache": null
+}
