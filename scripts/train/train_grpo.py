@@ -365,6 +365,13 @@ def main() -> None:
     tools, _registry, _sys_prompt = setup_tools(dietary_restrictions=None, variant="student",
                                                 cache=cache, async_tools=True)
     tokenizer = AutoTokenizer.from_pretrained(args.model_path or MODEL_ID)
+    # REBUILD the rewards with the tokenizer -- NOT optional for Gemma. TRL's
+    # mid-episode parse_response loses the final answer's content (bundled tool
+    # turns + a second thought span defeat the streaming parser; measured
+    # 2026-08-08: 16/16 finals parsed to content='' -> every reward 0, zero
+    # gradient). With the tokenizer, the reward decodes TRL's completion_ids kwarg
+    # itself and reads menu + evidence off the raw wire text (reward.py path 2).
+    reward_funcs, reward_weights = make_grpo_rewards(tokenizer=tokenizer)
 
     # Load the policy BEFORE building the LoRA config: how we scope LoRA depends on the
     # checkpoint's actual module tree, so inspect it rather than assume.

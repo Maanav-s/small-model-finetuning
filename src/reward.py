@@ -39,12 +39,11 @@ REWARD ORDERING (the gradient GRPO follows), with default weights + penalty:
   grounded, complete menu    ++    (all three positive)
 
 EVIDENCE PLUMBING (important): grounding needs the concatenated tool-response text
-for the rollout. The clean path is the GRPO rollout (a TRL `rollout_func` running
-our agent loop) attaching per-trajectory `final_json` and `evidence` kwargs -- we
-run the tool loop ourselves anyway, so both are in hand. make_grpo_rewards() reads
-those kwargs first and only falls back to best-effort parsing of the completion.
-This is the one part that must be validated against TRL's actual reward-callback
-inputs on GPU (see the GRPO wiring / notes).
+for the rollout. make_grpo_rewards() resolves each example's menu + evidence in
+priority order: explicit `final_json`/`evidence` kwargs (a custom rollout_func), the
+RAW `completion_ids` decoded with the supplied tokenizer (the path train_grpo.py
+uses -- see make_grpo_rewards for why TRL's own parsed messages LOSE Gemma final
+answers mid-episode), then best-effort parsing of the TRL completion object.
 """
 
 from __future__ import annotations
@@ -103,6 +102,12 @@ GROUNDING_SLACK = 0.15
 # (NOT the whole completion -- the final answer's own item names must not count as
 # their own grounding).
 _TOOL_RESPONSE_RE = re.compile(r"<\|tool_response>(.*?)<tool_response\|>", re.DOTALL)
+# The other Gemma wire spans _final_answer_from_wire must strip before extract_json:
+# a dangling tool call's arguments and a thought span can both contain '{', and
+# extract_json decodes from the FIRST brace it sees.
+_TOOL_CALL_RE = re.compile(r"<\|tool_call>.*?<tool_call\|>", re.DOTALL)
+_THOUGHT_RE = re.compile(r"<\|channel>[^\n]*\n.*?<channel\|>", re.DOTALL)
+_THOUGHT_OPEN_RE = re.compile(r"<\|channel>.*\Z", re.DOTALL)  # clipped: opener, no close
 
 
 # ---------------------------------------------------------------------------
@@ -254,6 +259,28 @@ def _completion_text(completion) -> str:
     return str(completion or "")
 
 
+def _final_answer_from_wire(raw: str) -> str:
+    """The final assistant answer text from a RAW Gemma wire completion (decoded with
+    skip_special_tokens=False).
+
+    Take the tail after the LAST <|tool_response> span (so scraped pages can never
+    leak into the answer), then strip tool-call spans and thought spans -- both can
+    carry braces that would fool extract_json's first-'{' scan. A completion clipped
+    inside an unterminated thought span strips to nothing, which is correct: it never
+    answered. Whatever remains (typically `<turn|>`/turn-header debris around the
+    model's final text) is handed to schema.extract_json, which tolerates
+    surrounding junk.
+    """
+    idx = 0
+    for m in _TOOL_RESPONSE_RE.finditer(raw):
+        idx = m.end()
+    tail = raw[idx:]
+    tail = _TOOL_CALL_RE.sub(" ", tail)
+    tail = _THOUGHT_RE.sub(" ", tail)
+    tail = _THOUGHT_OPEN_RE.sub(" ", tail)
+    return tail.strip()
+
+
 def _evidence_from_completion(completion) -> str:
     """Best-effort tool-response text from a completion when `evidence` isn't passed.
 
@@ -279,25 +306,54 @@ def _evidence_from_completion(completion) -> str:
     return ""
 
 
-def make_grpo_rewards(*, weights: RewardWeights = DEFAULT_WEIGHTS, include_dietary: bool = False):
+def make_grpo_rewards(*, weights: RewardWeights = DEFAULT_WEIGHTS, include_dietary: bool = False,
+                      tokenizer=None):
     """Build the TRL-GRPO `reward_funcs` list + matching `reward_weights`.
 
     Returns (funcs, reward_weights). Pass both to GRPOTrainer/GRPOConfig; TRL calls
     each `func(completions, **columns) -> list[float]`, sums them weighted, and logs
     each term's mean under its __name__ (structure_reward / found_reward /
-    grounding_reward). Each example's menu and evidence come from the rollout kwargs
-    `final_json` and `evidence` when present (the clean path), else are parsed from
-    the completion. `dietary_reward` is included only when include_dietary=True; it
-    carries weight 0 and returns 0.0 until a local judge is wired in.
+    grounding_reward). `dietary_reward` is included only when include_dietary=True;
+    it carries weight 0 and returns 0.0 until a local judge is wired in.
+
+    Each example's menu and evidence resolve in priority order:
+      1. rollout kwargs `final_json` / `evidence` (a custom rollout_func attaching
+         them explicitly);
+      2. `tokenizer` + the `completion_ids` kwarg TRL always passes: decode the RAW
+         wire text ourselves and extract answer/evidence from Gemma's markers;
+      3. the TRL-parsed completion messages (string or message-list).
+
+    Path 2 exists because path 3 is BROKEN for Gemma mid-episode turns (measured
+    2026-08-08 on transformers 5.14.1 / TRL 1.9.2, live rollouts: 16/16 final
+    answers parsed to content='' -> every reward 0, zero gradient). Gemma bundles
+    tool calls + responses INSIDE one assistant turn, so the final answer is a turn
+    CONTINUATION after a token-concatenated prefix ending in <tool_response|>, with
+    a SECOND thought span -- a shape the streaming response parser mis-handles (a
+    fresh single-turn parse of the same text is fine). The raw ids are authoritative
+    and immune to that parser: ALWAYS pass `tokenizer` when training Gemma.
     """
     def _resolve(completions, kwargs):
         n = len(completions)
         fj = kwargs.get("final_json") or [None] * n
         ev = kwargs.get("evidence") or [None] * n
+        ids_list = kwargs.get("completion_ids") if tokenizer is not None else None
         menus, evids = [], []
         for i, c in enumerate(completions):
-            menus.append(_as_menu(fj[i]) if fj[i] is not None else _as_menu(_completion_text(c)))
-            evids.append(ev[i] if ev[i] is not None else _evidence_from_completion(c))
+            raw = None
+            if ids_list is not None and i < len(ids_list) and ids_list[i] is not None:
+                raw = tokenizer.decode(ids_list[i], skip_special_tokens=False)
+            if fj[i] is not None:
+                menus.append(_as_menu(fj[i]))
+            elif raw is not None:
+                menus.append(_as_menu(_final_answer_from_wire(raw)))
+            else:
+                menus.append(_as_menu(_completion_text(c)))
+            if ev[i] is not None:
+                evids.append(ev[i])
+            elif raw is not None:
+                evids.append("\n".join(_TOOL_RESPONSE_RE.findall(raw)))
+            else:
+                evids.append(_evidence_from_completion(c))
         return menus, evids
 
     def structure_reward(completions, **kwargs) -> list[float]:

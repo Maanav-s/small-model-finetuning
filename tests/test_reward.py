@@ -236,3 +236,77 @@ def test_custom_weights_as_list():
     assert w.as_list() == [0.1, 0.3, 0.5, 0.1]
     _funcs, weights = make_grpo_rewards(weights=w)
     assert weights == [0.1, 0.3, 0.5]
+
+
+# ---------------------------------------------------------------------------
+# Raw-wire path (tokenizer + completion_ids): the path train_grpo.py uses, because
+# TRL's parsed messages lose Gemma final answers mid-episode (2026-08-08).
+# ---------------------------------------------------------------------------
+class FakeWireTokenizer:
+    """decode(ids) where ids ARE the wire string (chr-codes) -- enough to exercise
+    the completion_ids path without a real tokenizer."""
+
+    def decode(self, ids, skip_special_tokens=False):
+        return "".join(chr(i) for i in ids)
+
+
+def wire(ids_text: str) -> list[int]:
+    return [ord(ch) for ch in ids_text]
+
+
+WIRE_EPISODE = (
+    "<|channel>thought\nLet me search.\n<channel|>"
+    '<|tool_call>call:web_search{query:<|"|>joes menu<|"|>}<tool_call|>'
+    "<|tool_response>response:web_search{value:<|\"|>Joe's Pizza - joes.example/menu<|\"|>}<tool_response|>"
+    "<|channel>thought\nNow scrape.\n<channel|>"
+    '<|tool_call>call:scrape_url{url:<|"|>joes.example/menu<|"|>}<tool_call|>'
+    "<|tool_response>response:scrape_url{value:<|\"|>Menu: Margherita Pizza $12, Marinara Pizza $10<|\"|>}<tool_response|>"
+    "<|channel>thought\nI have the menu; {\"draft\": true} braces here must not fool the parser.\n<channel|>"
+    + json.dumps(menu("Margherita Pizza", "Marinara Pizza"))
+    + "<turn|>"
+)
+
+
+def test_wire_path_parses_final_answer_and_grounds_it():
+    funcs, _ = make_grpo_rewards(tokenizer=FakeWireTokenizer())
+    structure, found, grounding = funcs
+    kw = {"completion_ids": [wire(WIRE_EPISODE)]}
+    completions = [[{"role": "assistant", "content": ""}]]  # TRL-mangled: empty content
+    assert structure(completions, **kw) == [1.0]
+    assert found(completions, **kw) == [1.0]
+    assert grounding(completions, **kw)[0] > 0
+
+
+def test_wire_path_evidence_excludes_answer_and_thoughts():
+    # the answer invents items absent from the scraped spans -> negative grounding,
+    # even though the item names appear verbatim in the completion's own answer text
+    bad = WIRE_EPISODE.replace(
+        json.dumps(menu("Margherita Pizza", "Marinara Pizza")),
+        json.dumps(menu("Dragon Roll", "Wagyu Skewer")))
+    funcs, _ = make_grpo_rewards(tokenizer=FakeWireTokenizer())
+    grounding = funcs[2]
+    assert grounding([[{"role": "assistant", "content": ""}]],
+                     completion_ids=[wire(bad)])[0] < 0
+
+
+def test_wire_path_clipped_thought_scores_floor():
+    clipped = WIRE_EPISODE.split("<channel|>" + "{")[0]  # ends inside the last thought span
+    funcs, _ = make_grpo_rewards(tokenizer=FakeWireTokenizer())
+    structure = funcs[0]
+    assert structure([[{"role": "assistant", "content": ""}]],
+                     completion_ids=[wire(clipped)]) == [0.0]
+
+
+def test_wire_path_dangling_tool_call_scores_floor():
+    dangling = WIRE_EPISODE.split("<|tool_response>response:scrape_url")[0]
+    funcs, _ = make_grpo_rewards(tokenizer=FakeWireTokenizer())
+    structure = funcs[0]
+    assert structure([[{"role": "assistant", "content": ""}]],
+                     completion_ids=[wire(dangling)]) == [0.0]
+
+
+def test_no_tokenizer_keeps_legacy_paths():
+    funcs, _ = make_grpo_rewards()  # no tokenizer: completion_ids must be ignored
+    structure = funcs[0]
+    completions = [[{"role": "assistant", "content": json.dumps(menu(*REAL))}]]
+    assert structure(completions, completion_ids=[[1, 2, 3]]) == [1.0]
