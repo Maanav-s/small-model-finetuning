@@ -193,8 +193,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--cache-path", default=str(ROOT / "data" / "cache.sqlite"))
     # vLLM
     p.add_argument("--use-vllm", action="store_true",
-                   help="use TRL's vLLM rollout path (fast). Requires vLLM to serve Gemma-4-E4B on "
-                        "the card (head_dim=512 gate -- validate on Hopper). Default OFF = transformers gen.")
+                   help="use TRL's vLLM rollout path (fast; colocate needs the unified cu130 env + "
+                        "a merged-text --model-path -- see CLAUDE.md's GRPO subsection). Default OFF "
+                        "= transformers gen.")
     p.add_argument("--vllm-mode", default="colocate", choices=["colocate", "server"])
     p.add_argument("--vllm-gpu-memory-utilization", type=float, default=0.3)
     p.add_argument("--vllm-server-base-url", default=None)
@@ -315,7 +316,9 @@ def main() -> None:
     # in `except Exception`; the async path gathers with return_exceptions=True) and
     # feeds `{"error": str(e)}` back as the tool message -- so backends'
     # BrowserDeadError CANNOT abort training from inside a tool call. What it does
-    # instead is saturate TRL's `tools/failure_rate` metric (once the breaker trips,
+    # instead is saturate TRL's `tools/failure_frequency` metric -- failed calls /
+    # total calls, in [0,1] (grpo_trainer.py ~1804; the name is the same on 1.5.1
+    # and 1.8.0 -- there is NO `tools/failure_rate`) -- (once the breaker trips,
     # every scrape raises instantly). This callback is the abort path: stop when the
     # failure rate stays saturated, before hundreds of steps train against
     # {"error": ...} rollouts. A healthy run sits near 0 -- scrape/site failures
@@ -331,12 +334,12 @@ def main() -> None:
             self.consecutive = 0
 
         def on_log(self, args_, state, control, logs=None, **kwargs):
-            rate = (logs or {}).get("tools/failure_rate")
+            rate = (logs or {}).get("tools/failure_frequency")
             if rate is None:
                 return
             self.consecutive = self.consecutive + 1 if rate >= TOOL_FAILURE_ABORT_RATE else 0
             if self.consecutive >= TOOL_FAILURE_ABORT_LOGS:
-                print(f"\n[ABORT] tools/failure_rate >= {TOOL_FAILURE_ABORT_RATE} for "
+                print(f"\n[ABORT] tools/failure_frequency >= {TOOL_FAILURE_ABORT_RATE} for "
                       f"{self.consecutive} consecutive logging steps (step {state.global_step}): "
                       f"the tool stack is broken (dead local browser / BrowserDeadError), so "
                       f"rollouts are error text, not evidence. Stopping training; the adapter "

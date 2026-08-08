@@ -558,7 +558,7 @@ def _throttle(host: str) -> None:
 # TRL's GRPO tool loop CATCHES tool exceptions (grpo_trainer.py ~1527 `except
 # Exception`; async gathers with return_exceptions=True) and feeds {"error": ...}
 # back as the tool message -- there, this raise surfaces as a SATURATED
-# `tools/failure_rate` metric (every call raising instantly), and train_grpo.py's
+# `tools/failure_frequency` metric (every call raising instantly), and train_grpo.py's
 # ToolFailureAbort callback is what turns that into a stop. Successful browser
 # renders and SITE failures (the browser worked; the site refused) reset the
 # streak, so only a browser failing every consecutive call can trip it. A browser
