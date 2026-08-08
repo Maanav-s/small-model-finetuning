@@ -11,7 +11,7 @@
 #   bash scripts/infra/eval_pod.sh run-teacher    # teacher over the eval split -> REFERENCE + its own report
 #   bash scripts/infra/eval_pod.sh stop-teacher   # free the GPUs
 #   bash scripts/infra/eval_pod.sh prep-gemma     # pull both checkpoints, convert to text-only
-#   bash scripts/infra/eval_pod.sh serve-gemma    # base on GPU0:8001, SFT on GPU1:8002 (concurrently)
+#   bash scripts/infra/eval_pod.sh serve-gemma    # base on GPU0, SFT on GPU1 (concurrently)
 #   bash scripts/infra/eval_pod.sh run-gemma      # BOTH evals in parallel, scored vs the reference
 #   bash scripts/infra/eval_pod.sh finish         # summary table + push everything to S3
 #
@@ -64,6 +64,10 @@ SERVED_TEACHER="${SERVED_TEACHER:-teacher}"  # ON THE WIRE: must match serve_tea
 TEACHER_TP="${TEACHER_TP:-4}"
 GEMMA_MAX_LEN="${GEMMA_MAX_LEN:-98304}"       # v1 precedent: 500/500 episodes, 0 context-400s
 GEMMA_UTIL="${GEMMA_UTIL:-0.85}"
+# Ports: NOT 8001 -- the RunPod pytorch image runs nginx there, so vLLM dies with
+# `[Errno 98] Address already in use` while nginx keeps answering 200 on /v1/models.
+GEMMA_BASE_PORT="${GEMMA_BASE_PORT:-8011}"
+GEMMA_SFT_PORT="${GEMMA_SFT_PORT:-8012}"
 
 # RUN_SET is STICKY: computed once, then persisted. Deriving it from `date` on every
 # invocation splits a single run-set across two directories the moment a phase runs
@@ -90,10 +94,18 @@ require_env() {
   fi
 }
 
+is_vllm() {  # is_vllm <port> -- true only if a REAL vLLM model list answers
+  # NOT `curl -sf` alone: the RunPod image runs nginx, which answers 200 with its
+  # default HTML on any path it owns (it holds 8001). A status-only check reports
+  # that as a healthy model server, and the eval then talks to a web server.
+  curl -sf --max-time 10 "http://localhost:$1/v1/models" 2>/dev/null \
+    | grep -q '"object"[[:space:]]*:[[:space:]]*"list"'
+}
+
 wait_health() {  # wait_health <port> <label> [timeout_s]
   local port="$1" label="$2" timeout="${3:-3600}" waited=0
   echo "waiting for $label on :$port (timeout ${timeout}s) ..."
-  until curl -sf "http://localhost:$port/v1/models" >/dev/null 2>&1; do
+  until is_vllm "$port"; do
     sleep 10; waited=$((waited + 10))
     if [ "$waited" -ge "$timeout" ]; then
       echo "$label did not come up within ${timeout}s -- check the log" >&2
@@ -240,22 +252,29 @@ phase_prep_gemma() {
   ls -la "$WORK/base-text" "$WORK/sft-text"
 }
 
+serve_one_gemma() {  # serve_one_gemma <gpu> <ckpt_dir> <port> <logfile> <label>
+  local gpu="$1" ckpt="$2" port="$3" logf="$4" label="$5"
+  if is_vllm "$port"; then
+    echo "$label already serving on :$port -- skipping launch (phase is idempotent)"
+    return 0
+  fi
+  CUDA_VISIBLE_DEVICES="$gpu" nohup env PATH="$VLLM_VENV/bin:$PATH" "$VLLM_VENV/bin/vllm" serve "$ckpt" \
+      --served-model-name gemma-menu --max-model-len "$GEMMA_MAX_LEN" \
+      --gpu-memory-utilization "$GEMMA_UTIL" --host 0.0.0.0 --port "$port" \
+      </dev/null > "$logf" 2>&1 &
+  echo "$label launching on GPU$gpu :$port -> $logf"
+}
+
 phase_serve_gemma() {
   cd "$REPO"
-  log "serving BOTH Gemmas concurrently: base on GPU0:8001, SFT on GPU1:8002"
+  log "serving BOTH Gemmas concurrently: base GPU0::$GEMMA_BASE_PORT, SFT GPU1::$GEMMA_SFT_PORT"
   # One GPU each, so the two evals run in parallel on the pod we are already paying
   # for. Serve the merged bf16 text-only checkpoints -- never 4-bit (the v1 QLoRA
   # fidelity finding: 4-bit serving alone cost ~32 points of success rate).
-  CUDA_VISIBLE_DEVICES=0 nohup env PATH="$VLLM_VENV/bin:$PATH" "$VLLM_VENV/bin/vllm" serve "$WORK/base-text" \
-      --served-model-name gemma-menu --max-model-len "$GEMMA_MAX_LEN" \
-      --gpu-memory-utilization "$GEMMA_UTIL" --host 0.0.0.0 --port 8001 \
-      </dev/null > "$WORK/vllm-base.log" 2>&1 &
-  CUDA_VISIBLE_DEVICES=1 nohup env PATH="$VLLM_VENV/bin:$PATH" "$VLLM_VENV/bin/vllm" serve "$WORK/sft-text" \
-      --served-model-name gemma-menu --max-model-len "$GEMMA_MAX_LEN" \
-      --gpu-memory-utilization "$GEMMA_UTIL" --host 0.0.0.0 --port 8002 \
-      </dev/null > "$WORK/vllm-sft.log" 2>&1 &
-  wait_health 8001 "gemma-base" 1800
-  wait_health 8002 "gemma-sft" 1800
+  serve_one_gemma 0 "$WORK/base-text" "$GEMMA_BASE_PORT" "$WORK/vllm-base.log" "gemma-base"
+  serve_one_gemma 1 "$WORK/sft-text"  "$GEMMA_SFT_PORT"  "$WORK/vllm-sft.log"  "gemma-sft"
+  wait_health "$GEMMA_BASE_PORT" "gemma-base" 1800
+  wait_health "$GEMMA_SFT_PORT" "gemma-sft" 1800
 }
 
 phase_run_gemma() {
@@ -267,7 +286,7 @@ phase_run_gemma() {
 
   log "running BOTH Gemma evals in parallel"
   WANDB_NAME="gemma-base" "$PY" scripts/eval/eval.py "$EVAL_DIR/candidates/gemma-base" \
-      --model gemma --gemma-vllm-base-url http://localhost:8001/v1 \
+      --model gemma --gemma-vllm-base-url http://localhost:$GEMMA_BASE_PORT/v1 \
       --served-model-name gemma-menu --model-path "$WORK/base-text" \
       --limit "$LIMIT" --conditioned-frac "$COND" --seed "$SEED" \
       --cache-policy live --cache-path "$WORK/cache-base.sqlite" --workers "$WORKERS" \
@@ -275,7 +294,7 @@ phase_run_gemma() {
       --json "$EVAL_DIR/reports/gemma-base.json" > "$WORK/eval-base.log" 2>&1 &
   local pid_base=$!
   WANDB_NAME="gemma-sft" "$PY" scripts/eval/eval.py "$EVAL_DIR/candidates/gemma-sft" \
-      --model gemma --gemma-vllm-base-url http://localhost:8002/v1 \
+      --model gemma --gemma-vllm-base-url http://localhost:$GEMMA_SFT_PORT/v1 \
       --served-model-name gemma-menu --model-path "$WORK/sft-text" \
       --limit "$LIMIT" --conditioned-frac "$COND" --seed "$SEED" \
       --cache-policy live --cache-path "$WORK/cache-sft.sqlite" --workers "$WORKERS" \
