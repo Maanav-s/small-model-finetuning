@@ -12,6 +12,7 @@
 #   bash scripts/infra/eval_pod.sh stop-teacher   # free the GPUs
 #   bash scripts/infra/eval_pod.sh prep-gemma     # pull both checkpoints, convert to text-only
 #   bash scripts/infra/eval_pod.sh serve-gemma    # base on GPU0, SFT on GPU1 (concurrently)
+#   bash scripts/infra/eval_pod.sh smoke-gemma    # 2 real episodes per server -- the gate
 #   bash scripts/infra/eval_pod.sh run-gemma      # BOTH evals in parallel, scored vs the reference
 #   bash scripts/infra/eval_pod.sh finish         # summary table + push everything to S3
 #
@@ -155,9 +156,12 @@ phase_setup() {
   # claude_agent at module scope and that module imports anthropic at its top.
   [ -x "$PY" ] || python3 -m venv "$CLIENT_VENV"
   "$CLIENT_VENV/bin/pip" install -q -U pip
+  # jinja2 is NOT a hard dep of transformers 5.x, but apply_chat_template needs it --
+  # and the Gemma student path renders with OUR template, so without it every episode
+  # dies with `ImportError: apply_chat_template requires jinja2`.
   "$CLIENT_VENV/bin/pip" install -q \
       requests python-dotenv playwright markdownify beautifulsoup4 jsonschema \
-      openai transformers wandb boto3 anthropic
+      openai transformers jinja2 wandb boto3 anthropic
   "$CLIENT_VENV/bin/playwright" install --with-deps chromium
 
   log "pull the corpus + the warmed cache from S3"
@@ -277,6 +281,36 @@ phase_serve_gemma() {
   wait_health "$GEMMA_SFT_PORT" "gemma-sft" 1800
 }
 
+phase_smoke_gemma() {
+  # The teacher gets scripts/infra/smoke_teacher.py before anything metered runs; the
+  # students had no equivalent, and paid for it twice (a torch import and a missing
+  # jinja2, each killing all 500 episodes at episode 1). Two real episodes per server,
+  # into a throwaway candidate dir, exercising the SAME code path as the full run.
+  cd "$REPO"
+  require_env BRAVE_API_KEY
+  local rc=0
+  for spec in "gemma-base:$GEMMA_BASE_PORT:$WORK/base-text" "gemma-sft:$GEMMA_SFT_PORT:$WORK/sft-text"; do
+    local name="${spec%%:*}" rest="${spec#*:}"
+    local port="${rest%%:*}" ckpt="${rest#*:}"
+    log "smoke: $name on :$port (2 episodes)"
+    rm -rf "$WORK/smoke-$name"
+    if "$PY" scripts/eval/eval.py "$WORK/smoke-$name" \
+        --model gemma --gemma-vllm-base-url "http://localhost:$port/v1" \
+        --served-model-name gemma-menu --model-path "$ckpt" \
+        --limit 2 --conditioned-frac 0.5 --seed "$SEED" \
+        --cache-policy live --cache-path "$REPO/data/cache.sqlite" \
+        --workers 2 --no-wandb --self-report 2>&1 | tail -12; then
+      local n_ok
+      n_ok=$(grep -c '"schema_valid": true' "$WORK/smoke-$name"/*.json 2>/dev/null || echo 0)
+      echo "[smoke] $name wrote $(ls "$WORK/smoke-$name" 2>/dev/null | wc -l) candidates, $n_ok schema-valid"
+    else
+      echo "[smoke] $name FAILED"; rc=1
+    fi
+  done
+  [ "$rc" -eq 0 ] || { echo "gemma smoke failed -- refusing to start the metered run" >&2; exit 1; }
+  echo "gemma smoke OK for both servers"
+}
+
 phase_run_gemma() {
   cd "$REPO"
   require_env BRAVE_API_KEY
@@ -339,6 +373,7 @@ case "${1:-}" in
   stop-teacher)   phase_stop_teacher ;;
   prep-gemma)     phase_prep_gemma ;;
   serve-gemma)    phase_serve_gemma ;;
+  smoke-gemma)    phase_smoke_gemma ;;
   run-gemma)      phase_run_gemma ;;
   finish)         phase_finish ;;
   *) sed -n '2,40p' "$0"; exit 1 ;;
