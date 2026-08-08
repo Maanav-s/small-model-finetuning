@@ -192,3 +192,5 @@ cython_debug/
 #  refer to https://docs.cursor.com/context/ignore-files
 .cursorignore
 .cursorindexingignore
+# W&B local run artifacts (telemetry is uploaded; the local spool is scratch)
+wandb/
