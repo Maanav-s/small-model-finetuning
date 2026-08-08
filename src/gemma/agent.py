@@ -55,6 +55,21 @@ def render_prompt(tokenizer, messages: list[dict], tools: list) -> str:
     )
 
 
+END_OF_TURN = "<turn|>"   # Gemma 4's end-of-turn marker
+
+
+def strip_end_of_turn(text: str) -> str:
+    """Drop a trailing `<turn|>` (end-of-turn), leaving any other marker alone.
+
+    MUST NOT touch `<tool_call|>`: the vLLM path deliberately re-appends that one so
+    parse_response sees a complete tool call.
+    """
+    stripped = text.rstrip()
+    if stripped.endswith(END_OF_TURN):
+        return stripped[: -len(END_OF_TURN)].rstrip()
+    return text
+
+
 def parse_turn(tokenizer, text: str, prefix: str) -> dict:
     """tokenizer.parse_response, across the transformers versions we run on.
 
@@ -67,7 +82,19 @@ def parse_turn(tokenizer, text: str, prefix: str) -> dict:
     indistinguishable from the v1 non-termination failure, which is exactly how it
     nearly got misread as a broken checkpoint. transformers 5.10 (the repo pin) has
     no `prefix` kwarg at all, hence the TypeError fallback.
+
+    The trailing `<turn|>` is stripped first. Measured on transformers 5.14.1 with
+    the Gemma-4 tokenizer, a final answer parses to content ONLY when the end-of-turn
+    marker is absent:
+
+        'think<channel|>{"found":true}<turn|>'  -> {'role','thinking'}            content LOST
+        'think<channel|>{"found":true}'         -> {'role','thinking','content'}  content OK
+
+    The model emits `<turn|>` correctly (it is terminating properly) and vLLM returns
+    it, so every completed answer came back as content='' -- an empty final answer,
+    indistinguishable from the model never answering at all.
     """
+    text = strip_end_of_turn(text)
     try:
         return tokenizer.parse_response(text, prefix=prefix)
     except TypeError:
@@ -202,7 +229,14 @@ def run_episode(
         tool_calls = parsed.get("tool_calls")
 
         if not tool_calls:
-            return (parsed.get("content") or "").strip()  # final answer
+            # Final answer. If the parser surfaced no content, fall back to the RAW
+            # turn rather than returning "": a turn with no tool call is the model's
+            # answer, so throwing it away turns any parser/template quirk into a
+            # phantom "empty output" (exactly what a `<turn|>`-terminated answer did).
+            # Downstream schema.extract_json pulls the JSON out of surrounding prose,
+            # so handing it the raw text costs nothing when the parse was fine.
+            content = (parsed.get("content") or "").strip()
+            return content or strip_end_of_turn(text).strip()
 
         if out_of_budget:
             # Model tried to call a tool with no budget left (despite the finalize
