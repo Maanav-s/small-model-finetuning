@@ -55,6 +55,15 @@ key/checkpoint can't silently burn the whole run.
   # candidates + paired scoring (reference from the DB) with a free/conditioned breakdown
   uv run python scripts/eval/eval.py cand/ --model claude
 
+REPORTING. --json writes the permanent record (results/<run-set>/<model>.json; see
+results/README.md). Alongside the scores it stamps `run` (throughput, workers, the
+full failure list) and `cache` (hits/misses/writes + the derived `hit_rate`) --
+without the hit rate a score can't be read honestly, since a model that explored off
+the warmed distribution is partly being scored on the cache rather than on itself.
+The same numbers go to Weights & Biases iff WANDB_API_KEY is set (project from
+WANDB_PROJECT, default 'menu-eval'; --wandb-name labels the model, --no-wandb opts
+out). W&B is NEVER fatal: a missing package or a failed init degrades to console-only.
+
 Requires BRAVE_API_KEY (search backend is built even when frozen) and, for
 --model claude, ANTHROPIC_API_KEY (repo-root .env).
 """
@@ -64,6 +73,7 @@ import json
 import os
 import sys
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
@@ -106,6 +116,8 @@ from schema import MENU_SCHEMA, extract_json  # noqa: E402
 from tools import setup_tools  # noqa: E402
 
 GEMMA_MODEL_ID = "google/gemma-4-E4B-it"
+DEFAULT_WANDB_PROJECT = "menu-eval"
+PROGRESS_EVERY = 25  # aggregate progress line every N completed episodes
 
 
 # ---------------------------------------------------------------------------
@@ -143,11 +155,27 @@ def parse_args(argv=None):
                         help="vllm: OpenAI-compatible base URL of the vLLM server")
     parser.add_argument("--served-model-name", default=None,
                         help="vllm: served model name on the vLLM server (--served-model-name at "
-                             "serve time). Also the Gemma completions model when --gemma-vllm-base-url is set.")
+                             "serve time). Also the Gemma completions model when --gemma-vllm-base-url is set. "
+                             "This goes ON THE WIRE -- it must match what the server serves, or every "
+                             "request 404s. Use --model-label to control the reported name instead.")
+    parser.add_argument("--model-label", default=None,
+                        help="override the `model` label stamped into candidate traces and the "
+                             "report, WITHOUT changing the name sent to the server. Serving names "
+                             "are deliberately short ('teacher', 'gemma-menu'); the thing you want "
+                             "in a results table is the real checkpoint id "
+                             "(e.g. 'Qwen/Qwen3-235B-A22B-Instruct-2507-FP8').")
     parser.add_argument("--gemma-vllm-base-url", default=None,
                         help="gemma: serve the student via a vLLM /v1/completions server at this URL "
                              "(fast + concurrent) instead of loading HF weights locally. Renders with "
                              "our own template/parser (agent.generate_turn's vLLM path).")
+    parser.add_argument("--gemma-max-tokens", type=int, default=4096,
+                        help="gemma via vLLM: per-turn generation budget (default 4096). "
+                             "This is a CEILING ON THE ANSWER, not a safety knob: the "
+                             "student emits reasoning AND the full menu JSON in one turn, "
+                             "so a 40-item menu behind a long think can hit the cap and "
+                             "return finish_reason='length' with EMPTY content -- which "
+                             "scores identically to non-termination. Raise it for models "
+                             "that think long; it is recorded in the report either way.")
     parser.add_argument("--adapter-path", default=None,
                         help="gemma: load a LoRA adapter dir on top of the (4-bit) base model, "
                              "instead of a fully-merged --model-path checkpoint. Evaluates the "
@@ -178,6 +206,14 @@ def parse_args(argv=None):
                         help="print one scored line per episode")
     parser.add_argument("--json", type=Path, default=None,
                         help="also write the full report as JSON (the eval report.json)")
+    parser.add_argument("--no-wandb", action="store_true",
+                        help="disable Weights & Biases logging even when WANDB_API_KEY is set. "
+                             "By default the eval logs to W&B iff WANDB_API_KEY is in the "
+                             "environment (project from WANDB_PROJECT, default "
+                             f"{DEFAULT_WANDB_PROJECT!r}); without the key it is a no-op.")
+    parser.add_argument("--wandb-name", default=None,
+                        help="W&B run name (default: $WANDB_NAME, else wandb's own). Use it to "
+                             "label the model under test, e.g. 'teacher-qwen235b' / 'gemma-base'.")
     parser.add_argument("--list", action="store_true",
                         help="print the planned episodes and exit (no API/GPU calls)")
     args = parser.parse_args(argv)
@@ -196,7 +232,14 @@ def parse_args(argv=None):
 
 
 def model_label(args) -> str:
-    """The `model` field stamped into each candidate trace (checkpoint or base id)."""
+    """The `model` field stamped into each candidate trace (checkpoint or base id).
+
+    REPORTING only -- never sent to a server. --model-label wins when set, so a run
+    can be labelled with the real checkpoint id while still addressing the server by
+    the short name it actually serves (mixing the two 404s every request).
+    """
+    if args.model_label:
+        return args.model_label
     if args.model == "gemma":
         return args.model_path or GEMMA_MODEL_ID
     if args.model == "vllm":
@@ -244,6 +287,104 @@ def checkpoint_lineage(args) -> dict:
         "md5": meta.get("md5") if meta else None,
         "meta": meta,
     }
+
+
+# ---------------------------------------------------------------------------
+# W&B telemetry (same contract as build_corpus: key-gated and NEVER fatal)
+# ---------------------------------------------------------------------------
+def init_wandb(args, n_todo: int):
+    """Start a W&B run iff WANDB_API_KEY is set and --no-wandb was not passed.
+
+    Returns the run (or None). NEVER fatal: a missing wandb package or a failed init
+    degrades to console-only logging -- a metered eval on a $12/hr pod must not die
+    because telemetry is misconfigured. Reads WANDB_PROJECT / WANDB_ENTITY from the
+    environment (the caller exports them), defaulting the project only.
+    """
+    if args.no_wandb or not os.environ.get("WANDB_API_KEY"):
+        return None
+    try:
+        import wandb
+    except ImportError:
+        print("[wandb] WANDB_API_KEY is set but the wandb package is not installed "
+              "(pip install wandb); logging to console only")
+        return None
+    lineage = checkpoint_lineage(args)
+    try:
+        run = wandb.init(
+            project=os.environ.get("WANDB_PROJECT", DEFAULT_WANDB_PROJECT),
+            name=args.wandb_name or os.environ.get("WANDB_NAME") or None,
+            job_type="eval",
+            config={
+                "model": args.model, "model_id": model_label(args),
+                "model_path": args.model_path, "adapter_path": args.adapter_path,
+                "base_url": args.base_url, "gemma_vllm_base_url": args.gemma_vllm_base_url,
+                "served_model_name": args.served_model_name,
+                "split": args.split, "limit": args.limit, "seed": args.seed,
+                "conditioned_frac": args.conditioned_frac, "workers": args.workers,
+                "cache_policy": args.cache_policy, "cache_path": args.cache_path,
+                "prompt_variant": "student", "n_todo": n_todo,
+                "gemma_max_tokens": args.gemma_max_tokens,
+                "checkpoint_run_id": lineage["run_id"], "checkpoint_md5": lineage["md5"],
+            },
+        )
+    except Exception as exc:  # noqa: BLE001 -- telemetry must never break the eval
+        print(f"[wandb] init failed ({exc!r}); logging to console only")
+        return None
+    print(f"[wandb] logging to {run.url}")
+    return run
+
+
+def wandb_log(run, metrics: dict, step: int | None = None) -> None:
+    """Log to W&B, swallowing telemetry errors (a hiccup must not kill the eval)."""
+    if run is None:
+        return
+    try:
+        run.log(metrics, step=step)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[wandb] log failed at step {step} ({exc!r}); continuing")
+
+
+def wandb_summarize(run, report: dict) -> None:
+    """Flatten the finished report's headline numbers into W&B summary + a final log.
+
+    Everything the report holds that is a scalar we care about comparing across the
+    three models: per-slice aggregates, abstention buckets, and the cache hit rate
+    (the whole point of tracking it -- a low hit rate means the model explored off
+    the warmed distribution and its score is partly a cache artifact).
+    """
+    if run is None:
+        return
+    flat: dict[str, float] = {}
+    for slice_name, agg in (report.get("aggregate") or {}).items():
+        for k, v in (agg or {}).items():
+            if isinstance(v, (int, float)) and not isinstance(v, bool):
+                flat[f"{slice_name}/{k}"] = v
+    for k, v in (report.get("abstention") or {}).items():
+        flat[f"abstention/{k}"] = v
+    for k, v in (report.get("cache") or {}).items():
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            flat[f"cache/{k}"] = v
+    for k, v in (report.get("run") or {}).items():
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            flat[f"run/{k}"] = v
+    wandb_log(run, flat)
+    try:
+        run.summary.update(flat)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[wandb] summary update failed ({exc!r}); continuing")
+
+
+def cache_report(cache) -> dict:
+    """cache.stats() + the derived hit rate (None when no lookups happened).
+
+    `hit_rate` is over LOOKUPS (hits / (hits + misses)) -- writes are a subset of
+    misses under a live policy, so counting them would double-count.
+    """
+    stats = dict(cache.stats())
+    lookups = stats["hits"] + stats["misses"]
+    stats["lookups"] = lookups
+    stats["hit_rate"] = (stats["hits"] / lookups) if lookups else None
+    return stats
 
 
 # ---------------------------------------------------------------------------
@@ -304,7 +445,7 @@ def build_runner(args, label):
         # openai_agent.build_gemma_completions.
         vllm_generate = build_gemma_completions(
             build_client(args.gemma_vllm_base_url), args.served_model_name or "gemma-menu",
-            tokenizer=tokenizer,
+            max_tokens=args.gemma_max_tokens, tokenizer=tokenizer,
         )
 
         def runner(episode_input, tools, registry, system_prompt):
@@ -409,8 +550,13 @@ def run_one(runner, episode, tools, registry, system_prompt, args, label, candid
 # ---------------------------------------------------------------------------
 # Candidate production
 # ---------------------------------------------------------------------------
-def produce_candidates(args, episodes, todo, candidate_dir):
-    """Run every `todo` episode through the chosen runner; write candidate traces."""
+def produce_candidates(args, episodes, todo, candidate_dir, run=None):
+    """Run every `todo` episode through the chosen runner; write candidate traces.
+
+    Returns `(run_stats, cache_stats)`: the production-side counters (completed /
+    failed / recorded cache-misses / throughput) and the cache hit-rate report, both
+    of which get folded into the report JSON and W&B by main().
+    """
     if args.model == "claude" and not os.environ.get("ANTHROPIC_API_KEY"):
         sys.exit("ANTHROPIC_API_KEY is required for --model claude (repo-root .env)")
 
@@ -442,6 +588,7 @@ def produce_candidates(args, episodes, todo, candidate_dir):
     results, failures = [], []
     consecutive_failures = 0
     fail_lock = threading.Lock()
+    t_start = time.monotonic()
 
     with ThreadPoolExecutor(max_workers=args.workers) as pool:
         futures = {
@@ -464,6 +611,8 @@ def produce_candidates(args, episodes, todo, candidate_dir):
                         for f in futures:
                             f.cancel()
                         break
+                wandb_log(run, {"processed": i, "failed": len(failures),
+                                "episode/failed": 1}, step=i)
                 continue
             with fail_lock:
                 consecutive_failures = 0
@@ -474,15 +623,65 @@ def produce_candidates(args, episodes, todo, candidate_dir):
                   f"schema_valid={summary['schema_valid']} found={summary['found']} "
                   f"items={summary['items']}{flag}")
 
+            # Live telemetry: running rates + the cache hit rate as it evolves, so a
+            # run that is quietly missing the warm shows up early instead of at the end.
+            elapsed = time.monotonic() - t_start
+            cs = cache_report(cache)
+            wandb_log(run, {
+                "processed": i, "completed": len(results), "failed": len(failures),
+                "pct_done": i / len(todo),
+                "eps_per_min": i / elapsed * 60 if elapsed > 0 else 0.0,
+                "found_rate": sum(r["found"] for r in results) / len(results),
+                "schema_valid_rate": sum(r["schema_valid"] for r in results) / len(results),
+                "cache_miss_rate": sum(r["cache_miss"] for r in results) / len(results),
+                "cache/hits": cs["hits"], "cache/misses": cs["misses"],
+                "cache/writes": cs["writes"],
+                "cache/hit_rate": cs["hit_rate"] if cs["hit_rate"] is not None else 0.0,
+                "episode/found": int(summary["found"]),
+                "episode/schema_valid": int(summary["schema_valid"]),
+                "episode/items": summary["items"],
+                "episode/conditioned": int(summary["conditioned"]),
+            }, step=i)
+            if i % PROGRESS_EVERY == 0:
+                rate = i / elapsed if elapsed > 0 else 0.0
+                eta = (len(todo) - i) / rate if rate > 0 else 0.0
+                print(f"[progress] {i}/{len(todo)} ({100 * i / len(todo):.0f}%)  "
+                      f"{rate * 60:.1f} eps/min  ETA {eta / 60:.0f}m  |  "
+                      f"found={100 * sum(r['found'] for r in results) / len(results):.0f}%  "
+                      f"cache hit-rate="
+                      f"{100 * (cs['hit_rate'] or 0):.1f}% ({cs['hits']}/{cs['lookups']})")
+
+    elapsed = time.monotonic() - t_start
     n_miss = sum(r["cache_miss"] for r in results)
+    cache_stats = cache_report(cache)
     print("\n===== candidate run summary =====")
     print(f"episodes completed: {len(results)}  failed: {len(failures)}  "
           f"cache-misses (recorded empty): {n_miss}  "
           f"skipped (pre-existing): {len(episodes) - len(todo)}")
     for rid, name, err in failures:
         print(f"  FAILED {rid} {name!r}: {err}")
-    print(f"cache stats: {cache.stats()}")
+    hr = cache_stats["hit_rate"]
+    print(f"cache: hit-rate {'n/a' if hr is None else f'{100 * hr:.1f}%'} "
+          f"({cache_stats['hits']} hits / {cache_stats['misses']} misses / "
+          f"{cache_stats['writes']} writes, policy={cache_stats['miss_policy']})")
+    print(f"wall clock: {elapsed / 60:.1f} min "
+          f"({len(todo) / elapsed * 60 if elapsed > 0 else 0:.1f} eps/min)")
     cache.close()
+
+    run_stats = {
+        "n_planned": len(episodes),
+        "n_todo": len(todo),
+        "n_skipped_existing": len(episodes) - len(todo),
+        "n_completed": len(results),
+        "n_failed": len(failures),
+        "n_cache_miss_recorded": n_miss,
+        "elapsed_s": elapsed,
+        "eps_per_min": (len(todo) / elapsed * 60) if elapsed > 0 else 0.0,
+        "workers": args.workers,
+        "failures": [{"restaurant_id": rid, "name": name, "error": err}
+                     for rid, name, err in failures],
+    }
+    return run_stats, cache_stats
 
 
 # ---------------------------------------------------------------------------
@@ -617,6 +816,7 @@ def run_paired(args, reference, candidate_dir):
         "checkpoint": checkpoint_lineage(args),
         "split": args.split, "seed": args.seed, "conditioned_frac": args.conditioned_frac,
         "corpus": str(args.corpus), "cache_policy": args.cache_policy,
+        "gemma_max_tokens": args.gemma_max_tokens,
         "candidate_dir": str(candidate_dir), "n_reference_traces": len(reference),
         "aggregate": {"all": agg_all, "free": agg_free, "conditioned": agg_cond},
         "abstention": abstention,
@@ -658,6 +858,7 @@ def run_self_report(args, candidate_dir):
         "checkpoint": checkpoint_lineage(args),
         "split": args.split, "candidate_dir": str(candidate_dir),
         "corpus": str(args.corpus), "cache_policy": args.cache_policy,
+        "gemma_max_tokens": args.gemma_max_tokens,
         "aggregate": {"all": agg_all, "free": agg_free, "conditioned": agg_cond},
         "episodes": {tid: {**reports[tid], "conditioned": conditioned[tid]} for tid in reports},
         "unreadable": {"candidate": unreadable},
@@ -701,8 +902,11 @@ def main(argv=None):
                 print(f"  [{done}] {tid}  {r['name']}, {r['city']}  diet=[{diet}]")
             return
 
+        run = init_wandb(args, len(todo))
+        run_stats = cache_stats = None
         if todo:
-            produce_candidates(args, episodes, todo, candidate_dir)
+            run_stats, cache_stats = produce_candidates(args, episodes, todo,
+                                                        candidate_dir, run=run)
         else:
             print("all candidates already exist -- skipping the run, scoring what's on disk")
 
@@ -717,9 +921,26 @@ def main(argv=None):
                       "-- self-report only (build them with scripts/corpus/build_corpus.py)")
             report = run_self_report(args, candidate_dir)
 
+    # Production-side facts (throughput, failures, cache hit rate) travel WITH the
+    # scores -- a report whose cache hit rate is unknown can't be read honestly.
+    report["run"] = run_stats
+    report["cache"] = cache_stats
+    wandb_summarize(run, report)
+
     if args.json:
+        args.json.parent.mkdir(parents=True, exist_ok=True)
         args.json.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
         print(f"wrote JSON report: {args.json}")
+        if run is not None:
+            try:
+                run.save(str(args.json), policy="now")
+            except Exception as exc:  # noqa: BLE001 -- artifact upload is best-effort
+                print(f"[wandb] report upload failed ({exc!r}); the local file is authoritative")
+    if run is not None:
+        try:
+            run.finish()
+        except Exception as exc:  # noqa: BLE001
+            print(f"[wandb] finish failed ({exc!r})")
 
 
 if __name__ == "__main__":

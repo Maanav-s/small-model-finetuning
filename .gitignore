@@ -134,6 +134,12 @@ celerybeat.pid
 # (v2 retired the loose reject_list.txt/grounding.json — both are now DB fields.)
 data/*
 
+# Eval RESULTS are the exception: results/<run-set>/*.json + README.md ARE committed
+# (the permanent, in-repo record of every scored run -- see results/README.md). Only
+# the bulky per-episode candidate traces stay out; they are archived to
+# s3://$S3_BUCKET/$S3_PREFIX/eval/<run-set>/ by scripts/infra/eval_pod.sh finish.
+results/**/candidates/
+
 # Environments
 .env
 .venv
@@ -186,3 +192,5 @@ cython_debug/
 #  refer to https://docs.cursor.com/context/ignore-files
 .cursorignore
 .cursorindexingignore
+# W&B local run artifacts (telemetry is uploaded; the local spool is scratch)
+wandb/

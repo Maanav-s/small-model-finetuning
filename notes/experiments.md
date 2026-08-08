@@ -13,6 +13,85 @@ Conventions:
 
 ---
 
+## 2026-08-08 — FIRST three-model v2 eval: teacher vs SFT student vs untrained base (n=500 each)
+
+The first run where all three models are scored on the **same seeded plan** (`--split eval
+--seed 42 --limit 500 --conditioned-frac 0.4` = 300 free + 200 conditioned), and the first
+with a **paired** reference at all: `corpus.sqlite` had ZERO eval-split traces before this,
+so the teacher pass *created* the reference the students are scored against. That is also
+why the teacher row is self-report — it IS the reference; pairing it against itself would
+print P=R=F1=1.000.
+
+One 4×H100 pod ($13.16/hr): teacher on TP=4, then both Gemmas served concurrently (GPU0/GPU1,
+merged bf16 text-only) and evaluated in parallel. 500/500 episodes for every model, **0
+failures**. `--cache-policy live` throughout, against the fully-warmed eval split (601/601
+restaurants × 6 query templates), so hit rates were 92–94% — near-frozen comparisons.
+
+| model | mode | schema-valid | found acc. | item F1 | P | R | false-find | cache hit | eps/min |
+|---|---|---|---|---|---|---|---|---|---|
+| **Qwen3-235B teacher** | self-report | 99.6% | 82.0% *(found=true)* | — | — | — | — | — | 18.0 |
+| **Gemma SFT student** | paired | **100.0%** | **81.3%** | **0.560** | 0.827 | 0.573 | **10** | 94.0% | 40.1 |
+| **Gemma base (untrained)** | paired | 95.4% | 74.1% | 0.438 | 0.737 | 0.459 | 29 | 92.1% | 16.4 |
+
+**The student has closed the FIND gap: 81.3% vs the teacher's 82.0%.** What it has not closed
+is COMPLETENESS — precision 0.827 but recall 0.573, mean 7.8 fewer items than the reference.
+When it answers it is right; it just returns a partial menu. That is precisely what GRPO's
+completeness reward targets, and it is now measured rather than assumed.
+
+**SFT beats base on every axis**, most sharply on calibration: false-finds (claiming a menu
+for a restaurant that has none) **29 → 10**, false give-ups 100 → 83 of 410 findable.
+
+**The base model is stronger than the v1 log implies** — 74.1% found accuracy and 95.4%
+schema-validity UNTRAINED. So schema-following largely comes free with Gemma-4; SFT buys
+precision, completeness, and calibration. Base is also 2.4× slower (16.4 vs 40.1 eps/min):
+it takes many more tool calls to get there.
+
+**Conditioned episodes are the remaining quality gap, and this time it is NOT termination.**
+SFT free F1 0.655 vs conditioned 0.399 (recall 0.680 → 0.395), while found accuracy is FLAT
+across slices (81.3% both). Contrast [[v1-sft-failure-mode]], where the conditioned deficit
+was a termination artifact: the model now finds and answers conditioned episodes fine, it
+just over-filters.
+
+### Four silent bugs, all of which faked the v1 empty-output failure
+
+Every one produced `final_json=None` — the exact signature of v1 non-termination — so each
+would have been reported as "the v2 student is broken". Caught only by tracing a live
+episode turn by turn and seeing the model emit a complete, valid menu that our code threw away:
+
+1. **`parse_response` needs `prefix=`** (transformers 5.14.1). Without it every turn RAISED,
+   the loop's recovery told the model its (valid) tool calls were unparseable, and the model
+   burned all 8 tool calls apologising before returning ''.
+2. **A `<turn|>`-terminated answer parses to `content=''`.** Measured: `'…<channel|>{json}<turn|>'`
+   → `{'role','thinking'}`, the same text without the marker → content present. A 13,691-char
+   turn carrying a full 40-item menu scored as an empty episode.
+3. **The two checkpoints disagree about `prefix=`.** The SFT tokenizer (re-saved by a newer
+   transformers at train time) REQUIRES it; the base gemma-4-E4B-it tokenizer is legacy
+   `response_schema` and REJECTS it — with a ValueError, not a TypeError. Fixing (1) fixed SFT
+   and broke base.
+4. **`--gemma-max-tokens`**: the 4096 default truncates this student mid-answer
+   (`finish_reason=length`), which also yields empty content. Real, but NOT the main cause —
+   diagnosed first and fixed nothing on its own. The budget is now recorded in every report.
+
+Infra bugs worth remembering: **nginx ships on :8001 in the RunPod pytorch image**, so vLLM
+died with `Address already in use` while `curl -sf /v1/models` reported the port HEALTHY (nginx
+answers 200 with HTML on any path) — a status-only health check would have run 500 base
+episodes against a web server. Health checks now assert `"object": "list"`. Also: HF's Xet CDN
+500'd mid-download (`us.aws.cdn.hf.co/xorbs/…`), fixed with `HF_TOKEN` + `HF_HUB_DISABLE_XET=1`
+and a retry loop; and `RUN_SET` derived from `date` rolled over UTC midnight mid-run, which
+would have split the reference and the candidates into two directories that never join.
+
+**The generalizable rule: an empty final answer is a PARSING hypothesis before it is a model
+hypothesis.** Three of the four bugs above were in code that discards the model's output.
+`run_episode` now falls back to the raw turn whenever a tool-call-free turn yields no content,
+so a parser quirk can never again masquerade as non-termination.
+
+**Artifacts:** `results/eval500-20260808/{teacher-qwen3-235b,gemma-sft,gemma-base}.json` +
+`README.md` (committed); 1,500 candidate traces + the reports at
+`s3://restaurant-menu-corpus/v2/eval/eval500-20260808/`; the 500 eval reference traces are in
+`v2/corpus.sqlite`. W&B project `menu-eval` (runs `teacher-qwen3-235b`, `gemma-sft`, `gemma-base`).
+
+---
+
 ## 2026-08-06 — GRPO cache warm COMPLETE (902/902), after a wedged renderer + two self-inflicted hangs
 
 The big `--modes both` GRPO warm finished: **all 902 `grpo`-split restaurants fully

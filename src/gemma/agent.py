@@ -22,8 +22,12 @@ from pathlib import Path
 # file is run directly or imported by run_agent.py.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-import torch  # noqa: E402
-
+# torch is imported LAZILY, inside the HF-generate branch of generate_turn -- it is
+# the only thing here that needs it (one torch.no_grad()). The vLLM path is
+# tokenizer-only by design (model may be None; see CLAUDE.md "vLLM serving"), so a
+# module-scope import would force a ~2.5 GB CUDA torch into serving-only environments
+# that never load HF weights -- and did: it crashed the pod's eval client venv with
+# ModuleNotFoundError before episode 1.
 from prompts import BUDGET_FINALIZE_INSTRUCTION, SYSTEM_PROMPT  # noqa: E402
 
 MAX_TOOL_CALLS = 8          # tool-call budget per episode (matches claude_agent.py)
@@ -38,8 +42,83 @@ def build_messages(restaurant_name: str, system_prompt: str = SYSTEM_PROMPT) -> 
     ]
 
 
+def render_prompt(tokenizer, messages: list[dict], tools: list) -> str:
+    """The exact prompt string a turn is generated from.
+
+    Shared by generate_turn (the vLLM path sends this string) and parse_turn (newer
+    transformers needs it as `prefix=`), so the text we generate from and the text we
+    parse against can never drift.
+    """
+    return tokenizer.apply_chat_template(
+        messages, tools=tools, add_generation_prompt=True,
+        enable_thinking=True, tokenize=False,
+    )
+
+
+END_OF_TURN = "<turn|>"   # Gemma 4's end-of-turn marker
+
+
+def strip_end_of_turn(text: str) -> str:
+    """Drop a trailing `<turn|>` (end-of-turn), leaving any other marker alone.
+
+    MUST NOT touch `<tool_call|>`: the vLLM path deliberately re-appends that one so
+    parse_response sees a complete tool call.
+    """
+    stripped = text.rstrip()
+    if stripped.endswith(END_OF_TURN):
+        return stripped[: -len(END_OF_TURN)].rstrip()
+    return text
+
+
+def parse_turn(tokenizer, text: str, prefix: str) -> dict:
+    """tokenizer.parse_response, across the transformers versions we run on.
+
+    transformers >=5.11 requires `prefix=` (the prompt that preceded generation) for
+    new-style response templates, because the template pre-writes part of the
+    assistant message that the parser must see. Without it, it raises -- and since
+    run_episode treats a parse failure as "the model emitted garbage", EVERY turn
+    fell into the recovery path: the model burned its whole tool budget being told
+    its (perfectly valid) tool calls were unparseable, then returned "". That is
+    indistinguishable from the v1 non-termination failure, which is exactly how it
+    nearly got misread as a broken checkpoint. transformers 5.10 (the repo pin) has
+    no `prefix` kwarg at all, hence the TypeError fallback.
+
+    The trailing `<turn|>` is stripped first. Measured on transformers 5.14.1 with
+    the Gemma-4 tokenizer, a final answer parses to content ONLY when the end-of-turn
+    marker is absent:
+
+        'think<channel|>{"found":true}<turn|>'  -> {'role','thinking'}            content LOST
+        'think<channel|>{"found":true}'         -> {'role','thinking','content'}  content OK
+
+    The model emits `<turn|>` correctly (it is terminating properly) and vLLM returns
+    it, so every completed answer came back as content='' -- an empty final answer,
+    indistinguishable from the model never answering at all.
+
+    The prefix kwarg cuts BOTH ways, and the two checkpoints we serve disagree:
+
+      * SFT (tokenizer re-saved by a newer transformers at train time) -> NEW-style
+        `response_template`, which REQUIRES prefix.
+      * base gemma-4-E4B-it -> LEGACY `response_schema`, which REJECTS it with
+        `ValueError: prefix= is only supported with new-style response_template
+        specs`.
+
+    So try with, then without. Only a prefix-related ValueError is retried -- a
+    genuine parse failure (malformed tool-call arguments) must still propagate, since
+    run_episode's recovery path depends on it.
+    """
+    text = strip_end_of_turn(text)
+    try:
+        return tokenizer.parse_response(text, prefix=prefix)
+    except TypeError:
+        return tokenizer.parse_response(text)          # transformers 5.10: no kwarg
+    except ValueError as exc:
+        if "prefix" not in str(exc):
+            raise
+        return tokenizer.parse_response(text)          # legacy response_schema
+
+
 def generate_turn(model, tokenizer, messages: list[dict], tools: list,
-                  vllm_generate=None) -> str:
+                  vllm_generate=None, prompt: str | None = None) -> str:
     """Render `messages`, generate one model turn, return the decoded text.
 
     Keeps special tokens (skip_special_tokens=False) so parse_response can see
@@ -54,11 +133,10 @@ def generate_turn(model, tokenizer, messages: list[dict], tools: list,
     text that still ENDS with that marker so parse_response sees a complete call.
     """
     if vllm_generate is not None:
-        prompt = tokenizer.apply_chat_template(
-            messages, tools=tools, add_generation_prompt=True,
-            enable_thinking=True, tokenize=False,
-        )
-        return vllm_generate(prompt)
+        return vllm_generate(prompt if prompt is not None
+                             else render_prompt(tokenizer, messages, tools))
+
+    import torch  # local HF generate path only -- see the note at the imports
 
     inputs = tokenizer.apply_chat_template(
         messages,
@@ -124,9 +202,14 @@ def run_episode(
                 "tool_responses": [{"name": name, "response": BUDGET_FINALIZE_INSTRUCTION}],
             })
 
-        text = generate_turn(model, tokenizer, messages, tools, vllm_generate=vllm_generate)
+        # Render ONCE and reuse: the string we generate from is exactly the `prefix`
+        # the parser needs (see parse_turn), so they cannot drift apart.
+        prompt = render_prompt(tokenizer, messages, tools)
+        text = generate_turn(model, tokenizer, messages, tools,
+                             vllm_generate=vllm_generate, prompt=prompt)
         try:
-            parsed = tokenizer.parse_response(text)  # {role, [thinking], content?, tool_calls?}
+            # {role, [thinking], content?, tool_calls?}
+            parsed = parse_turn(tokenizer, text, prompt)
         except (ValueError, TypeError) as e:
             # Gemma's parser raises when a tool call's JSON arguments are
             # malformed - e.g. the model degenerated into a recursive/truncated
@@ -162,7 +245,14 @@ def run_episode(
         tool_calls = parsed.get("tool_calls")
 
         if not tool_calls:
-            return (parsed.get("content") or "").strip()  # final answer
+            # Final answer. If the parser surfaced no content, fall back to the RAW
+            # turn rather than returning "": a turn with no tool call is the model's
+            # answer, so throwing it away turns any parser/template quirk into a
+            # phantom "empty output" (exactly what a `<turn|>`-terminated answer did).
+            # Downstream schema.extract_json pulls the JSON out of surrounding prose,
+            # so handing it the raw text costs nothing when the parse was fine.
+            content = (parsed.get("content") or "").strip()
+            return content or strip_end_of_turn(text).strip()
 
         if out_of_budget:
             # Model tried to call a tool with no budget left (despite the finalize
