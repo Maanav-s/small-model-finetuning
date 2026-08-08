@@ -65,7 +65,16 @@ TEACHER_TP="${TEACHER_TP:-4}"
 GEMMA_MAX_LEN="${GEMMA_MAX_LEN:-98304}"       # v1 precedent: 500/500 episodes, 0 context-400s
 GEMMA_UTIL="${GEMMA_UTIL:-0.85}"
 
-RUN_SET="${RUN_SET:-eval${LIMIT}-$(date +%Y%m%d)}"
+# RUN_SET is STICKY: computed once, then persisted. Deriving it from `date` on every
+# invocation splits a single run-set across two directories the moment a phase runs
+# after UTC midnight -- the teacher's reference would sit in one dir and the students'
+# candidates in another, and they would never join. Explicit $RUN_SET always wins.
+RUN_SET_FILE="${RUN_SET_FILE:-$WORK/run_set.txt}"
+if [ -z "${RUN_SET:-}" ] && [ -f "$RUN_SET_FILE" ]; then
+  RUN_SET="$(cat "$RUN_SET_FILE")"
+fi
+RUN_SET="${RUN_SET:-eval${LIMIT}-$(date -u +%Y%m%d)}"
+mkdir -p "$(dirname "$RUN_SET_FILE")" && echo "$RUN_SET" > "$RUN_SET_FILE"
 EVAL_DIR="$REPO/data/eval/$RUN_SET"           # candidates + reports -> S3 (data/eval is a synced dir)
 RESULTS="$REPO/results/$RUN_SET"              # the small report JSONs -> committed to the repo
 export WANDB_PROJECT="${WANDB_PROJECT:-menu-eval}"
