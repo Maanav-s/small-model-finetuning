@@ -93,12 +93,28 @@ def parse_turn(tokenizer, text: str, prefix: str) -> dict:
     The model emits `<turn|>` correctly (it is terminating properly) and vLLM returns
     it, so every completed answer came back as content='' -- an empty final answer,
     indistinguishable from the model never answering at all.
+
+    The prefix kwarg cuts BOTH ways, and the two checkpoints we serve disagree:
+
+      * SFT (tokenizer re-saved by a newer transformers at train time) -> NEW-style
+        `response_template`, which REQUIRES prefix.
+      * base gemma-4-E4B-it -> LEGACY `response_schema`, which REJECTS it with
+        `ValueError: prefix= is only supported with new-style response_template
+        specs`.
+
+    So try with, then without. Only a prefix-related ValueError is retried -- a
+    genuine parse failure (malformed tool-call arguments) must still propagate, since
+    run_episode's recovery path depends on it.
     """
     text = strip_end_of_turn(text)
     try:
         return tokenizer.parse_response(text, prefix=prefix)
     except TypeError:
-        return tokenizer.parse_response(text)
+        return tokenizer.parse_response(text)          # transformers 5.10: no kwarg
+    except ValueError as exc:
+        if "prefix" not in str(exc):
+            raise
+        return tokenizer.parse_response(text)          # legacy response_schema
 
 
 def generate_turn(model, tokenizer, messages: list[dict], tools: list,

@@ -83,6 +83,34 @@ class TestParseTurn:
         parsed = ag.parse_turn(tok, f"r<channel|>{ANSWER}<turn|>", prefix="P")
         assert parsed.get("content") == ANSWER
 
+    def test_falls_back_for_a_legacy_template_that_rejects_prefix(self):
+        """The BASE checkpoint's tokenizer is legacy `response_schema` and REJECTS
+        prefix -- with a ValueError, not a TypeError. The SFT checkpoint's requires
+        it. One code path has to serve both."""
+
+        class LegacyTokenizer(FakeTokenizer):
+            def parse_response(self, text, prefix=None):
+                if prefix is not None:
+                    raise ValueError("`prefix=` is only supported with new-style "
+                                     "`response_template` specs, not legacy "
+                                     "`response_schema`.")
+                return super().parse_response(text, prefix=None)
+
+        tok = LegacyTokenizer(requires_prefix=False)
+        parsed = ag.parse_turn(tok, f"r<channel|>{ANSWER}<turn|>", prefix="P")
+        assert parsed.get("content") == ANSWER
+
+    def test_a_real_parse_failure_still_propagates(self):
+        """Malformed tool-call arguments must keep raising: run_episode's recovery
+        path is built on that. Only prefix-related ValueErrors get retried."""
+
+        class BrokenTokenizer(FakeTokenizer):
+            def parse_response(self, text, prefix=None):
+                raise ValueError("Invalid JSON in tool call arguments")
+
+        with pytest.raises(ValueError, match="Invalid JSON"):
+            ag.parse_turn(BrokenTokenizer(), "garbage", prefix="P")
+
 
 class TestRunEpisodeFinalAnswer:
     def _run(self, tok, raw_turn):
