@@ -1,0 +1,31 @@
+{
+  "os": "Windows-11-10.0.26200-SP0",
+  "python": "CPython 3.13.5",
+  "startedAt": "2026-08-08T00:56:04.263652Z",
+  "args": [
+    "--teacher",
+    "vllm",
+    "--teacher-model",
+    "teacher",
+    "--db",
+    "C:\\Users\\Maanav\\AppData\\Local\\Temp\\pytest-of-Maanav\\pytest-95\\test_off_by_default_never_push0\\corpus.sqlite",
+    "--cache-path",
+    "C:\\Users\\Maanav\\AppData\\Local\\Temp\\pytest-of-Maanav\\pytest-95\\test_off_by_default_never_push0\\cache.sqlite",
+    "--conditioned-frac",
+    "0",
+    "--workers",
+    "1",
+    "--limit",
+    "3"
+  ],
+  "program": "-m pytest.__main__",
+  "git": {
+    "remote": "https://github.com/Maanav-s/small-model-finetuning.git",
+    "commit": "aaa56347e79e64a1577f1eff2e4e95b0ec45305e"
+  },
+  "email": "ms96977@my.utexas.edu",
+  "root": "C:\\Users\\Maanav\\OneDrive\\Documents\\GitHub\\small-model-finetuning",
+  "host": "MaanavLaptop",
+  "executable": "C:\\Users\\Maanav\\OneDrive\\Documents\\GitHub\\small-model-finetuning\\.venv\\Scripts\\python.exe",
+  "writerId": "w3jrhx4egfegcklocwsnj5zzsz9v8zsj"
+}

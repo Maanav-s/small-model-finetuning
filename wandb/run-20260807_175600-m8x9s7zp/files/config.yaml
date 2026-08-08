@@ -1,0 +1,90 @@
+_wandb:
+    value:
+        cli_version: 0.28.1
+        e:
+            rhfn4qqcqgvju3wk2u56zfwn2l28bo8f:
+                args:
+                    - --teacher
+                    - vllm
+                    - --teacher-model
+                    - teacher
+                    - --db
+                    - C:\Users\Maanav\AppData\Local\Temp\pytest-of-Maanav\pytest-95\test_unhandled_crash_cancels_t0\corpus.sqlite
+                    - --cache-path
+                    - C:\Users\Maanav\AppData\Local\Temp\pytest-of-Maanav\pytest-95\test_unhandled_crash_cancels_t0\cache.sqlite
+                    - --limit
+                    - "60"
+                    - --conditioned-frac
+                    - "0"
+                    - --workers
+                    - "2"
+                cpu_count: 16
+                cpu_count_logical: 16
+                cudaVersion: "13.2"
+                disk:
+                    /:
+                        total: "995465621504"
+                        used: "373509906432"
+                email: ms96977@my.utexas.edu
+                executable: C:\Users\Maanav\OneDrive\Documents\GitHub\small-model-finetuning\.venv\Scripts\python.exe
+                git:
+                    commit: aaa56347e79e64a1577f1eff2e4e95b0ec45305e
+                    remote: https://github.com/Maanav-s/small-model-finetuning.git
+                gpu: NVIDIA GeForce RTX 4050 Laptop GPU
+                gpu_count: 1
+                gpu_nvidia:
+                    - architecture: Ada
+                      cudaCores: 2560
+                      memoryTotal: "6439305216"
+                      name: NVIDIA GeForce RTX 4050 Laptop GPU
+                      uuid: GPU-83b0aef2-5d81-b9df-db53-cbb201e1c0fb
+                host: MaanavLaptop
+                memory:
+                    total: "33777467392"
+                os: Windows-11-10.0.26200-SP0
+                program: -m pytest.__main__
+                python: CPython 3.13.5
+                root: C:\Users\Maanav\OneDrive\Documents\GitHub\small-model-finetuning
+                startedAt: "2026-08-08T00:56:00.914192Z"
+                writerId: rhfn4qqcqgvju3wk2u56zfwn2l28bo8f
+        m: []
+        python_version: 3.13.5
+        t:
+            "1":
+                - 97
+            "2":
+                - 97
+            "3":
+                - 2
+                - 16
+                - 24
+                - 61
+                - 62
+            "4": 3.13.5
+            "5": 0.28.1
+            "8":
+                - 3
+            "12": 0.28.1
+            "13": windows-amd64
+cache_policy:
+    value: live
+conditioned_frac:
+    value: 0
+limit:
+    value: 60
+max_tool_chars:
+    value: 24000
+n_todo:
+    value: 60
+prompt_variant:
+    value: teacher
+seed:
+    value: 42
+split:
+    value: sft
+teacher:
+    value: vllm
+teacher_model:
+    value: teacher
+workers:
+    value: 2

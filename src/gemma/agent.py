@@ -22,8 +22,12 @@ from pathlib import Path
 # file is run directly or imported by run_agent.py.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-import torch  # noqa: E402
-
+# torch is imported LAZILY, inside the HF-generate branch of generate_turn -- it is
+# the only thing here that needs it (one torch.no_grad()). The vLLM path is
+# tokenizer-only by design (model may be None; see CLAUDE.md "vLLM serving"), so a
+# module-scope import would force a ~2.5 GB CUDA torch into serving-only environments
+# that never load HF weights -- and did: it crashed the pod's eval client venv with
+# ModuleNotFoundError before episode 1.
 from prompts import BUDGET_FINALIZE_INSTRUCTION, SYSTEM_PROMPT  # noqa: E402
 
 MAX_TOOL_CALLS = 8          # tool-call budget per episode (matches claude_agent.py)
@@ -59,6 +63,8 @@ def generate_turn(model, tokenizer, messages: list[dict], tools: list,
             enable_thinking=True, tokenize=False,
         )
         return vllm_generate(prompt)
+
+    import torch  # local HF generate path only -- see the note at the imports
 
     inputs = tokenizer.apply_chat_template(
         messages,
