@@ -168,6 +168,14 @@ def parse_args(argv=None):
                         help="gemma: serve the student via a vLLM /v1/completions server at this URL "
                              "(fast + concurrent) instead of loading HF weights locally. Renders with "
                              "our own template/parser (agent.generate_turn's vLLM path).")
+    parser.add_argument("--gemma-max-tokens", type=int, default=4096,
+                        help="gemma via vLLM: per-turn generation budget (default 4096). "
+                             "This is a CEILING ON THE ANSWER, not a safety knob: the "
+                             "student emits reasoning AND the full menu JSON in one turn, "
+                             "so a 40-item menu behind a long think can hit the cap and "
+                             "return finish_reason='length' with EMPTY content -- which "
+                             "scores identically to non-termination. Raise it for models "
+                             "that think long; it is recorded in the report either way.")
     parser.add_argument("--adapter-path", default=None,
                         help="gemma: load a LoRA adapter dir on top of the (4-bit) base model, "
                              "instead of a fully-merged --model-path checkpoint. Evaluates the "
@@ -315,6 +323,7 @@ def init_wandb(args, n_todo: int):
                 "conditioned_frac": args.conditioned_frac, "workers": args.workers,
                 "cache_policy": args.cache_policy, "cache_path": args.cache_path,
                 "prompt_variant": "student", "n_todo": n_todo,
+                "gemma_max_tokens": args.gemma_max_tokens,
                 "checkpoint_run_id": lineage["run_id"], "checkpoint_md5": lineage["md5"],
             },
         )
@@ -436,7 +445,7 @@ def build_runner(args, label):
         # openai_agent.build_gemma_completions.
         vllm_generate = build_gemma_completions(
             build_client(args.gemma_vllm_base_url), args.served_model_name or "gemma-menu",
-            tokenizer=tokenizer,
+            max_tokens=args.gemma_max_tokens, tokenizer=tokenizer,
         )
 
         def runner(episode_input, tools, registry, system_prompt):
@@ -807,6 +816,7 @@ def run_paired(args, reference, candidate_dir):
         "checkpoint": checkpoint_lineage(args),
         "split": args.split, "seed": args.seed, "conditioned_frac": args.conditioned_frac,
         "corpus": str(args.corpus), "cache_policy": args.cache_policy,
+        "gemma_max_tokens": args.gemma_max_tokens,
         "candidate_dir": str(candidate_dir), "n_reference_traces": len(reference),
         "aggregate": {"all": agg_all, "free": agg_free, "conditioned": agg_cond},
         "abstention": abstention,
@@ -848,6 +858,7 @@ def run_self_report(args, candidate_dir):
         "checkpoint": checkpoint_lineage(args),
         "split": args.split, "candidate_dir": str(candidate_dir),
         "corpus": str(args.corpus), "cache_policy": args.cache_policy,
+        "gemma_max_tokens": args.gemma_max_tokens,
         "aggregate": {"all": agg_all, "free": agg_free, "conditioned": agg_cond},
         "episodes": {tid: {**reports[tid], "conditioned": conditioned[tid]} for tid in reports},
         "unreadable": {"candidate": unreadable},

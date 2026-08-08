@@ -65,6 +65,10 @@ SERVED_TEACHER="${SERVED_TEACHER:-teacher}"  # ON THE WIRE: must match serve_tea
 TEACHER_TP="${TEACHER_TP:-4}"
 GEMMA_MAX_LEN="${GEMMA_MAX_LEN:-98304}"       # v1 precedent: 500/500 episodes, 0 context-400s
 GEMMA_UTIL="${GEMMA_UTIL:-0.85}"
+# Per-turn generation budget. 4096 (the eval.py default) TRUNCATES this student: it
+# emits a long think plus a 40-item menu in ONE turn, hits finish_reason=length, and
+# returns empty content -- scoring identically to non-termination.
+GEMMA_MAX_TOKENS="${GEMMA_MAX_TOKENS:-12288}"
 # Ports: NOT 8001 -- the RunPod pytorch image runs nginx there, so vLLM dies with
 # `[Errno 98] Address already in use` while nginx keeps answering 200 on /v1/models.
 GEMMA_BASE_PORT="${GEMMA_BASE_PORT:-8011}"
@@ -299,7 +303,7 @@ phase_smoke_gemma() {
         --served-model-name gemma-menu --model-path "$ckpt" \
         --limit 2 --conditioned-frac 0.5 --seed "$SEED" \
         --cache-policy live --cache-path "$REPO/data/cache.sqlite" \
-        --workers 2 --no-wandb --self-report 2>&1 | tail -12; then
+        --workers 2 --gemma-max-tokens "$GEMMA_MAX_TOKENS" --no-wandb --self-report 2>&1 | tail -12; then
       local n_ok
       n_ok=$(grep -c '"schema_valid": true' "$WORK/smoke-$name"/*.json 2>/dev/null || echo 0)
       echo "[smoke] $name wrote $(ls "$WORK/smoke-$name" 2>/dev/null | wc -l) candidates, $n_ok schema-valid"
@@ -324,6 +328,7 @@ phase_run_gemma() {
       --served-model-name gemma-menu --model-path "$WORK/base-text" \
       --limit "$LIMIT" --conditioned-frac "$COND" --seed "$SEED" \
       --cache-policy live --cache-path "$WORK/cache-base.sqlite" --workers "$WORKERS" \
+      --gemma-max-tokens "$GEMMA_MAX_TOKENS" \
       --wandb-name "gemma-base" \
       --json "$EVAL_DIR/reports/gemma-base.json" > "$WORK/eval-base.log" 2>&1 &
   local pid_base=$!
@@ -332,6 +337,7 @@ phase_run_gemma() {
       --served-model-name gemma-menu --model-path "$WORK/sft-text" \
       --limit "$LIMIT" --conditioned-frac "$COND" --seed "$SEED" \
       --cache-policy live --cache-path "$WORK/cache-sft.sqlite" --workers "$WORKERS" \
+      --gemma-max-tokens "$GEMMA_MAX_TOKENS" \
       --wandb-name "gemma-sft" \
       --json "$EVAL_DIR/reports/gemma-sft.json" > "$WORK/eval-sft.log" 2>&1 &
   local pid_sft=$!
