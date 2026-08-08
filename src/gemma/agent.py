@@ -42,8 +42,40 @@ def build_messages(restaurant_name: str, system_prompt: str = SYSTEM_PROMPT) -> 
     ]
 
 
+def render_prompt(tokenizer, messages: list[dict], tools: list) -> str:
+    """The exact prompt string a turn is generated from.
+
+    Shared by generate_turn (the vLLM path sends this string) and parse_turn (newer
+    transformers needs it as `prefix=`), so the text we generate from and the text we
+    parse against can never drift.
+    """
+    return tokenizer.apply_chat_template(
+        messages, tools=tools, add_generation_prompt=True,
+        enable_thinking=True, tokenize=False,
+    )
+
+
+def parse_turn(tokenizer, text: str, prefix: str) -> dict:
+    """tokenizer.parse_response, across the transformers versions we run on.
+
+    transformers >=5.11 requires `prefix=` (the prompt that preceded generation) for
+    new-style response templates, because the template pre-writes part of the
+    assistant message that the parser must see. Without it, it raises -- and since
+    run_episode treats a parse failure as "the model emitted garbage", EVERY turn
+    fell into the recovery path: the model burned its whole tool budget being told
+    its (perfectly valid) tool calls were unparseable, then returned "". That is
+    indistinguishable from the v1 non-termination failure, which is exactly how it
+    nearly got misread as a broken checkpoint. transformers 5.10 (the repo pin) has
+    no `prefix` kwarg at all, hence the TypeError fallback.
+    """
+    try:
+        return tokenizer.parse_response(text, prefix=prefix)
+    except TypeError:
+        return tokenizer.parse_response(text)
+
+
 def generate_turn(model, tokenizer, messages: list[dict], tools: list,
-                  vllm_generate=None) -> str:
+                  vllm_generate=None, prompt: str | None = None) -> str:
     """Render `messages`, generate one model turn, return the decoded text.
 
     Keeps special tokens (skip_special_tokens=False) so parse_response can see
@@ -58,11 +90,8 @@ def generate_turn(model, tokenizer, messages: list[dict], tools: list,
     text that still ENDS with that marker so parse_response sees a complete call.
     """
     if vllm_generate is not None:
-        prompt = tokenizer.apply_chat_template(
-            messages, tools=tools, add_generation_prompt=True,
-            enable_thinking=True, tokenize=False,
-        )
-        return vllm_generate(prompt)
+        return vllm_generate(prompt if prompt is not None
+                             else render_prompt(tokenizer, messages, tools))
 
     import torch  # local HF generate path only -- see the note at the imports
 
@@ -130,9 +159,14 @@ def run_episode(
                 "tool_responses": [{"name": name, "response": BUDGET_FINALIZE_INSTRUCTION}],
             })
 
-        text = generate_turn(model, tokenizer, messages, tools, vllm_generate=vllm_generate)
+        # Render ONCE and reuse: the string we generate from is exactly the `prefix`
+        # the parser needs (see parse_turn), so they cannot drift apart.
+        prompt = render_prompt(tokenizer, messages, tools)
+        text = generate_turn(model, tokenizer, messages, tools,
+                             vllm_generate=vllm_generate, prompt=prompt)
         try:
-            parsed = tokenizer.parse_response(text)  # {role, [thinking], content?, tool_calls?}
+            # {role, [thinking], content?, tool_calls?}
+            parsed = parse_turn(tokenizer, text, prompt)
         except (ValueError, TypeError) as e:
             # Gemma's parser raises when a tool call's JSON arguments are
             # malformed - e.g. the model degenerated into a recursive/truncated
