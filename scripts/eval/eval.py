@@ -155,7 +155,15 @@ def parse_args(argv=None):
                         help="vllm: OpenAI-compatible base URL of the vLLM server")
     parser.add_argument("--served-model-name", default=None,
                         help="vllm: served model name on the vLLM server (--served-model-name at "
-                             "serve time). Also the Gemma completions model when --gemma-vllm-base-url is set.")
+                             "serve time). Also the Gemma completions model when --gemma-vllm-base-url is set. "
+                             "This goes ON THE WIRE -- it must match what the server serves, or every "
+                             "request 404s. Use --model-label to control the reported name instead.")
+    parser.add_argument("--model-label", default=None,
+                        help="override the `model` label stamped into candidate traces and the "
+                             "report, WITHOUT changing the name sent to the server. Serving names "
+                             "are deliberately short ('teacher', 'gemma-menu'); the thing you want "
+                             "in a results table is the real checkpoint id "
+                             "(e.g. 'Qwen/Qwen3-235B-A22B-Instruct-2507-FP8').")
     parser.add_argument("--gemma-vllm-base-url", default=None,
                         help="gemma: serve the student via a vLLM /v1/completions server at this URL "
                              "(fast + concurrent) instead of loading HF weights locally. Renders with "
@@ -216,7 +224,14 @@ def parse_args(argv=None):
 
 
 def model_label(args) -> str:
-    """The `model` field stamped into each candidate trace (checkpoint or base id)."""
+    """The `model` field stamped into each candidate trace (checkpoint or base id).
+
+    REPORTING only -- never sent to a server. --model-label wins when set, so a run
+    can be labelled with the real checkpoint id while still addressing the server by
+    the short name it actually serves (mixing the two 404s every request).
+    """
+    if args.model_label:
+        return args.model_label
     if args.model == "gemma":
         return args.model_path or GEMMA_MODEL_ID
     if args.model == "vllm":

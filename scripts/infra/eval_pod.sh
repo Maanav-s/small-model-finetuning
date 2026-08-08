@@ -57,7 +57,10 @@ COND="${COND:-0.4}"
 SEED="${SEED:-42}"
 WORKERS="${WORKERS:-16}"
 
-TEACHER_HF="${TEACHER_HF:-Qwen/Qwen3-235B-A22B-Instruct-2507-FP8}"
+TEACHER_HF="${TEACHER_HF:-Qwen/Qwen3-235B-A22B-Instruct-2507-FP8}"   # reporting label
+SERVED_TEACHER="${SERVED_TEACHER:-teacher}"  # ON THE WIRE: must match serve_teacher.sh's
+                                             # SERVED_NAME default and build_corpus's
+                                             # --teacher-model below, or requests 404
 TEACHER_TP="${TEACHER_TP:-4}"
 GEMMA_MAX_LEN="${GEMMA_MAX_LEN:-98304}"       # v1 precedent: 500/500 episodes, 0 context-400s
 GEMMA_UTIL="${GEMMA_UTIL:-0.85}"
@@ -191,15 +194,18 @@ phase_run_teacher() {
   WANDB_NAME="teacher-reference-build" \
   "$PY" scripts/corpus/build_corpus.py \
       --split "$SPLIT" --limit "$LIMIT" --conditioned-frac "$COND" --seed "$SEED" \
-      --teacher vllm --teacher-base-url http://localhost:8000/v1 --teacher-model teacher \
+      --teacher vllm --teacher-base-url http://localhost:8000/v1 --teacher-model "$SERVED_TEACHER" \
       --workers "$WORKERS" --cache-policy live --sync-every 25
 
   log "export the teacher's traces as candidate files (no inference)"
   "$PY" scripts/eval/dump_reference.py "$EVAL_DIR/candidates/teacher"
 
   log "score the teacher through the SAME scorer (self-report -- it IS the reference)"
+  # --served-model-name is what goes ON THE WIRE (must be 'teacher', what the server
+  # serves); --model-label is what lands in the report. Conflating them 404s any
+  # episode this pass has to re-run because build_corpus failed it.
   "$PY" scripts/eval/eval.py "$EVAL_DIR/candidates/teacher" \
-      --model vllm --served-model-name "$TEACHER_HF" --self-report \
+      --model vllm --served-model-name "$SERVED_TEACHER" --model-label "$TEACHER_HF" --self-report \
       --limit "$LIMIT" --conditioned-frac "$COND" --seed "$SEED" \
       --cache-policy live --wandb-name "teacher-qwen3-235b" \
       --json "$EVAL_DIR/reports/teacher-qwen3-235b.json"
