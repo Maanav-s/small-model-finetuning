@@ -13,6 +13,67 @@ Conventions:
 
 ---
 
+## 2026-08-08 — GRPO launch debugging: TRL's parse loses Gemma finals (bug #11) + the real backward memory model
+
+Standing up the real GRPO run (1×H200 SECURE $4.59/hr, pod `p0lbxgcnvn06vi`) surfaced one
+silent showstopper and one wrong memory estimate. Both are now fixed on `main`
+(`2165be0`, `547ee2d`); the epoch run launched clean afterwards.
+
+**Bug #11 — every reward 0, gradient 0, no error anywhere.** The canned 2-step smoke and the
+first live steps both logged `rewards/*/mean = 0, reward_std = 0, frac_reward_zero_std = 1,
+grad_norm = 0` while `tools/call_frequency` was healthy (12–27) and TRL's completion table
+visibly showed menu JSON. Dumping the actual reward inputs (a `REWARD_DEBUG_DUMP` probe in
+`_resolve`, 1-step live run) showed **16/16 final assistant messages arrived with
+`content=''`** — the JSON was gone before the reward ever saw it. Root cause chain:
+
+- TRL ≥1.9 parses each generated segment into messages with `tokenizer.parse_response(ids,
+  prefix=...)` (grpo_trainer.py ~2125) instead of handing the reward raw text.
+- For a FRESH single turn that parse is correct (verified directly on the pod: thinking split
+  out, content intact, `<turn|>` or not — the eval harness's `<turn|>` bug is NOT this).
+- What breaks is the MID-EPISODE shape: Gemma bundles tool calls + tool responses INSIDE one
+  assistant turn, so the final answer is a **turn continuation** whose prefix (built by token
+  concatenation, ending `<tool_response|>`, no fresh `<|turn>model` anchor) plus a **second
+  thought span** confuses the streaming response parser (`transformers/utils/chat_parsing`) —
+  content is dropped or truncated (observed both `''` and 201/244-char mid-word cuts).
+- The smoke's zeros had looked explainable as the documented canned+8192 pathology
+  (sentinel-junk evidence → thrash → budget clipping), which is REAL but was masking bug #11:
+  the live run at 16384 with `clipped_ratio 0.31` and 68% clean terminations still scored
+  all-zero. **Lesson: "all rewards zero" has more than one sufficient cause — keep digging
+  until the observed zeros are OVER-determined, not just explained once.**
+
+**Fix (`547ee2d`):** `make_grpo_rewards(tokenizer=...)` now decodes the `completion_ids`
+kwarg TRL always passes and reads the rollout off the RAW wire text itself: evidence = the
+`<|tool_response>` spans, final answer = the tail after the last tool span with tool-call and
+thought spans stripped (both can carry braces; `extract_json` decodes from the first `{`).
+Priority stays: explicit `final_json`/`evidence` kwargs → raw ids → TRL-parsed messages.
+Validated on-pod (1 live step): structure 0→**1.0**, found 0.25, grounding +0.08,
+grad_norm 0→**0.054**, `clipped_ratio 0` at 16384. Five unit tests pin the wire path
+(grounded / hallucinated / clipped-thought / dangling-call / no-tokenizer).
+
+**Bug #10.5 — the fp32-logits estimate missed the retained graph (2 OOMs).** CLAUDE.md's
+"bs=1 @ 24K ≈ 25 GB logits" counts ONE tensor; the loss chain retains ~3.5× that (bf16
+logits ~12 GB → `.float()` 24 GB → log-softmax 24 GB, then a 24 GB grad buffer in
+`backward()`). At `max_completion_length=24576` that is ~85 GB of logits-chain memory —
+over 141 GB with policy (15) + vLLM colocate share, at ANY `vllm_gpu_memory_utilization`
+(shrinking vLLM 0.30→0.20 just let the retained chain grow 10 GB further before the same
+24 GB ask failed: 125→135 GiB in use). **Diagnostic that settled it: the OOM stack is in
+`accelerator.backward()`, and "in use" GREW when vLLM shrank.** Fix: 16384 + util 0.18 →
+peak ~114 GB, fits with ~25 GB headroom. 16384 is not binding so far (`clipped_ratio 0`
+on validation; watch it on the epoch).
+
+**Also fixed pre-launch (`2165be0`): the ToolFailureAbort callback watched a metric TRL
+never logs** (`tools/failure_rate`; the real name is `tools/failure_frequency` on 1.5.1
+through 1.9.2) — the dead-browser abort could never have fired. Same 0.8 threshold carries
+over (it is failures/calls in [0,1]).
+
+**Run config that launched:** 902 prompts (541 free + 361 conditioned @ 0.4, seed 42), G=8,
+`max_completion_length` 16384, bs=1 × accum 16 (effective 16 → 2 prompts/step, ~451
+steps/epoch), lr 1e-6, beta 0, temp 1.0, `--cache-policy live` over the fully-warmed grpo
+split, vLLM colocate util 0.18, W&B project `menu-grpo`, checkpoints → S3
+`v2/models/gemma-4-e4b-it/grpo/gemma-menu-grpo/` every 10 min. Step-time datapoints so far:
+417 s (first pass, cache-warming the student's explorations) → 103 s (validation step over
+the now-warm cache).
+
 ## 2026-08-08 — FIRST three-model v2 eval: teacher vs SFT student vs untrained base (n=500 each)
 
 The first run where all three models are scored on the **same seeded plan** (`--split eval
