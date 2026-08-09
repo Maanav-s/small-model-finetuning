@@ -35,6 +35,7 @@ BRANCH="${BRANCH:-grpo-run2}"
 WORK="${WORK:-/workspace}"
 VENV="${VENV:-/opt/grpo}"
 PY="$VENV/bin/python"
+AWS="$VENV/bin/aws"          # awscli is pip-installed into $VENV (no apt candidate on this image)
 
 S3_MODELS="s3://${S3_BUCKET:-restaurant-menu-corpus}/${S3_PREFIX:-v2}/models/gemma-4-e4b-it"
 KV_DIR="$WORK/kv"                # ONLY the 54 kv-shared tensors (105 MB), not the 16 GB base
@@ -79,7 +80,9 @@ phase_setup() {
   [ -n "${WANDB_API_KEY:-}" ] || echo "[warn] WANDB_API_KEY unset -- console-only logging"
 
   log "system packages"
-  apt-get update -qq && apt-get install -y -qq tmux git curl awscli
+  # NOT awscli from apt: the runpod/pytorch ubuntu2404 image has no candidate for it.
+  # It goes into $VENV via pip below, and every call here uses $AWS, never a bare `aws`.
+  apt-get update -qq && apt-get install -y -qq tmux git curl
 
   log "repo @ $BRANCH"
   [ -d "$REPO/.git" ] || git clone "$REPO_URL" "$REPO"
@@ -106,7 +109,7 @@ phase_setup() {
   "$VENV/bin/pip" install -q "trl>=1.5.1" "peft>=0.19.1" "accelerate>=1.13.0" \
       "bitsandbytes>=0.49.2" jmespath datasets wandb boto3
   "$VENV/bin/pip" install -q requests python-dotenv playwright markdownify beautifulsoup4 \
-      jsonschema jinja2
+      jsonschema jinja2 awscli
   "$VENV/bin/playwright" install --with-deps chromium
   "$PY" -c "import torch,vllm,trl,peft,transformers as t; \
       print('torch',torch.__version__,'vllm',vllm.__version__,'trl',trl.__version__, \
@@ -135,8 +138,8 @@ phase_prep_model() {
   mkdir -p "$KV_DIR" "$MERGED"
   # NOT the 16 GB base: to_text_only's backfill just globs *.safetensors in --base, and
   # the 54 tensors it needs are pre-extracted into base/kv-backfill/.
-  aws s3 sync "$S3_MODELS/base/kv-backfill/" "$KV_DIR/"
-  aws s3 sync "$S3_MODELS/sft/gemma-menu-sft/merged/" "$MERGED/"
+  "$AWS" s3 sync "$S3_MODELS/base/kv-backfill/" "$KV_DIR/"
+  "$AWS" s3 sync "$S3_MODELS/sft/gemma-menu-sft/merged/" "$MERGED/"
   du -sh "$KV_DIR" "$MERGED"
 
   log "merged -> merged-text (text-only Gemma4ForCausalLM + the 54 backfilled KV tensors)"
@@ -176,7 +179,7 @@ phase_smoke() {
 phase_pusher() {
   while true; do
     sleep 600
-    aws s3 sync "$OUT/" "$S3_MODELS/grpo/$RUN_NAME/" \
+    "$AWS" s3 sync "$OUT/" "$S3_MODELS/grpo/$RUN_NAME/" \
         --exclude "*/optimizer.pt" --exclude "*/rng_state*" --quiet || true
   done
 }
@@ -218,7 +221,7 @@ phase_norms() {
 phase_finish() {
   cd "$REPO"
   log "final push: adapter + the cache the rollouts warmed"
-  aws s3 sync "$OUT/" "$S3_MODELS/grpo/$RUN_NAME/" --exclude "*/optimizer.pt" --exclude "*/rng_state*"
+  "$AWS" s3 sync "$OUT/" "$S3_MODELS/grpo/$RUN_NAME/" --exclude "*/optimizer.pt" --exclude "*/rng_state*"
   "$PY" scripts/infra/corpus_sync.py push --only cache.sqlite
   echo "finish OK -- safe to destroy the pod"
 }
