@@ -138,8 +138,8 @@ phase_prep_model() {
   mkdir -p "$KV_DIR" "$MERGED"
   # NOT the 16 GB base: to_text_only's backfill just globs *.safetensors in --base, and
   # the 54 tensors it needs are pre-extracted into base/kv-backfill/.
-  "$AWS" s3 sync "$S3_MODELS/base/kv-backfill/" "$KV_DIR/"
-  "$AWS" s3 sync "$S3_MODELS/sft/gemma-menu-sft/merged/" "$MERGED/"
+  "$AWS" s3 sync --no-progress "$S3_MODELS/base/kv-backfill/" "$KV_DIR/"
+  "$AWS" s3 sync --no-progress "$S3_MODELS/sft/gemma-menu-sft/merged/" "$MERGED/"
   du -sh "$KV_DIR" "$MERGED"
 
   log "merged -> merged-text (text-only Gemma4ForCausalLM + the 54 backfilled KV tensors)"
@@ -179,7 +179,7 @@ phase_smoke() {
 phase_pusher() {
   while true; do
     sleep 600
-    "$AWS" s3 sync "$OUT/" "$S3_MODELS/grpo/$RUN_NAME/" \
+    "$AWS" s3 sync --no-progress "$OUT/" "$S3_MODELS/grpo/$RUN_NAME/" \
         --exclude "*/optimizer.pt" --exclude "*/rng_state*" --quiet || true
   done
 }
@@ -221,7 +221,7 @@ phase_norms() {
 phase_finish() {
   cd "$REPO"
   log "final push: adapter + the cache the rollouts warmed"
-  "$AWS" s3 sync "$OUT/" "$S3_MODELS/grpo/$RUN_NAME/" --exclude "*/optimizer.pt" --exclude "*/rng_state*"
+  "$AWS" s3 sync --no-progress "$OUT/" "$S3_MODELS/grpo/$RUN_NAME/" --exclude "*/optimizer.pt" --exclude "*/rng_state*"
   "$PY" scripts/infra/corpus_sync.py push --only cache.sqlite
   echo "finish OK -- safe to destroy the pod"
 }
