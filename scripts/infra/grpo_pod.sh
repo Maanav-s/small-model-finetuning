@@ -128,6 +128,32 @@ phase_setup() {
       print('torch',torch.__version__,'vllm',vllm.__version__,'trl',trl.__version__, \
             'peft',peft.__version__,'transformers',t.__version__)"
 
+  # ---- Blackwell only: make the pip CUDA toolchain self-consistent -------------
+  # On sm_100 vLLM picks the FlashInfer attention backend, and its trtllm-gen FMHA
+  # module is NOT in the flashinfer-cubin wheel -- it is JIT-compiled on first use, so
+  # the toolchain has to actually work. Out of the box it does not, and it fails THREE
+  # times in a row, each one only visible after the previous is fixed (measured
+  # 2026-08-09 on a B200; each failure surfaced ~4 min in, after the 15 GB policy load):
+  #   1. nvcc 13.2 against nvidia-cuda-runtime 13.0 headers ->
+  #      cccl: "CUDA compiler and CUDA toolkit headers are incompatible"
+  #   2. nvvm still 13.2 -> emits PTX ISA 9.2, ptxas 13.0 rejects it:
+  #      "Unsupported .version 9.2; current version is '9.0'"
+  #   3. the link step passes -L$CUDA_HOME/lib64 and -lcudart, but the wheel ships
+  #      lib/ (not lib64/) and only libcudart.so.13 (no unversioned .so) -> ld: cannot
+  #      find -lcudart
+  # Pinning the whole nvcc set DOWN to 13.0 (rather than the runtime UP) keeps torch
+  # linked against the libcudart it was built for. Harmless on Hopper, which serves
+  # Gemma-4 on FA4 and never compiles any of this.
+  if [ -d "$CUDA_HOME" ]; then
+    log "CUDA toolchain consistency (Blackwell JIT path)"
+    "$VENV/bin/pip" install -q "nvidia-cuda-nvcc==13.0.88" "nvidia-nvvm==13.0.88" \
+        "nvidia-cuda-crt==13.0.88"
+    [ -e "$CUDA_HOME/lib/libcudart.so" ] || ln -s libcudart.so.13 "$CUDA_HOME/lib/libcudart.so"
+    mkdir -p "$CUDA_HOME/lib/stubs"
+    [ -e "$CUDA_HOME/lib64" ] || ln -s lib "$CUDA_HOME/lib64"
+    "$CUDA_HOME/bin/nvcc" --version | tail -1
+  fi
+
   log "pull the corpus + the fully-warmed cache from S3 (228 MB cache -- the grpo split is 100% covered)"
   "$PY" scripts/infra/corpus_sync.py pull --only corpus.sqlite --only cache.sqlite --only grpo
 
