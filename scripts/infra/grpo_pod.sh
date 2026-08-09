@@ -207,7 +207,7 @@ phase_smoke() {
       --max-steps 2 --limit 8 --cache-policy canned \
       --output-dir "$WORK/grpo-smoke" --report-to none
   log "smoke checkpoint movement (||B|| should be nonzero after 2 steps at lr $LR)"
-  "$PY" scripts/analysis/adapter_norms.py "$WORK/grpo-smoke" 2>/dev/null || \
+  "$PY" scripts/analysis/adapter_norms.py "$WORK/grpo-smoke/adapter" 2>/dev/null || \
     echo "(no adapter saved at 2 steps -- fine; the gate is that the loop ran)"
   echo "smoke OK -- 'train' is the expensive one"
 }
@@ -229,7 +229,14 @@ phase_train() {
   log "GRPO: G=$G len=$MAXLEN bs=$BS x accum=$ACCUM lr=$LR temp=$TEMP tools=$TOOL_CALLS/$TOOL_CHARS"
   mkdir -p "$OUT"
   tmux kill-session -t grpo 2>/dev/null || true
-  tmux new-session -d -s grpo "cd $REPO && $PY scripts/train/train_grpo.py \
+  # REDIRECT, do not `| tee` into the tmux pane. TRL prints a rich table of sampled
+  # completions every logging step; piping that through tee to a pane whose fd wandb's
+  # console_capture has left non-blocking kills the run outright -- measured 2026-08-09,
+  # the first attempt died 11 min in, one step from its first checkpoint, with
+  # `BlockingIOError: [Errno 11] write could not complete without blocking` raised
+  # inside rich's _write_buffer. TERM=dumb also stops rich from drawing box art into
+  # what is now a plain file.
+  TERM=dumb tmux new-session -d -s grpo "cd $REPO && TERM=dumb $PY scripts/train/train_grpo.py \
       --data data/grpo/train.jsonl --model-path '$MERGED_TEXT' \
       --starting-checkpoint gemma-menu-sft \
       --use-vllm --vllm-mode colocate --vllm-gpu-memory-utilization $VLLM_UTIL \
@@ -240,7 +247,7 @@ phase_train() {
       --cache-policy live --cache-path data/cache.sqlite \
       --save-steps $SAVE_STEPS --max-steps $MAX_STEPS \
       --output-dir '$OUT' --run-id '$RUN_NAME' --run-name '$RUN_NAME' --report-to wandb \
-      2>&1 | tee '$LOG'"
+      > '$LOG' 2>&1"
   tmux new-session -d -s push "bash $REPO/scripts/infra/grpo_pod.sh pusher"
   echo "launched. tmux sessions: grpo (training), push (S3 every 10 min)"
   echo "  bash scripts/infra/grpo_pod.sh watch"
