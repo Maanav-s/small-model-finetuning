@@ -37,6 +37,19 @@ VENV="${VENV:-/opt/grpo}"
 PY="$VENV/bin/python"
 AWS="$VENV/bin/aws"          # awscli is pip-installed into $VENV (no apt candidate on this image)
 
+# THE VENV'S bin/ MUST BE ON PATH, and it is not enough to call $VENV/bin/python by
+# absolute path -- that does not activate the venv. vLLM JIT-compiles attention kernels
+# and shells out to `ninja` BY NAME, so the engine dies LATE (after the 15 GB policy
+# load and the vLLM weight load) with a bare `FileNotFoundError: 'ninja'` even though
+# ninja is installed right next to the vllm binary. CLAUDE.md documents this for
+# Ampere/TRITON_ATTN; measured 2026-08-09 it bites on Blackwell too, via a different
+# JIT -- flashinfer's trtllm_gen_fmha module (jit/cpp_ext.py run_ninja).
+# nvcc comes from the pip nvidia-cu13 wheel, not the image (which ships only CUDA 12.8),
+# so CUDA_HOME has to point INTO site-packages or flashinfer's JIT finds the wrong one.
+CUDA_HOME="${CUDA_HOME:-$VENV/lib/python3.12/site-packages/nvidia/cu13}"
+export CUDA_HOME
+export PATH="$VENV/bin:$CUDA_HOME/bin:$PATH"
+
 S3_MODELS="s3://${S3_BUCKET:-restaurant-menu-corpus}/${S3_PREFIX:-v2}/models/gemma-4-e4b-it"
 KV_DIR="$WORK/kv"                # ONLY the 54 kv-shared tensors (105 MB), not the 16 GB base
 MERGED="$WORK/merged"            # the SFT student, merged bf16
