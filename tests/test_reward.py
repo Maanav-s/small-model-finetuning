@@ -310,3 +310,108 @@ def test_no_tokenizer_keeps_legacy_paths():
     structure = funcs[0]
     completions = [[{"role": "assistant", "content": json.dumps(menu(*REAL))}]]
     assert structure(completions, completion_ids=[[1, 2, 3]]) == [1.0]
+
+
+# ---------------------------------------------------------------------------
+# Budget-truncation neutralization (the Path-A fix). A rollout TRL cut off at
+# max_completion_length scores 0 on every term through no fault of its own, and
+# those zeros land on the rollouts that explored the most -- so within a group
+# they hand positive advantage to the sibling that answered after one scrape.
+# Truncated samples are re-scored to their group's terminated mean, which leaves
+# the group mean unchanged (=> ~zero advantage for them, none for the siblings).
+# ---------------------------------------------------------------------------
+class FakeStopTokenizer(FakeWireTokenizer):
+    """Wire tokenizer that also exposes stop ids, mirroring the REAL requirement
+    that eos be Gemma's turn terminator: here the wire ends with '<turn|>', so the
+    final char '>' plays the role of <turn|> (106) and 0 plays <pad>."""
+
+    eos_token_id = ord(">")
+    pad_token_id = 0
+
+
+TRUNCATED_WIRE = WIRE_EPISODE[: WIRE_EPISODE.index('{"found"') + 20]  # cut mid-JSON
+
+
+def _kw(*wires):
+    return {"completion_ids": [wire(w) for w in wires]}
+
+
+def test_truncated_detection_matches_trl_last_token_test():
+    assert WIRE_EPISODE.endswith("<turn|>")     # terminated: last char is the stop id
+    assert not TRUNCATED_WIRE.endswith(">")     # truncated: cut mid-token-stream
+
+
+def test_truncated_rollout_takes_group_mean_not_zero():
+    funcs, _ = make_grpo_rewards(tokenizer=FakeStopTokenizer(), num_generations=4)
+    structure = funcs[0]
+    comps = [[{"role": "assistant", "content": ""}]] * 4
+    # 3 terminated + 1 truncated: the truncated one must not score the 0.0 floor
+    out = structure(comps, **_kw(WIRE_EPISODE, WIRE_EPISODE, WIRE_EPISODE, TRUNCATED_WIRE))
+    assert out == [1.0, 1.0, 1.0, 1.0]
+    # and the group mean is unchanged vs. the terminated siblings alone
+    assert sum(out) / len(out) == pytest.approx(1.0)
+
+
+def test_neutralization_preserves_group_mean_with_mixed_scores():
+    funcs, _ = make_grpo_rewards(tokenizer=FakeStopTokenizer(), num_generations=4)
+    grounding = funcs[2]
+    comps = [[{"role": "assistant", "content": ""}]] * 4
+    out = grounding(comps, **_kw(WIRE_EPISODE, WIRE_EPISODE, WIRE_EPISODE, TRUNCATED_WIRE))
+    terminated = out[:3]
+    assert out[3] == pytest.approx(sum(terminated) / len(terminated))
+
+
+def test_fully_truncated_group_is_left_alone():
+    """All-truncated => scores already equal => zero advantage anyway. Rewriting
+    them would be a no-op, and there is no terminated sibling to average."""
+    funcs, _ = make_grpo_rewards(tokenizer=FakeStopTokenizer(), num_generations=2)
+    structure = funcs[0]
+    comps = [[{"role": "assistant", "content": ""}]] * 2
+    assert structure(comps, **_kw(TRUNCATED_WIRE, TRUNCATED_WIRE)) == [0.0, 0.0]
+
+
+def test_neutralization_off_by_flag_and_without_num_generations():
+    comps = [[{"role": "assistant", "content": ""}]] * 2
+    kw = _kw(WIRE_EPISODE, TRUNCATED_WIRE)
+    off, _ = make_grpo_rewards(tokenizer=FakeStopTokenizer(), num_generations=2,
+                               neutralize_truncated=False)
+    assert off[0](comps, **kw) == [1.0, 0.0]
+    no_g, _ = make_grpo_rewards(tokenizer=FakeStopTokenizer())  # group size unknown
+    assert no_g[0](comps, **kw) == [1.0, 0.0]
+
+
+def test_tokenizer_without_stop_ids_does_not_neutralize():
+    """FakeWireTokenizer has no eos/pad -> we cannot tell truncated from terminated,
+    so scores must pass through untouched rather than be silently rewritten."""
+    funcs, _ = make_grpo_rewards(tokenizer=FakeWireTokenizer(), num_generations=2)
+    comps = [[{"role": "assistant", "content": ""}]] * 2
+    assert funcs[0](comps, **_kw(WIRE_EPISODE, TRUNCATED_WIRE)) == [1.0, 0.0]
+
+
+# Path A: TRL rolled back an overflowing tool result and dropped the sample, so the
+# rollout ends CLEANLY on its own tool call with no answer. It is invisible to TRL's
+# last-token truncation test (and so to mask_truncated_completions) -- 22.9% of the
+# 2026-08-08 run's rollouts, mean advantage -0.239. The reward must still treat it as
+# a budget abort, not as a policy failure.
+DANGLING_WIRE = (
+    WIRE_EPISODE.split("<|tool_response>response:scrape_url")[0] + "<turn|>"
+)
+
+
+def test_dangling_tool_call_is_detected_though_it_ends_on_a_stop_token():
+    assert DANGLING_WIRE.endswith("<turn|>")  # terminates cleanly: TRL sees no truncation
+    funcs, _ = make_grpo_rewards(tokenizer=FakeStopTokenizer(), num_generations=2)
+    structure = funcs[0]
+    comps = [[{"role": "assistant", "content": ""}]] * 2
+    # paired with a clean sibling: the aborted one takes the sibling's score, not 0.0
+    assert structure(comps, **_kw(WIRE_EPISODE, DANGLING_WIRE)) == [1.0, 1.0]
+
+
+def test_dangling_detection_requires_a_missing_answer():
+    """A rollout that called tools AND then answered is not a budget abort, even
+    though tool-call spans appear earlier in its wire text."""
+    funcs, _ = make_grpo_rewards(tokenizer=FakeStopTokenizer(), num_generations=2)
+    grounding = funcs[2]
+    comps = [[{"role": "assistant", "content": ""}]] * 2
+    out = grounding(comps, **_kw(WIRE_EPISODE, WIRE_EPISODE))
+    assert out[0] == out[1] and out[0] > 0  # untouched, both scored on their merits

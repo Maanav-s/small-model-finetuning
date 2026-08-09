@@ -55,6 +55,7 @@ import argparse
 import json
 import os
 import re
+import statistics
 import sys
 from pathlib import Path
 
@@ -129,6 +130,60 @@ def load_policy_model(model_path: str | None, attn: str = "sdpa"):
 
 
 # ---------------------------------------------------------------------------
+# LoRA movement (live "is the policy actually changing?" metric)
+# ---------------------------------------------------------------------------
+# PEFT initializes lora_B to EXACTLY ZERO, so ||B|| is a direct odometer on training.
+# The 2026-08-08 run only revealed its problem post-hoc, by pulling the adapter out of
+# S3 (scripts/analysis/adapter_norms.py): 100 steps at lr 1e-6 moved median ||B|| to
+# 0.0026 against the v2 SFT adapter's 0.41 -- 159x smaller, i.e. the policy was still
+# ~its starting checkpoint, which is why reward was flat. That is knowable at step 20,
+# not step 100, so it belongs on the live curve.
+SFT_REFERENCE_B_NORM = 0.41  # v2 SFT adapter, same r=16/alpha=32, 258 modules
+
+
+def lora_movement(model, scaling: float) -> dict[str, float]:
+    """{metric: value} describing how far the LoRA has moved from its init.
+
+    ||dW||_F is computed WITHOUT forming dW: with B (out x r) and A (r x in),
+        ||B @ A||_F^2 = trace(A^T B^T B A) = trace((B^T B)(A A^T)) = sum(G_B * G_A)
+    where both Gram matrices are only r x r. Forming dW would be a full
+    out x in matrix per module (~134 MB fp32 for one Gemma MLP projection); this is
+    two small matmuls instead, cheap enough to run every step.
+    """
+    import torch
+
+    a_by, b_by = {}, {}
+    for name, p in model.named_parameters():
+        if ".lora_A" in name:
+            a_by[name.replace(".lora_A", ".*")] = p
+        elif ".lora_B" in name:
+            b_by[name.replace(".lora_B", ".*")] = p
+
+    b_norms, dw_norms = [], []
+    with torch.no_grad():
+        for key, b in b_by.items():
+            a = a_by.get(key)
+            if a is None:
+                continue
+            bf, af = b.detach().float(), a.detach().float()
+            b_norms.append(bf.norm().item())
+            g_b = bf.T @ bf                      # (r, r)
+            g_a = af @ af.T                      # (r, r)
+            dw_norms.append(scaling * (g_b * g_a).sum().clamp(min=0).sqrt().item())
+    if not b_norms:
+        return {}
+    med = statistics.median(b_norms)
+    return {
+        "lora/b_norm_median": med,
+        "lora/b_norm_max": max(b_norms),
+        "lora/delta_w_norm_median": statistics.median(dw_norms),
+        # >= ~0.05 means movement on the order of a real fine-tune; the flat 2026-08-08
+        # run sat at 0.006 for its whole length.
+        "lora/b_norm_vs_sft": med / SFT_REFERENCE_B_NORM,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Args
 # ---------------------------------------------------------------------------
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -155,12 +210,52 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-completion-length", type=int, default=8192,
                    help="cap on the rollout completion (incl. tool responses). Long scraped pages "
                         "make this memory-heavy -- keep small for smoke; raise on H200 for real runs.")
-    p.add_argument("--temperature", type=float, default=1.0, help="rollout sampling temperature (GRPO needs >0 for diversity)")
+    p.add_argument("--temperature", type=float, default=1.2,
+                   help="rollout sampling temperature. Above 1.0 on purpose: the 2026-08-08 run "
+                        "logged mean token entropy of 0.06 at temperature 1.0 -- a near-"
+                        "deterministic policy, so the G samples in a group barely differ and the "
+                        "reward spread within a group comes from environment luck rather than "
+                        "policy variation. Watch `entropy` (should rise) against "
+                        "`tools/failure_frequency` (malformed tool-call args if pushed too far).")
     p.add_argument("--top-p", type=float, default=1.0)
     p.add_argument("--beta", type=float, default=0.0, help="KL coeff to the ref model (0 = no KL, common for GRPO)")
-    p.add_argument("--max-tool-calls", type=int, default=8, help="tool-call budget per rollout (TRL max_tool_calls)")
+    p.add_argument("--max-tool-calls", type=int, default=6,
+                   help="tool-call ITERATIONS per rollout (TRL max_tool_calling_iterations). "
+                        "NOT the number of calls: Gemma emits several calls per turn, so the "
+                        "2026-08-08 run averaged 15.5 calls (median 12, max 88) under a limit of "
+                        "8 -- vs the teacher's 4.8 -- and that tool-output volume, not the "
+                        "budget size, is what exhausted the completion window.")
+    p.add_argument("--max-tool-chars", type=int, default=None,
+                   help="read-time cap on each tool result (default: tools.GRPO_TOOL_CHARS = "
+                        "16000, below the 24000 eval/corpus default). Tool text is appended INTO "
+                        "the completion, so this competes directly with --max-completion-length. "
+                        "Re-scoring the teacher corpus: 16000 keeps 94.3% of grounded items, "
+                        "8000 keeps only 75% -- long pages are long because they carry menu.")
+    # --- budget-truncation handling (both halves of the Path-A fix; see reward.py) ---
+    p.add_argument("--mask-truncated-completions", action="store_true",
+                   help="also drop budget-truncated rollouts' TOKENS from the loss (TRL/DAPO). "
+                        "Usually redundant: --neutralize-truncated already gives them exactly "
+                        "zero advantage, and TRL's masking only sees rollouts cut mid-stream, "
+                        "not the dangling-tool-call abort (reward.py Path A).")
+    p.add_argument("--no-neutralize-truncated", dest="neutralize_truncated",
+                   action="store_false",
+                   help="let truncated rollouts' 0.0 rewards enter their group's mean/std. "
+                        "Default is to replace them with the group's terminated mean, so they "
+                        "don't hand positive advantage to the sibling that answered early.")
+    p.add_argument("--use-liger-kernel", action="store_true",
+                   help="fused Liger GRPO loss: computes the loss from hidden states + lm_head "
+                        "in chunks instead of materializing the bs x len x 262144 logits tensor "
+                        "(the term that caps --max-completion-length at 16384 on an H200). "
+                        "Needs `pip install liger-kernel` in the GRPO env; validate with a smoke "
+                        "before a real run -- Gemma 4 coverage in Liger is unverified here.")
     # optimization
-    p.add_argument("--learning-rate", type=float, default=1e-6)
+    p.add_argument("--learning-rate", type=float, default=1e-5,
+                   help="1e-5, NOT TRL's 1e-6 default -- that default is for FULL fine-tuning; "
+                        "only the low-rank factors move here. Measured 2026-08-09 on the "
+                        "2026-08-08 run (100 steps @ 1e-6): median LoRA ||B|| reached 0.0026 "
+                        "vs 0.41 for the v2 SFT adapter at the same r/alpha -- 159x smaller, "
+                        "i.e. the policy was still ~its starting checkpoint, which is why the "
+                        "reward curve was flat. Check with scripts/analysis/adapter_norms.py.")
     p.add_argument("--per-device-train-batch-size", type=int, default=None,
                    help="(prompt,completion) pairs per device; defaults to --num-generations "
                         "(1 prompt/device/step). Must be a multiple of --num-generations.")
@@ -289,7 +384,12 @@ def main() -> None:
     print(f"  temperature/top_p:     {args.temperature}/{args.top_p}   beta(KL): {args.beta}")
     print(f"  generation backend:    {'vLLM (' + args.vllm_mode + ')' if args.use_vllm else 'transformers'}")
     print(f"  tools:                 web_search/scrape_url, cache={args.cache_policy}@{args.cache_path}")
-    print(f"  max_tool_calls:        {args.max_tool_calls}")
+    print(f"  max_tool_calls:        {args.max_tool_calls} iterations "
+          f"(Gemma emits several CALLS per iteration)")
+    print(f"  max_tool_chars:        {args.max_tool_chars or 16000} "
+          f"(eval/corpus use 24000; lower here -- tool text eats the completion budget)")
+    print(f"  truncated rollouts:    mask={args.mask_truncated_completions} "
+          f"neutralize={args.neutralize_truncated}   liger={args.use_liger_kernel}")
     print(f"  lr / epochs / steps:   {args.learning_rate} / {args.num_train_epochs} / {args.max_steps}")
     print(f"  output-dir:            {args.output_dir}")
 
@@ -346,6 +446,31 @@ def main() -> None:
                       f"for the steps already trained is still saved.", flush=True)
                 control.should_training_stop = True
 
+    # Feed lora_movement() into TRL's own metrics dict rather than calling wandb
+    # directly: GRPOTrainer.log() averages self._metrics[mode] and merges it into `logs`
+    # BEFORE dispatching to the reporters (grpo_trainer.py ~2648), so one append reaches
+    # wandb, the console, AND trainer_state.json -- the last of which is what made the
+    # 2026-08-08 post-mortem possible at all. Mutating `logs` from a callback's on_log
+    # would NOT work: Trainer puts the reporting callbacks BEFORE user-supplied ones, so
+    # wandb has already logged by the time ours runs.
+    class LoraNormLogger(TrainerCallback):
+        def __init__(self, scaling: float):
+            self.scaling = scaling
+            self.trainer = None  # set after the trainer exists (chicken-and-egg)
+
+        def on_step_end(self, args_, state, control, model=None, **kwargs):
+            if self.trainer is None or model is None:
+                return
+            try:
+                stats = lora_movement(model, self.scaling)
+            except Exception as e:  # never let a diagnostic kill a 15-hour run
+                print(f"  [warn] lora_movement failed at step {state.global_step}: {e}",
+                      flush=True)
+                return
+            metrics = self.trainer._metrics["train"]
+            for k, v in stats.items():
+                metrics[k].append(v)
+
     # Fail before the (expensive, GPU-holding) model load, not on rollout 1: under a
     # live/error cache policy the rollouts scrape through the local browser, and a
     # browser that cannot launch would turn every tool result into an infra sentinel
@@ -362,16 +487,45 @@ def main() -> None:
     # one-at-a-time and only asyncio.gather's coroutines, so sync tools serialize every
     # live scrape across the whole generation batch (measured >40 min/step, GPU at 0%).
     # See tools._to_async.
+    from tools import GRPO_TOOL_CHARS
+
+    max_tool_chars = args.max_tool_chars or GRPO_TOOL_CHARS
     tools, _registry, _sys_prompt = setup_tools(dietary_restrictions=None, variant="student",
-                                                cache=cache, async_tools=True)
+                                                cache=cache, async_tools=True,
+                                                max_tool_chars=max_tool_chars)
     tokenizer = AutoTokenizer.from_pretrained(args.model_path or MODEL_ID)
+
+    # ---- Do NOT "fix" eos to <turn|> here. It looks wrong on paper and is right in
+    # practice (checked against the 2026-08-08 run's logs, 2026-08-09).
+    # The paper argument: TRL detects truncation as `ids[-1] not in [tokenizer.eos_token_id,
+    # pad_token_id]` (grpo_trainer.py 1785/1921), tokenizer.eos_token_id is 1 (<eos>) while
+    # generation_config.eos_token_id is [1, 106, 50] and a Gemma TURN ends on 106 (<turn|>) --
+    # which would flag every rollout truncated. It does not: under vLLM the rollouts end on
+    # <eos>, and the run's own metrics prove the detector discriminates --
+    # completions/clipped_ratio ranged 0.00-0.69 (mean 0.299) and tracked the independently
+    # measured rate of answers cut mid-text (29.3% of 1680 logged completions), while
+    # completions/mean_terminated_length stayed real (586-8074, never its zeros(1) fallback).
+    # Setting eos to <turn|> would INVERT this: the ~71% of rollouts ending on <eos> would all
+    # be flagged truncated, and with masking on that zeroes most of the batch.
+    # Watch clipped_ratio: pinned at ~1.0 with mean_terminated_length at 0 is the signature
+    # that this assumption has broken (e.g. a checkpoint whose generation_config differs).
+    print(f"  eos/pad token ids:     {tokenizer.eos_token_id}/{tokenizer.pad_token_id} "
+          f"(TRL's truncation test; watch completions/clipped_ratio for ~1.0)")
     # REBUILD the rewards with the tokenizer -- NOT optional for Gemma. TRL's
     # mid-episode parse_response loses the final answer's content (bundled tool
     # turns + a second thought span defeat the streaming parser; measured
     # 2026-08-08: 16/16 finals parsed to content='' -> every reward 0, zero
     # gradient). With the tokenizer, the reward decodes TRL's completion_ids kwarg
     # itself and reads menu + evidence off the raw wire text (reward.py path 2).
-    reward_funcs, reward_weights = make_grpo_rewards(tokenizer=tokenizer)
+    # num_generations lets the reward neutralize budget-truncated rollouts against
+    # their group (see reward.make_grpo_rewards) -- the half of the Path-A fix that
+    # mask_truncated_completions cannot do, since TRL computes advantages over the
+    # RAW group rewards before any masking.
+    reward_funcs, reward_weights = make_grpo_rewards(
+        tokenizer=tokenizer,
+        num_generations=args.num_generations,
+        neutralize_truncated=args.neutralize_truncated,
+    )
 
     # Load the policy BEFORE building the LoRA config: how we scope LoRA depends on the
     # checkpoint's actual module tree, so inspect it rather than assume.
@@ -407,6 +561,8 @@ def main() -> None:
         top_p=args.top_p,
         beta=args.beta,
         max_tool_calling_iterations=args.max_tool_calls,
+        mask_truncated_completions=args.mask_truncated_completions,
+        use_liger_kernel=args.use_liger_kernel,
         reward_weights=reward_weights,
         learning_rate=args.learning_rate,
         num_train_epochs=args.num_train_epochs,
@@ -430,6 +586,7 @@ def main() -> None:
         vllm_server_base_url=args.vllm_server_base_url,
     )
 
+    lora_logger = LoraNormLogger(scaling=args.lora_alpha / args.lora_r)
     trainer = GRPOTrainer(
         model=model,
         reward_funcs=reward_funcs,
@@ -438,8 +595,9 @@ def main() -> None:
         tools=tools,
         peft_config=lora_config,
         processing_class=tokenizer,
-        callbacks=[ToolFailureAbort()],
+        callbacks=[ToolFailureAbort(), lora_logger],
     )
+    lora_logger.trainer = trainer  # _metrics only exists once the trainer is built
     trainer.train()
 
     adapter_dir = os.path.join(args.output_dir, "adapter")
@@ -473,6 +631,10 @@ def main() -> None:
                 "temperature": args.temperature,
                 "top_p": args.top_p,
                 "max_tool_calls": args.max_tool_calls,
+                "max_tool_chars": max_tool_chars,
+                "mask_truncated_completions": args.mask_truncated_completions,
+                "neutralize_truncated": args.neutralize_truncated,
+                "use_liger_kernel": args.use_liger_kernel,
                 "per_device_train_batch_size": per_device_bs,
                 "gradient_accumulation_steps": args.gradient_accumulation_steps,
                 "seed": args.seed,

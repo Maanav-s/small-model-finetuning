@@ -76,3 +76,50 @@ def test_async_tools_actually_run_concurrently():
         return time.time() - t0
 
     assert asyncio.run(_four()) < 0.9  # generous vs the ~1.2s serial floor
+
+
+# ---------------------------------------------------------------------------
+# The read-time result cap is PER-CALLER (tools.GRPO_TOOL_CHARS = 16000 for RL
+# rollouts, MAX_TOOL_CHARS = 24000 everywhere else). Tool results are appended into
+# the GRPO completion, so this cap competes with --max-completion-length; eval and
+# corpus builds must keep the 24000 they were all measured at.
+# ---------------------------------------------------------------------------
+def test_cap_defaults_to_max_tool_chars():
+    from tools import MAX_TOOL_CHARS
+
+    def search(q):
+        return "x" * (MAX_TOOL_CHARS + 5000)
+
+    def scrape(url, mode="direct"):
+        return "y" * (MAX_TOOL_CHARS + 5000)
+
+    tools, registry = build_model_tools(search, scrape)
+    assert len(registry["web_search"](query="q")) == MAX_TOOL_CHARS
+    assert len(registry["scrape_url"](url="u")) == MAX_TOOL_CHARS
+
+
+def test_cap_is_overridable_per_caller():
+    from tools import GRPO_TOOL_CHARS
+
+    def search(q):
+        return "x" * 100_000
+
+    def scrape(url, mode="direct"):
+        return "y" * 100_000
+
+    _tools, registry = build_model_tools(search, scrape, max_tool_chars=GRPO_TOOL_CHARS)
+    assert GRPO_TOOL_CHARS == 16000
+    assert len(registry["web_search"](query="q")) == GRPO_TOOL_CHARS
+    assert len(registry["scrape_url"](url="u")) == GRPO_TOOL_CHARS
+
+
+def test_under_cap_results_pass_through_unchanged():
+    def search(q):
+        return "short result"
+
+    def scrape(url, mode="direct"):
+        return "short page"
+
+    _tools, registry = build_model_tools(search, scrape, max_tool_chars=100)
+    assert registry["web_search"](query="q") == "short result"
+    assert registry["scrape_url"](url="u") == "short page"

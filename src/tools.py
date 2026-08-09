@@ -64,15 +64,28 @@ from prompts import build_system_prompt
 MAX_TOOL_CHARS = 24000
 
 
-def _cap(text: str, label: str) -> str:
+# GRPO's cap is LOWER than the teacher's, and deliberately per-caller rather than a
+# new global (measured 2026-08-09 on the 2026-08-08 run): tool results are appended
+# INTO the completion, so at 24K chars (~6-7.3K tokens) a rollout making the student's
+# observed 15.5 tool calls blows the 16384-token completion budget long before it can
+# answer -- 22.9% of that run's rollouts ended on a dangling tool call and 29.3% were
+# cut mid-text. Lowering the cap is not free: re-scoring the teacher corpus at each cap
+# showed 16K retains 94.3% of grounded items (mean grounding term 0.725 -> 0.649) while
+# 8K retains only 75% (term 0.421), because long pages are long precisely BECAUSE they
+# carry a lot of menu. 16K is the knee. Kept per-caller so eval and corpus builds stay
+# at 24000 and remain comparable with every run measured to date.
+GRPO_TOOL_CHARS = 16000
+
+
+def _cap(text: str, label: str, max_chars: int = MAX_TOOL_CHARS) -> str:
     """Truncate an over-long tool result, warning so a clipped menu isn't silent."""
-    if len(text) > MAX_TOOL_CHARS:
+    if len(text) > max_chars:
         print(
             f"  [warn] {label} returned {len(text)} chars; truncating to "
-            f"{MAX_TOOL_CHARS} (the tail is dropped - raise MAX_TOOL_CHARS or use "
+            f"{max_chars} (the tail is dropped - raise the cap or use "
             f"a chunk/lookup tool if this clips the menu)"
         )
-        text = text[:MAX_TOOL_CHARS]
+        text = text[:max_chars]
     return text
 
 
@@ -115,7 +128,8 @@ def _to_async(fn):
     return _async_tool
 
 
-def build_model_tools(search_fn, scrape_fn, async_tools: bool = False):
+def build_model_tools(search_fn, scrape_fn, async_tools: bool = False,
+                      max_tool_chars: int = MAX_TOOL_CHARS):
     """Wrap the backend's (search_fn, scrape_fn) as the model-facing tools.
 
     Returns (tools, registry): `tools` is a list of plain functions (for
@@ -136,7 +150,7 @@ def build_model_tools(search_fn, scrape_fn, async_tools: bool = False):
             query: Search query, e.g. the restaurant name plus its city and the
                 word "menu".
         """
-        return _cap(search_fn(query), "web_search")
+        return _cap(search_fn(query), "web_search", max_tool_chars)
 
     def scrape_url(url: str, mode: str = "direct") -> str:
         """Fetch the full contents of a web page as markdown.
@@ -157,7 +171,7 @@ def build_model_tools(search_fn, scrape_fn, async_tools: bool = False):
         """
         # scrape_fn already returns slimmed markdown (build_scrape slims at the
         # source -- see backends._slim_scrape), so here we only apply the char cap.
-        return _cap(scrape_fn(url, mode), "scrape_url")
+        return _cap(scrape_fn(url, mode), "scrape_url", max_tool_chars)
 
     tools = [web_search, scrape_url]
     if async_tools:
@@ -170,7 +184,7 @@ def build_model_tools(search_fn, scrape_fn, async_tools: bool = False):
 # Setup
 # ---------------------------------------------------------------------------
 def setup_tools(dietary_restrictions=None, variant: str = "teacher", cache=None,
-                async_tools: bool = False):
+                async_tools: bool = False, max_tool_chars: int = MAX_TOOL_CHARS):
     """Build the live tools and return (tools, tool_registry, system_prompt).
 
     The tools are `web_search` (Brave; reads BRAVE_API_KEY) + `scrape_url` (local
@@ -189,6 +203,11 @@ def setup_tools(dietary_restrictions=None, variant: str = "teacher", cache=None,
     in PARALLEL rather than one-at-a-time (see _to_async -- this is the difference
     between ~40 min/step and a usable rollout rate on live tools). Only train_grpo.py
     wants this; the sync callers would get coroutines back.
+    max_tool_chars (int): read-time cap on each tool result, applied AFTER the cache
+    (so it is retunable without re-scraping). Defaults to MAX_TOOL_CHARS = 24000, the
+    teacher-reliable value every eval and corpus build to date used -- pass
+    GRPO_TOOL_CHARS (16000) for RL rollouts, where tool text competes with the
+    completion budget. See GRPO_TOOL_CHARS for the measured trade-off.
     """
     search_fn, scrape_fn = build_search(), build_scrape()
     if cache is not None:
@@ -201,7 +220,8 @@ def setup_tools(dietary_restrictions=None, variant: str = "teacher", cache=None,
             "scrape", scrape_fn, key_fn=norm_scrape, status_fn=scrape_status,
             provider="local", store_if=is_cacheable,
         )
-    tools, registry = build_model_tools(search_fn, scrape_fn, async_tools=async_tools)
+    tools, registry = build_model_tools(search_fn, scrape_fn, async_tools=async_tools,
+                                        max_tool_chars=max_tool_chars)
     cached = f", cached ({cache.miss_policy}) at {cache.path}" if cache is not None else ""
     mode = " [async: parallel tool calls]" if async_tools else ""
     print(f"Live tools: web_search via Brave, scrape_url via local Chromium{cached}{mode}")

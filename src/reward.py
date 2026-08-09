@@ -108,6 +108,14 @@ _TOOL_RESPONSE_RE = re.compile(r"<\|tool_response>(.*?)<tool_response\|>", re.DO
 _TOOL_CALL_RE = re.compile(r"<\|tool_call>.*?<tool_call\|>", re.DOTALL)
 _THOUGHT_RE = re.compile(r"<\|channel>[^\n]*\n.*?<channel\|>", re.DOTALL)
 _THOUGHT_OPEN_RE = re.compile(r"<\|channel>.*\Z", re.DOTALL)  # clipped: opener, no close
+# Path-A signature: the rollout's last content is a COMPLETE tool call (optionally
+# followed by turn/eos markers and whitespace). TRL rolled back the tool result that
+# would have overflowed the budget and dropped the sample, so the episode ends here
+# with no final answer -- while still ending on a stop token, which is why TRL's own
+# truncation test cannot see it. See _aborted_flags.
+_DANGLING_TOOL_CALL_RE = re.compile(
+    r"<\|tool_call>.*?<tool_call\|>(?:\s|<turn\|>|<eos>|<pad>)*\Z", re.DOTALL
+)
 
 
 # ---------------------------------------------------------------------------
@@ -307,7 +315,8 @@ def _evidence_from_completion(completion) -> str:
 
 
 def make_grpo_rewards(*, weights: RewardWeights = DEFAULT_WEIGHTS, include_dietary: bool = False,
-                      tokenizer=None):
+                      tokenizer=None, num_generations: int | None = None,
+                      neutralize_truncated: bool = True):
     """Build the TRL-GRPO `reward_funcs` list + matching `reward_weights`.
 
     Returns (funcs, reward_weights). Pass both to GRPOTrainer/GRPOConfig; TRL calls
@@ -322,6 +331,31 @@ def make_grpo_rewards(*, weights: RewardWeights = DEFAULT_WEIGHTS, include_dieta
       2. `tokenizer` + the `completion_ids` kwarg TRL always passes: decode the RAW
          wire text ourselves and extract answer/evidence from Gemma's markers;
       3. the TRL-parsed completion messages (string or message-list).
+
+    TRUNCATION NEUTRALIZATION (`neutralize_truncated`, needs `tokenizer` +
+    `num_generations`): a rollout the tool loop CUT OFF at max_completion_length did
+    not fail -- it was stopped by the budget. TRL rolls back the tool result that
+    would overflow and drops the sample from the loop (grpo_trainer.py ~1584), so the
+    completion ends on a dangling tool call with no final answer and every term here
+    scores exactly 0.0. That zero is not a random draw: it lands on the rollouts that
+    scraped the MOST pages, so within a group it drags the mean down and hands
+    POSITIVE advantage to the sibling that answered after one scrape -- training the
+    policy away from the persistence SFT distilled. `mask_truncated_completions=True`
+    removes such a sample's own tokens from the loss but NOT its reward from the group
+    mean/std (advantages are computed over the raw group, grpo_trainer.py ~2145), so
+    the sibling inflation survives masking. Here we close that half: a truncated
+    sample's score is replaced by the mean of its TERMINATED group siblings. Adding a
+    point equal to the mean leaves the mean unchanged and gives that sample ~zero
+    advantage, so it becomes inert rather than actively mis-teaching. (It does shrink
+    the group std slightly, mildly inflating the surviving advantages.) Groups that
+    are entirely truncated are left alone -- their scores are already equal, so the
+    advantage is zero and the group simply contributes nothing.
+
+    Truncation is detected the same way TRL detects it (last token not EOS/pad), which
+    means the tokenizer's `eos_token_id` MUST be Gemma's turn terminator `<turn|>`
+    (106), NOT `<eos>` (1) -- see train_grpo.py, which sets it. With the stock
+    tokenizer every Gemma rollout looks truncated and this would neutralize the whole
+    batch.
 
     Path 2 exists because path 3 is BROKEN for Gemma mid-episode turns (measured
     2026-08-08 on transformers 5.14.1 / TRL 1.9.2, live rollouts: 16/16 final
@@ -356,17 +390,81 @@ def make_grpo_rewards(*, weights: RewardWeights = DEFAULT_WEIGHTS, include_dieta
                 evids.append(_evidence_from_completion(c))
         return menus, evids
 
+    def _aborted_flags(menus, kwargs, n) -> list[bool] | None:
+        """Which rollouts died on the completion budget rather than on their own merits.
+
+        TWO shapes, and only the first is visible to TRL:
+          B. cut mid-stream -- the post-tool turn overshot and was sliced
+             (grpo_trainer.py ~1642), so the last token is not EOS/pad. This is
+             exactly TRL's own `completions/clipped_ratio` test.
+          A. dangling tool call -- the tool loop refused a result that would
+             overflow, rolled it back and dropped the sample (grpo_trainer.py
+             ~1584). The rollout then ENDS CLEANLY on its own tool-call tokens, so
+             its last token IS a stop token and TRL counts it as *terminated*. It
+             is invisible to clipped_ratio and to mask_truncated_completions alike
+             -- measured on the 2026-08-08 run: 22.9% of 1680 logged rollouts, mean
+             advantage -0.239, i.e. GRPO steadily punishing "called another tool".
+        Path A is detected here instead: no parseable final answer AND the raw wire
+        ends on a tool-call span. Returns None when we cannot tell (no tokenizer, no
+        completion_ids) -- callers then leave scores untouched.
+        """
+        if tokenizer is None or not neutralize_truncated:
+            return None
+        ids_list = kwargs.get("completion_ids")
+        if not ids_list or len(ids_list) < n:
+            return None
+        stop = {getattr(tokenizer, "eos_token_id", None), getattr(tokenizer, "pad_token_id", None)}
+        stop.discard(None)
+        flags = []
+        for i in range(n):
+            ids = ids_list[i]
+            cut_mid_stream = bool(stop) and bool(ids) and ids[-1] not in stop
+            dangling = False
+            if menus[i] is None and ids:
+                raw = tokenizer.decode(ids, skip_special_tokens=False)
+                dangling = bool(_DANGLING_TOOL_CALL_RE.search(raw))
+            flags.append(cut_mid_stream or dangling)
+        return flags
+
+    def _neutralize(scores: list[float], menus, kwargs) -> list[float]:
+        """Replace each budget-aborted rollout's score with its group's clean mean.
+
+        The replacement equals the mean of the clean siblings, so the group mean is
+        unchanged and the aborted sample's advantage is EXACTLY 0 -- it contributes
+        no gradient of its own and inflates no sibling's. That makes TRL's
+        `mask_truncated_completions` redundant for our purposes (and it could not
+        see Path A anyway).
+        """
+        flags = _aborted_flags(menus, kwargs, len(scores))
+        if not flags or not any(flags):
+            return scores
+        g = num_generations
+        if not g or g < 2 or len(scores) % g:
+            return scores  # can't identify group boundaries -> leave it alone
+        out = list(scores)
+        for start in range(0, len(scores), g):
+            group = range(start, start + g)
+            kept = [scores[i] for i in group if not flags[i]]
+            if not kept or len(kept) == g:
+                continue  # all truncated (already equal) or none truncated
+            mean_kept = sum(kept) / len(kept)
+            for i in group:
+                if flags[i]:
+                    out[i] = mean_kept
+        return out
+
     def structure_reward(completions, **kwargs) -> list[float]:
         menus, _ = _resolve(completions, kwargs)
-        return [structure_score(m) for m in menus]
+        return _neutralize([structure_score(m) for m in menus], menus, kwargs)
 
     def found_reward(completions, **kwargs) -> list[float]:
         menus, _ = _resolve(completions, kwargs)
-        return [found_score(m) for m in menus]
+        return _neutralize([found_score(m) for m in menus], menus, kwargs)
 
     def grounding_reward(completions, **kwargs) -> list[float]:
         menus, evids = _resolve(completions, kwargs)
-        return [grounding_score(m, e or "") for m, e in zip(menus, evids)]
+        return _neutralize([grounding_score(m, e or "") for m, e in zip(menus, evids)],
+                           menus, kwargs)
 
     funcs = [structure_reward, found_reward, grounding_reward]
     reward_weights = [weights.structure, weights.found, weights.grounding]
