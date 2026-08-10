@@ -9,7 +9,10 @@
 #   bash scripts/infra/grpo_pod.sh train       # the real run, in tmux, with a checkpoint->S3 pusher
 #   bash scripts/infra/grpo_pod.sh watch       # tail the log
 #   bash scripts/infra/grpo_pod.sh norms       # ||B|| on the latest checkpoint (the flat-curve check)
-#   bash scripts/infra/grpo_pod.sh finish      # final push of adapter + cache to S3
+#   bash scripts/infra/grpo_pod.sh prep-eval   # merge the GRPO adapter, re-backfill, + SFT text-only
+#   bash scripts/infra/grpo_pod.sh serve-eval  # GRPO on GPU0, SFT on GPU1
+#   bash scripts/infra/grpo_pod.sh run-eval    # both evals in parallel, paired vs the teacher reference
+#   bash scripts/infra/grpo_pod.sh finish      # final push of adapter + eval + cache to S3
 #
 # WHY ONE UNIFIED /opt/grpo ENV AND NOT THE eval_pod SPLIT: eval talks to a vLLM
 # *server* over HTTP, so vllm can live in its own venv. TRL's GRPO **colocate** mode
@@ -327,9 +330,140 @@ phase_norms() {
   "$PY" scripts/analysis/adapter_norms.py "$ck"
 }
 
+# ---------------------------------------------------------------------------
+# Eval: score the GRPO student against the SAME teacher reference the SFT student was
+# scored on (2026-08-08), on the SAME seeded plan, so the two rows are comparable.
+# ---------------------------------------------------------------------------
+EVAL_LIMIT="${EVAL_LIMIT:-500}"
+EVAL_COND="${EVAL_COND:-0.4}"
+EVAL_SEED="${EVAL_SEED:-42}"
+EVAL_WORKERS="${EVAL_WORKERS:-16}"
+EVAL_MAX_LEN="${EVAL_MAX_LEN:-98304}"
+EVAL_UTIL="${EVAL_UTIL:-0.85}"
+# 4096 (eval.py's default) TRUNCATES this student: it emits a long think plus a 40-item
+# menu in ONE turn, hits finish_reason=length, and returns empty -- scoring identically
+# to non-termination.
+EVAL_MAX_TOKENS="${EVAL_MAX_TOKENS:-12288}"
+# NOT 8001: the runpod image runs nginx there, which answers 200 on /v1/models while
+# vLLM dies with EADDRINUSE.
+GRPO_PORT="${GRPO_PORT:-8011}"
+SFT_PORT="${SFT_PORT:-8012}"
+EVAL_DIR="$REPO/data/eval/grpo-$RUN_NAME"
+
+is_vllm() {  # a REAL model list, not nginx's 200
+  curl -sf --max-time 10 "http://localhost:$1/v1/models" 2>/dev/null \
+    | grep -q '"object"[[:space:]]*:[[:space:]]*"list"'
+}
+
+wait_health() {  # wait_health <port> <label> [timeout_s]
+  local port="$1" label="$2" timeout="${3:-1800}" waited=0
+  echo "waiting for $label on :$port ..."
+  until is_vllm "$port"; do
+    sleep 10; waited=$((waited + 10))
+    [ "$waited" -ge "$timeout" ] && { echo "$label did not come up in ${timeout}s" >&2; exit 1; }
+    [ $((waited % 120)) -eq 0 ] && echo "  ... ${waited}s"
+  done
+  echo "$label up after ${waited}s"
+}
+
+snapshot_cache() {  # VACUUM INTO, never cp: cache.sqlite is WAL and live state spans sidecars
+  rm -f "$1"
+  "$PY" - "$REPO/data/cache.sqlite" "$1" <<'PY'
+import sqlite3, sys
+con = sqlite3.connect(sys.argv[1]); con.execute("VACUUM INTO ?", (sys.argv[2],)); con.close()
+print(f"snapshot -> {sys.argv[2]}")
+PY
+}
+
+phase_prep_eval() {
+  cd "$REPO"
+  local ck="${CKPT:-$(ls -d "$OUT"/checkpoint-* 2>/dev/null | sort -t- -k2 -n | tail -1)}"
+  [ -n "$ck" ] || { echo "no checkpoint under $OUT"; exit 1; }
+  log "merging GRPO adapter $ck into the policy it was trained on ($MERGED_TEXT)"
+  # The GRPO LoRA sits on top of merged-text (the merged SFT student), so THAT is the
+  # base to merge into -- not the raw base model, and not `merged`.
+  [ -d "$WORK/grpo-merged" ] || "$PY" - "$MERGED_TEXT" "$ck" "$WORK/grpo-merged" <<'PY'
+import sys
+import torch
+from peft import PeftModel
+from transformers import AutoModelForCausalLM, AutoTokenizer
+base_dir, adapter_dir, out = sys.argv[1], sys.argv[2], sys.argv[3]
+print(f"loading {base_dir} ...", flush=True)
+base = AutoModelForCausalLM.from_pretrained(base_dir, dtype=torch.bfloat16, low_cpu_mem_usage=True)
+merged = PeftModel.from_pretrained(base, adapter_dir).merge_and_unload()
+merged.save_pretrained(out, safe_serialization=True)
+AutoTokenizer.from_pretrained(base_dir).save_pretrained(out)
+print(f"merged -> {out}", flush=True)
+PY
+  # RE-BACKFILL. transformers never instantiates the 54 kv-shared tensors, so loading
+  # merged-text above SILENTLY DROPPED them and save_pretrained wrote a checkpoint
+  # without them -- which vLLM hard-rejects. Merging is not exempt from this.
+  log "re-backfilling the 54 kv-shared tensors (the merge dropped them)"
+  [ -f "$WORK/grpo-text/model.safetensors" ] || \
+    "$PY" scripts/train/to_text_only.py "$WORK/grpo-merged" "$WORK/grpo-text" --base "$KV_DIR"
+  # The SFT student, for a SAME-SESSION paired row: GPU1 is idle either way, and a
+  # comparison run on the same day, same cache and same plan beats quoting the
+  # 2026-08-08 numbers across a changed cache.
+  [ -f "$WORK/sft-text/model.safetensors" ] || \
+    "$PY" scripts/train/to_text_only.py "$MERGED" "$WORK/sft-text" --base "$KV_DIR"
+  du -sh "$WORK/grpo-text" "$WORK/sft-text"
+}
+
+serve_one() {  # serve_one <gpu> <ckpt> <port> <log> <label>
+  if is_vllm "$3"; then echo "$5 already on :$3 -- skipping"; return 0; fi
+  CUDA_VISIBLE_DEVICES="$1" nohup env PATH="$VENV/bin:$PATH" "$VENV/bin/vllm" serve "$2" \
+      --served-model-name gemma-menu --max-model-len "$EVAL_MAX_LEN" \
+      --gpu-memory-utilization "$EVAL_UTIL" --host 0.0.0.0 --port "$3" \
+      </dev/null > "$4" 2>&1 &
+  echo "$5 launching on GPU$1 :$3 -> $4"
+}
+
+phase_serve_eval() {
+  cd "$REPO"
+  log "serving GRPO on GPU0::$GRPO_PORT and SFT on GPU1::$SFT_PORT (merged bf16, never 4-bit)"
+  serve_one 0 "$WORK/grpo-text" "$GRPO_PORT" "$WORK/vllm-grpo.log" "gemma-grpo"
+  serve_one 1 "$WORK/sft-text"  "$SFT_PORT"  "$WORK/vllm-sft.log"  "gemma-sft"
+  wait_health "$GRPO_PORT" "gemma-grpo"
+  wait_health "$SFT_PORT" "gemma-sft"
+}
+
+phase_run_eval() {
+  cd "$REPO"
+  require_env BRAVE_API_KEY
+  mkdir -p "$EVAL_DIR/candidates" "$EVAL_DIR/reports"
+  # One snapshot per model: no write contention between the two concurrent evals, both
+  # start from byte-identical inputs, and each reports an uncontaminated hit rate.
+  snapshot_cache "$WORK/cache-grpo.sqlite"
+  snapshot_cache "$WORK/cache-sft.sqlite"
+  log "both evals in parallel, $EVAL_LIMIT episodes each, paired vs the teacher reference"
+  WANDB_NAME="gemma-grpo" "$PY" scripts/eval/eval.py "$EVAL_DIR/candidates/gemma-grpo" \
+      --model gemma --gemma-vllm-base-url "http://localhost:$GRPO_PORT/v1" \
+      --served-model-name gemma-menu --model-path "$WORK/grpo-text" \
+      --limit "$EVAL_LIMIT" --conditioned-frac "$EVAL_COND" --seed "$EVAL_SEED" \
+      --cache-policy live --cache-path "$WORK/cache-grpo.sqlite" --workers "$EVAL_WORKERS" \
+      --gemma-max-tokens "$EVAL_MAX_TOKENS" --wandb-name "gemma-grpo" \
+      --json "$EVAL_DIR/reports/gemma-grpo.json" > "$WORK/eval-grpo.log" 2>&1 &
+  local p1=$!
+  WANDB_NAME="gemma-sft" "$PY" scripts/eval/eval.py "$EVAL_DIR/candidates/gemma-sft" \
+      --model gemma --gemma-vllm-base-url "http://localhost:$SFT_PORT/v1" \
+      --served-model-name gemma-menu --model-path "$WORK/sft-text" \
+      --limit "$EVAL_LIMIT" --conditioned-frac "$EVAL_COND" --seed "$EVAL_SEED" \
+      --cache-policy live --cache-path "$WORK/cache-sft.sqlite" --workers "$EVAL_WORKERS" \
+      --gemma-max-tokens "$EVAL_MAX_TOKENS" --wandb-name "gemma-sft" \
+      --json "$EVAL_DIR/reports/gemma-sft.json" > "$WORK/eval-sft.log" 2>&1 &
+  local p2=$!
+  echo "follow: tail -f $WORK/eval-grpo.log $WORK/eval-sft.log"
+  local rc=0
+  wait "$p1" || { echo "[warn] grpo eval exited nonzero"; rc=1; }
+  wait "$p2" || { echo "[warn] sft eval exited nonzero"; rc=1; }
+  return "$rc"
+}
+
 phase_finish() {
   cd "$REPO"
   log "final push: adapter + the cache the rollouts warmed"
+  [ -d "$EVAL_DIR" ] && "$AWS" s3 sync --no-progress "$EVAL_DIR/" \
+      "s3://${S3_BUCKET}/${S3_PREFIX:-v2}/eval/grpo-$RUN_NAME/" || true
   "$AWS" s3 sync --no-progress "$OUT/" "$S3_MODELS/grpo/$RUN_NAME/" --exclude "*/optimizer.pt" --exclude "*/rng_state*"
   "$PY" scripts/infra/corpus_sync.py push --only cache.sqlite
   echo "finish OK -- safe to destroy the pod"
@@ -343,6 +477,9 @@ case "${1:-}" in
   pusher)     phase_pusher ;;
   watch)      phase_watch ;;
   norms)      phase_norms ;;
+  prep-eval)  phase_prep_eval ;;
+  serve-eval) phase_serve_eval ;;
+  run-eval)   phase_run_eval ;;
   finish)     phase_finish ;;
   *) sed -n '2,30p' "$0"; exit 1 ;;
 esac
