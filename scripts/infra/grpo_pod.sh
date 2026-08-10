@@ -91,7 +91,13 @@ LR="${LR:-1e-5}"                 # NOT 1e-6: see the commit that raised the defa
 TEMP="${TEMP:-1.2}"              # entropy was 0.06 at 1.0 -- a near-deterministic policy
 TOOL_CALLS="${TOOL_CALLS:-6}"
 TOOL_CHARS="${TOOL_CHARS:-16000}"
-VLLM_UTIL="${VLLM_UTIL:-0.18}"
+# 0.12, down from the 1-GPU run's 0.18. The 2-GPU smoke peaked at 182.0 of 183.4 GB --
+# 1.3 GB of headroom, which over 150 steps is an OOM waiting for one unusually long
+# batch. Margin is bought HERE rather than from MAXLEN because the KV cache is pure
+# rollout concurrency (0.12 x 183 = ~22 GB still holds 16 sequences comfortably),
+# whereas cutting MAXLEN would truncate the tool-heavy rollouts specifically -- biasing
+# training against exactly the episodes that gathered the most evidence.
+VLLM_UTIL="${VLLM_UTIL:-0.12}"
 SAVE_STEPS="${SAVE_STEPS:-25}"
 # CAP IT. A full epoch is ~436 steps; at the measured ~580 s/step that is 70 h, and a
 # 2-GPU pod costs ~2x/hr. 150 steps (~25 h) is 300 prompts and 15 probe points -- enough
