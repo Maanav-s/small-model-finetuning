@@ -77,7 +77,15 @@ else:
     from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING  # noqa
     text_model = AutoModelForCausalLM.from_config(text_cfg)
     text_model = text_model.to(torch.bfloat16)
-    # copy weights: strip the multimodal prefixes
+    # copy weights: strip the multimodal prefixes, DROP the towers, and pass everything
+    # else through unchanged -- the last clause is what makes an ALREADY-text-only source
+    # work. Without it (measured 2026-08-10) a text-only input matched none of the
+    # prefixes, new_sd came out nearly empty, and load_state_dict(strict=False) left 665
+    # tensors at RANDOM INIT. The result saved and served happily and emitted
+    # "sounds sounds sounds tou tou" -- 0/500 schema-valid on eval, while its weight
+    # norms sat ~28% below the source (q_proj 63.1 -> 45.5), the signature of fresh init.
+    TOWERS = ("vision_tower.", "audio_tower.", "multi_modal_projector.",
+              "model.vision_tower.", "model.audio_tower.", "model.multi_modal_projector.")
     sd = m.state_dict()
     new_sd = {}
     for k, v in sd.items():
@@ -85,12 +93,24 @@ else:
             new_sd["model." + k[len("model.language_model."):]] = v
         elif k.startswith("language_model."):
             new_sd[k[len("language_model."):]] = v
-        elif k == "lm_head.weight":
+        elif any(k.startswith(p) for p in TOWERS):
+            continue
+        else:
             new_sd[k] = v
     missing, unexpected = text_model.load_state_dict(new_sd, strict=False)
     print(f"   loaded; missing={len(missing)} unexpected={len(unexpected)}")
+    # HARD FAIL, never warn-and-save. A missing tensor here is not a dead weight (the 54
+    # kv-shared ones are never instantiated by transformers, so they cannot appear in
+    # this list) -- it is a real parameter left at random init, and the resulting
+    # checkpoint is indistinguishable from a good one until you serve it.
     if missing:
-        print("   first missing:", missing[:5])
+        print(f"   first missing: {missing[:5]}")
+        sys.exit(
+            f"REFUSING TO SAVE: {len(missing)} tensors were not copied from {src} and "
+            f"would be written at RANDOM INITIALIZATION. This means the source's key "
+            f"layout was not recognised by the remap above, not that the weights are "
+            f"absent. Fix the remap rather than the check."
+        )
 
 n_params = sum(p.numel() for p in text_model.parameters())
 print(f"text model params: {n_params/1e9:.2f}B  arch={type(text_model).__name__}")
