@@ -342,6 +342,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         "= transformers gen.")
     p.add_argument("--vllm-mode", default="colocate", choices=["colocate", "server"])
     p.add_argument("--vllm-gpu-memory-utilization", type=float, default=0.3)
+    p.add_argument("--vllm-max-model-len", type=int, default=None,
+                   help="cap the colocate engine's context (TRL vllm_max_model_length). "
+                        "Gemma-4's default is 131072, and vLLM sizes its KV pool to serve "
+                        "at least one request THAT long -- 2.18 GiB -- so a low "
+                        "--vllm-gpu-memory-utilization fails the engine's own startup check "
+                        "('estimated maximum model length is 75904') before it ever runs. A "
+                        "rollout here needs prompt (~3K) + --max-completion-length, so "
+                        "capping this near that sum makes the same KV budget hold ~4x more "
+                        "concurrent sequences and frees the rest for the backward.")
     p.add_argument("--vllm-server-base-url", default=None)
     p.add_argument("--dry-run", action="store_true",
                    help="build dataset + config + wire/exercise the reward on a synthetic "
@@ -647,6 +656,7 @@ def main() -> None:
         use_vllm=args.use_vllm,
         vllm_mode=args.vllm_mode,
         vllm_gpu_memory_utilization=args.vllm_gpu_memory_utilization,
+        vllm_max_model_length=args.vllm_max_model_len,
         vllm_server_base_url=args.vllm_server_base_url,
     )
 

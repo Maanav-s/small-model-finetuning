@@ -91,13 +91,20 @@ LR="${LR:-1e-5}"                 # NOT 1e-6: see the commit that raised the defa
 TEMP="${TEMP:-1.2}"              # entropy was 0.06 at 1.0 -- a near-deterministic policy
 TOOL_CALLS="${TOOL_CALLS:-6}"
 TOOL_CHARS="${TOOL_CHARS:-16000}"
-# 0.12, down from the 1-GPU run's 0.18. The 2-GPU smoke peaked at 182.0 of 183.4 GB --
+# 0.14, down from the 1-GPU run's 0.18. The 2-GPU smoke peaked at 182.0 of 183.4 GB --
 # 1.3 GB of headroom, which over 150 steps is an OOM waiting for one unusually long
 # batch. Margin is bought HERE rather than from MAXLEN because the KV cache is pure
-# rollout concurrency (0.12 x 183 = ~22 GB still holds 16 sequences comfortably),
-# whereas cutting MAXLEN would truncate the tool-heavy rollouts specifically -- biasing
-# training against exactly the episodes that gathered the most evidence.
-VLLM_UTIL="${VLLM_UTIL:-0.12}"
+# rollout concurrency, whereas cutting MAXLEN would truncate the tool-heavy rollouts
+# specifically -- biasing training against exactly the episodes that gathered the most
+# evidence. There is a FLOOR: the util fraction covers the vLLM weight copy (~15 GB)
+# too, so 0.12 left too little for KV and the engine refused to start (see VLLM_MAXLEN).
+VLLM_UTIL="${VLLM_UTIL:-0.14}"
+# Cap the engine context near what a rollout actually needs (prompt ~3K + MAXLEN).
+# Gemma-4 defaults to 131072 and vLLM refuses to start unless its KV pool can serve one
+# request THAT long (2.18 GiB) -- which is why util 0.12 died with "estimated maximum
+# model length is 75904" before a single rollout. Capping it makes the same budget hold
+# ~4x more concurrent sequences, so the util cut buys backward headroom instead.
+VLLM_MAXLEN="${VLLM_MAXLEN:-32768}"
 SAVE_STEPS="${SAVE_STEPS:-25}"
 # CAP IT. A full epoch is ~436 steps; at the measured ~580 s/step that is 70 h, and a
 # 2-GPU pod costs ~2x/hr. 150 steps (~25 h) is 300 prompts and 15 probe points -- enough
@@ -237,6 +244,7 @@ phase_smoke() {
   $smoke_run \
       --data data/grpo/train.jsonl --model-path "$MERGED_TEXT" \
       --use-vllm --vllm-mode colocate --vllm-gpu-memory-utilization "$VLLM_UTIL" \
+      --vllm-max-model-len "$VLLM_MAXLEN" \
       --max-completion-length "$MAXLEN" \
       --num-generations 4 --per-device-train-batch-size 1 --gradient-accumulation-steps 4 \
       --probe-size 4 --probe-every 1 --probe-generations 2 \
@@ -293,6 +301,7 @@ tools=$TOOL_CALLS/$TOOL_CHARS probe=${PROBE_SIZE}x${PROBE_GENS}/${PROBE_EVERY} s
       --data data/grpo/train.jsonl --model-path '$MERGED_TEXT' \
       --starting-checkpoint gemma-menu-sft \
       --use-vllm --vllm-mode colocate --vllm-gpu-memory-utilization $VLLM_UTIL \
+      --vllm-max-model-len $VLLM_MAXLEN \
       --num-generations $G --max-completion-length $MAXLEN \
       --per-device-train-batch-size $BS --gradient-accumulation-steps $ACCUM \
       --learning-rate $LR --temperature $TEMP \
