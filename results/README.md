@@ -5,6 +5,17 @@ pods are ephemeral, so this directory is the one place a result survives without
 W&B. `notes/experiments.md` is the narrative log ("what we learned"); this is the
 machine-readable evidence behind it.
 
+## Run-sets in this directory
+
+| run-set | plan | models | what it answers |
+|---|---|---|---|
+| [eval500-20260808](eval500-20260808/) | `eval` / seed 42 / n=500 / cond 0.4 | Qwen3-235B teacher, Gemma SFT, Gemma base | **Did SFT work?** Yes — item F1 0.438 → 0.560 over base, false-finds 29 → 10, and the student matches the teacher's find rate. This pass also *created* the eval-split reference traces every paired score since is measured against. |
+| [eval500-20260810](eval500-20260810/) | same plan | Gemma GRPO (ckpt-50), Gemma SFT | **Did GRPO beat SFT?** No — item F1 0.539 vs 0.559, 71 wins / 75 losses per episode, all \|t\| < 1.96. SFT was **re-measured in the same session on the same cache** rather than quoted from 08-08, so the two rows are a true paired A/B. Paired deltas and t-stats are in [notes/experiments.md](../notes/experiments.md). |
+
+Both use the same plan, so per-episode trace ids join **across** run-sets as well as within
+one — the SFT row appears in both and moves only by cache/serving noise (F1 0.560 vs 0.559),
+which is itself a useful reproducibility check.
+
 ## Layout
 
 ```
