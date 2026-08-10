@@ -99,6 +99,33 @@ def load_grpo_dataset(path: str, limit: int | None):
     return Dataset.from_dict({"prompt": prompts})
 
 
+def split_probe(train_ds, probe_size: int):
+    """Hold out a fixed probe set from the training prompts -> (train, probe).
+
+    WHY A PROBE AT ALL (measured 2026-08-09 on the 25-step run): the training reward
+    is logged over the prompts of the CURRENT step -- 2 restaurants -- so its
+    step-to-step spread (sd 0.154) is dominated by which restaurants came up, not by
+    the policy. Over 25 steps the mean drifted +0.068, i.e. 0.44 sd: indistinguishable
+    from zero no matter what the policy did. The same 30 restaurants scored repeatedly
+    hold that term FIXED, so a change in `eval_reward` is a change in the policy.
+
+    Held out of training, not sampled from it: a prompt the policy has taken gradient
+    steps on measures memorization as much as capability.
+
+    STRIDE, not head/tail. build_grpo writes the restriction-FREE episodes first and
+    the dietary-CONDITIONED ones after (see its docstring), so `rows[-30:]` would be
+    an all-conditioned probe and `rows[:30]` an all-free one -- either would track a
+    sub-population rather than the task. A stride keeps the file's free/conditioned mix.
+    """
+    n = len(train_ds)
+    if probe_size <= 0 or probe_size >= n:
+        return train_ds, None
+    stride = n / probe_size
+    probe_idx = sorted({min(n - 1, int(i * stride)) for i in range(probe_size)})
+    keep_idx = [i for i in range(n) if i not in set(probe_idx)]
+    return train_ds.select(keep_idx), train_ds.select(probe_idx)
+
+
 # ---------------------------------------------------------------------------
 # Model (mirror train_sft.load_base_model: bf16, SDPA GQA patch, no device_map)
 # ---------------------------------------------------------------------------
@@ -205,11 +232,33 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="the SFT run-id this GRPO run initialized from (--model-path's lineage); "
                         "recorded in meta.json as starting_checkpoint (plan §6).")
     p.add_argument("--limit", type=int, default=None, help="use only the first N prompts")
+    # --- the fixed probe: the instrument the TRAINING reward curve cannot be ---------
+    p.add_argument("--probe-size", type=int, default=30,
+                   help="hold out N prompts (stride-sampled, so the free/conditioned mix is "
+                        "preserved) and re-score them every --probe-every steps as TRL's "
+                        "eval_dataset. Logged as eval_reward / eval_rewards/*. 0 disables. The "
+                        "training reward averages only the CURRENT step's prompts, so at 2 "
+                        "prompts/step its sd (0.154, measured 2026-08-09) swamps any policy "
+                        "change; a fixed probe removes the restaurant term entirely.")
+    p.add_argument("--probe-every", type=int, default=10,
+                   help="run the probe every N optimizer steps (default 10)")
+    p.add_argument("--probe-generations", type=int, default=2,
+                   help="completions per probe prompt (TRL num_generations_eval). Deliberately "
+                        "far below --num-generations: the probe wants a low-variance MEAN over "
+                        "many distinct restaurants, not a within-group advantage, so samples are "
+                        "better spent on prompts than on repeats. At G=16 an unset value would "
+                        "make one probe 30x16=480 rollouts -- 15 training steps of work.")
     # GRPO / generation
-    p.add_argument("--num-generations", type=int, default=4, help="G: completions per prompt (group size)")
-    p.add_argument("--max-completion-length", type=int, default=8192,
-                   help="cap on the rollout completion (incl. tool responses). Long scraped pages "
-                        "make this memory-heavy -- keep small for smoke; raise on H200 for real runs.")
+    p.add_argument("--num-generations", type=int, default=8,
+                   help="G: completions per prompt (group size). NOT the flat-curve culprit -- "
+                        "the 2026-08-08 run's frac_reward_zero_std sat at 0.00-0.05 at G=8, so "
+                        "groups were not degenerate.")
+    p.add_argument("--max-completion-length", type=int, default=16384,
+                   help="cap on the rollout completion (INCLUDING tool responses -- see "
+                        "--max-tool-chars). Memory is LINEAR in this at ~3.7 MB/token (the "
+                        "retained logits chain in the backward), so 16384 is the H200 141 GB "
+                        "ceiling and 24576 needs a 180 GB B200. 8192 fits exactly ONE capped "
+                        "scrape and is a SMOKE value only.")
     p.add_argument("--temperature", type=float, default=1.2,
                    help="rollout sampling temperature. Above 1.0 on purpose: the 2026-08-08 run "
                         "logged mean token entropy of 0.06 at temperature 1.0 -- a near-"
@@ -373,10 +422,15 @@ def main() -> None:
 
     reward_funcs, reward_weights = make_grpo_rewards()
     train_ds = load_grpo_dataset(args.data, args.limit)
+    train_ds, probe_ds = split_probe(train_ds, args.probe_size)
 
     print("\n=== resolved GRPO config ===")
     print(f"  policy:                {args.model_path or 'base MODEL_ID/GEMMA_MODEL_PATH'}")
     print(f"  dataset:               {len(train_ds)} prompts from {args.data}")
+    print(f"  probe (held out):      "
+          + (f"{len(probe_ds)} prompts x {args.probe_generations} gens every "
+             f"{args.probe_every} steps -> eval_reward"
+             if probe_ds is not None else "disabled (--probe-size 0)"))
     print(f"  reward funcs:          {[f.__name__ for f in reward_funcs]}  weights={reward_weights}")
     print(f"  num_generations (G):   {args.num_generations}")
     print(f"  per_device_bs x accum: {per_device_bs} x {args.gradient_accumulation_steps}")
@@ -572,6 +626,16 @@ def main() -> None:
         logging_steps=args.logging_steps,
         save_strategy=args.save_strategy,
         save_steps=args.save_steps,
+        # The probe. TRL has no separate eval path -- prediction_step calls compute_loss,
+        # so an eval_dataset produces REAL rollouts through the same tools and the same
+        # reward funcs, logged under an `eval_` prefix (grpo_trainer.log). num_generations
+        # _eval is what keeps it affordable; per_device_eval_batch_size must satisfy
+        # (per_device_eval_batch_size * num_processes) % num_generations_eval == 0.
+        **({"eval_strategy": "steps",
+            "eval_steps": args.probe_every,
+            "per_device_eval_batch_size": args.probe_generations,
+            "num_generations_eval": args.probe_generations}
+           if probe_ds is not None else {}),
         bf16=True,
         gradient_checkpointing=True,
         gradient_checkpointing_kwargs={"use_reentrant": False},
@@ -592,6 +656,7 @@ def main() -> None:
         reward_funcs=reward_funcs,
         args=grpo_config,
         train_dataset=train_ds,
+        eval_dataset=probe_ds,
         tools=tools,
         peft_config=lora_config,
         processing_class=tokenizer,

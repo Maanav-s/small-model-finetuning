@@ -198,6 +198,15 @@ class Cache:
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA synchronous=NORMAL")
+        # self._lock above only serializes THREADS inside one process. Multi-PROCESS
+        # writers (2-GPU GRPO runs one trainer rank per GPU, each with its own Cache on
+        # the same file) are serialized by SQLite itself: WAL permits exactly one writer,
+        # and the default busy_timeout of 0 makes the loser raise
+        # `OperationalError: database is locked` IMMEDIATELY rather than wait. Under live
+        # rollouts both ranks write a scrape row every few seconds, so without this a
+        # multi-GPU run dies on a lock collision. Writes here are single small rows, so
+        # any real contention clears in milliseconds; 30 s is a ceiling, not a target.
+        self._conn.execute("PRAGMA busy_timeout=30000")
         self._conn.executescript(_SCHEMA)
         self._conn.commit()
 

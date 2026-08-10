@@ -670,3 +670,33 @@ class TestReclassify:
         rep = cache.reclassify(scrape_status)  # scrape namespace only
         assert rep["rows_changed"] == 0
         assert cache._get("search", norm_query("q"))["status"] == "empty"
+
+
+# ---------------------------------------------------------------------------
+# Multi-PROCESS writers (2-GPU GRPO: one trainer rank per GPU, one Cache each)
+# ---------------------------------------------------------------------------
+def test_busy_timeout_is_set_so_a_second_writer_waits_instead_of_raising(tmp_path):
+    """The in-process threading.Lock cannot serialize two PROCESSES. WAL allows one
+    writer, and sqlite's default busy_timeout of 0 makes the loser raise
+    `database is locked` immediately -- which under live GRPO rollouts (both ranks
+    writing scrape rows continuously) kills the run."""
+    c = Cache(str(tmp_path / "c.sqlite"), miss_policy="live")
+    assert c._conn.execute("PRAGMA busy_timeout").fetchone()[0] >= 30000
+
+
+def test_a_second_connection_can_write_while_the_first_holds_a_transaction(tmp_path):
+    """The behaviour the pragma buys, exercised against two real connections on one
+    file -- the shape a 2-rank run actually produces."""
+    import sqlite3
+
+    path = str(tmp_path / "c.sqlite")
+    a = Cache(path, miss_policy="live")
+    b = Cache(path, miss_policy="live")
+    a.wrap("search", lambda q: "from-a", key_fn=norm_query)("q1")
+    # b must see a's row and be able to add its own without SQLITE_BUSY
+    assert b.wrap("search", lambda q: "unused", key_fn=norm_query)("q1") == "from-a"
+    b.wrap("search", lambda q: "from-b", key_fn=norm_query)("q2")
+    assert a.wrap("search", lambda q: "unused", key_fn=norm_query)("q2") == "from-b"
+    con = sqlite3.connect(path)
+    assert con.execute("SELECT COUNT(*) FROM cache").fetchone()[0] == 2
+    con.close()

@@ -94,3 +94,55 @@ def test_unpaired_b_without_its_a_is_skipped():
     m = FakeLoraModel(["l0.q_proj"], seed=5)
     m._params = [p for p in m._params if ".lora_A" not in p[0]]
     assert t.lora_movement(m, scaling=2.0) == {}
+
+
+# ---------------------------------------------------------------------------
+# split_probe -- the held-out fixed probe
+# ---------------------------------------------------------------------------
+def _ds(n):
+    from datasets import Dataset
+
+    return Dataset.from_dict({"prompt": [[{"role": "user", "content": f"r{i}"}] for i in range(n)]})
+
+
+def _texts(ds):
+    return [row["prompt"][0]["content"] for row in ds]
+
+
+def test_probe_is_disjoint_from_train_and_partitions_the_set():
+    train, probe = t.split_probe(_ds(902), 30)
+    assert len(probe) == 30
+    assert len(train) == 872
+    assert not (set(_texts(train)) & set(_texts(probe)))
+    assert set(_texts(train)) | set(_texts(probe)) == {f"r{i}" for i in range(902)}
+
+
+def test_probe_strides_across_the_file_not_head_or_tail():
+    """build_grpo writes free episodes first, conditioned after -- a head or tail slice
+    would give a single-population probe. The stride must span the whole range."""
+    _, probe = t.split_probe(_ds(902), 30)
+    idx = sorted(int(s[1:]) for s in _texts(probe))
+    assert idx[0] < 30            # reaches the free end
+    assert idx[-1] > 0.9 * 902    # reaches deep into the conditioned tail
+    # the real property: both populations are represented (conditioned start ~541)
+    assert sum(1 for i in idx if i < 541) >= 10
+    assert sum(1 for i in idx if i >= 541) >= 10
+    gaps = [b - a for a, b in zip(idx, idx[1:])]
+    assert max(gaps) - min(gaps) <= 1   # evenly spaced
+
+
+def test_probe_is_deterministic():
+    a = _texts(t.split_probe(_ds(902), 30)[1])
+    b = _texts(t.split_probe(_ds(902), 30)[1])
+    assert a == b
+
+
+def test_probe_disabled_returns_none():
+    for size in (0, -1):
+        train, probe = t.split_probe(_ds(50), size)
+        assert probe is None and len(train) == 50
+
+
+def test_probe_larger_than_dataset_is_refused_rather_than_emptying_train():
+    train, probe = t.split_probe(_ds(20), 20)
+    assert probe is None and len(train) == 20

@@ -58,23 +58,36 @@ MERGED_TEXT="$WORK/merged-text"  # what BOTH the trainer and vLLM actually load
 # ---- the run config ------------------------------------------------------------
 RUN_NAME="${RUN_NAME:-gemma-menu-grpo-v2}"
 OUT="${OUT:-$WORK/$RUN_NAME}"
-# G=8: the 2026-08-08 run's frac_reward_zero_std sat at 0.00-0.05, so groups were NOT
-# degenerate -- group size was never the problem and is unchanged here.
-G="${G:-8}"
+NPROC="${NPROC:-2}"              # GPUs. DDP data-parallel: each rank runs its own policy
+                                 # AND its own colocate vLLM, so per-GPU memory is
+                                 # UNCHANGED by adding ranks -- the second GPU buys
+                                 # rollout throughput, not headroom for a longer MAXLEN.
+# G=16, doubled from 8. G was never the flat-curve cause (frac_reward_zero_std sat at
+# 0.00-0.05 at G=8, so groups were not degenerate) -- this is about the QUALITY of the
+# advantage estimate, whose noise falls as 1/sqrt(G). The second GPU pays for it:
+# NPROC*BS*ACCUM = 2*1*16 = 32 completions/step = 2 prompts at G=16, so prompt
+# diversity per step is held at the 1-GPU value instead of being halved.
+G="${G:-16}"
 # 24576, up from 16384. On an H200 141 GB this OOM'd in accelerator.backward() at ANY
 # vllm util (~85 GB of retained logits chain + 15 GB policy); it fits on a 180 GB B200.
 # 32768 does NOT fit anywhere available: the chain is LINEAR in length at ~3.7 MB/token,
 # so 32768 -> ~120 GB + ~29 GB of everything-else + vLLM's share > 180.
 MAXLEN="${MAXLEN:-24576}"
 BS="${BS:-1}"                    # pure memory knob; the group may span accumulation steps
-ACCUM="${ACCUM:-16}"             # effective 16 = 2 prompts/step at G=8 -> ~451 steps/epoch
+ACCUM="${ACCUM:-16}"             # NPROC*BS*ACCUM = 32 must be divisible by G
+PROBE_SIZE="${PROBE_SIZE:-30}"   # held out of training; the only trend instrument that
+PROBE_EVERY="${PROBE_EVERY:-10}" # is not swamped by which restaurants a step drew
+PROBE_GENS="${PROBE_GENS:-2}"    # 30x2=60 rollouts/probe (~2 steps of work), not 30x16
 LR="${LR:-1e-5}"                 # NOT 1e-6: see the commit that raised the default
 TEMP="${TEMP:-1.2}"              # entropy was 0.06 at 1.0 -- a near-deterministic policy
 TOOL_CALLS="${TOOL_CALLS:-6}"
 TOOL_CHARS="${TOOL_CHARS:-16000}"
 VLLM_UTIL="${VLLM_UTIL:-0.18}"
 SAVE_STEPS="${SAVE_STEPS:-25}"
-MAX_STEPS="${MAX_STEPS:--1}"
+# CAP IT. A full epoch is ~436 steps; at the measured ~580 s/step that is 70 h, and a
+# 2-GPU pod costs ~2x/hr. 150 steps (~25 h) is 300 prompts and 15 probe points -- enough
+# to see a trend in eval_reward, which is the question this run exists to answer.
+MAX_STEPS="${MAX_STEPS:-150}"
 export WANDB_PROJECT="${WANDB_PROJECT:-menu-grpo}"
 
 LOG="$WORK/grpo.log"
@@ -199,12 +212,20 @@ phase_smoke() {
   # canned so the smoke costs no scraping and cannot be slowed by the network. It also
   # starves grounding by design (a frozen miss returns a constant), so judge the smoke
   # on "it ran and rewards are finite", NOT on the reward value.
-  "$PY" scripts/train/train_grpo.py \
+  # Runs on ALL $NPROC GPUs and with the probe ON, because those are the two things a
+  # smoke is for here: DDP + one colocate vLLM engine per rank, and the eval_dataset
+  # path (TRL routes it through compute_loss, so a probe misconfig is a crash, not a
+  # missing metric). --probe-every 1 forces a probe inside 2 steps.
+  local smoke_run="$PY scripts/train/train_grpo.py"
+  [ "$NPROC" -gt 1 ] && smoke_run="$VENV/bin/accelerate launch --num_processes $NPROC \
+      --num_machines 1 --mixed_precision bf16 --dynamo_backend no scripts/train/train_grpo.py"
+  $smoke_run \
       --data data/grpo/train.jsonl --model-path "$MERGED_TEXT" \
       --use-vllm --vllm-mode colocate --vllm-gpu-memory-utilization "$VLLM_UTIL" \
       --max-completion-length "$MAXLEN" \
       --num-generations 4 --per-device-train-batch-size 1 --gradient-accumulation-steps 4 \
-      --max-steps 2 --limit 8 --cache-policy canned \
+      --probe-size 4 --probe-every 1 --probe-generations 2 \
+      --max-steps 2 --limit 16 --cache-policy canned \
       --output-dir "$WORK/grpo-smoke" --report-to none
   log "smoke checkpoint movement (||B|| should be nonzero after 2 steps at lr $LR)"
   "$PY" scripts/analysis/adapter_norms.py "$WORK/grpo-smoke/adapter" 2>/dev/null || \
@@ -226,8 +247,25 @@ phase_pusher() {
 phase_train() {
   cd "$REPO"
   require_env BRAVE_API_KEY
-  log "GRPO: G=$G len=$MAXLEN bs=$BS x accum=$ACCUM lr=$LR temp=$TEMP tools=$TOOL_CALLS/$TOOL_CHARS"
+  log "GRPO: ${NPROC}xGPU G=$G len=$MAXLEN bs=$BS x accum=$ACCUM lr=$LR temp=$TEMP \
+tools=$TOOL_CALLS/$TOOL_CHARS probe=${PROBE_SIZE}x${PROBE_GENS}/${PROBE_EVERY} steps=$MAX_STEPS"
   mkdir -p "$OUT"
+  # TRL's rule is on the GLOBAL batch: NPROC * BS * ACCUM must be divisible by G.
+  # train_grpo.py can only check its single-process half of that, so check it here where
+  # NPROC is known -- a mismatch otherwise surfaces after both ranks have loaded 15 GB.
+  if [ $(( NPROC * BS * ACCUM % G )) -ne 0 ]; then
+    echo "global batch (NPROC $NPROC * BS $BS * ACCUM $ACCUM = $((NPROC*BS*ACCUM))) must be" >&2
+    echo "divisible by G ($G)" >&2
+    exit 1
+  fi
+  local runner="$PY scripts/train/train_grpo.py"
+  if [ "$NPROC" -gt 1 ]; then
+    # accelerate launch, NOT plain python: colocate puts a vLLM engine on every rank, and
+    # DDP is what makes the ranks agree on the gradient. --num_processes must equal the
+    # visible GPU count or ranks contend for GPU 0.
+    runner="$VENV/bin/accelerate launch --num_processes $NPROC --num_machines 1 \
+        --mixed_precision bf16 --dynamo_backend no scripts/train/train_grpo.py"
+  fi
   tmux kill-session -t grpo 2>/dev/null || true
   # REDIRECT, do not `| tee` into the tmux pane. TRL prints a rich table of sampled
   # completions every logging step; piping that through tee to a pane whose fd wandb's
@@ -236,7 +274,7 @@ phase_train() {
   # `BlockingIOError: [Errno 11] write could not complete without blocking` raised
   # inside rich's _write_buffer. TERM=dumb also stops rich from drawing box art into
   # what is now a plain file.
-  TERM=dumb tmux new-session -d -s grpo "cd $REPO && TERM=dumb $PY scripts/train/train_grpo.py \
+  TERM=dumb tmux new-session -d -s grpo "cd $REPO && TERM=dumb $runner \
       --data data/grpo/train.jsonl --model-path '$MERGED_TEXT' \
       --starting-checkpoint gemma-menu-sft \
       --use-vllm --vllm-mode colocate --vllm-gpu-memory-utilization $VLLM_UTIL \
@@ -245,6 +283,7 @@ phase_train() {
       --learning-rate $LR --temperature $TEMP \
       --max-tool-calls $TOOL_CALLS --max-tool-chars $TOOL_CHARS \
       --cache-policy live --cache-path data/cache.sqlite \
+      --probe-size $PROBE_SIZE --probe-every $PROBE_EVERY --probe-generations $PROBE_GENS \
       --save-steps $SAVE_STEPS --max-steps $MAX_STEPS \
       --output-dir '$OUT' --run-id '$RUN_NAME' --run-name '$RUN_NAME' --report-to wandb \
       > '$LOG' 2>&1"
