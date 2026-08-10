@@ -43,7 +43,7 @@ set -euo pipefail
 
 REPO="${REPO:-/workspace/small-model-finetuning}"
 REPO_URL="${REPO_URL:-https://github.com/Maanav-s/small-model-finetuning.git}"
-BRANCH="${BRANCH:-eval-v2-three-model}"
+BRANCH="${BRANCH:-main}"
 WORK="${WORK:-/workspace}"
 CLIENT_VENV="${CLIENT_VENV:-/opt/client}"     # repo deps (tools, eval, corpus) -- NO torch
 VLLM_VENV="${VLLM_VENV:-/opt/vllm}"           # vllm + its own torch; created by serve_teacher.sh

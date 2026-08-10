@@ -34,7 +34,7 @@ set -euo pipefail
 
 REPO="${REPO:-/workspace/small-model-finetuning}"
 REPO_URL="${REPO_URL:-https://github.com/Maanav-s/small-model-finetuning.git}"
-BRANCH="${BRANCH:-grpo-run2}"
+BRANCH="${BRANCH:-main}"
 WORK="${WORK:-/workspace}"
 VENV="${VENV:-/opt/grpo}"
 PY="$VENV/bin/python"
