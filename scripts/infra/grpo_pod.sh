@@ -50,6 +50,15 @@ CUDA_HOME="${CUDA_HOME:-$VENV/lib/python3.12/site-packages/nvidia/cu13}"
 export CUDA_HOME
 export PATH="$VENV/bin:$CUDA_HOME/bin:$PATH"
 
+# GRPO rollouts are VARIABLE length by nature -- every completion is a different size,
+# and the probe adds a second, shorter distribution on top -- which is exactly the case
+# the caching allocator fragments on. Measured 2026-08-10, the 2-GPU smoke at MAXLEN
+# 24576 OOM'd on rank1 asking for 20.9 GiB with 3.6 GiB free while holding **51.3 GiB
+# reserved but unallocated**: a third of the card was stranded in size-mismatched
+# segments, not actually in use. expandable_segments lets the allocator grow one
+# segment instead of rounding each new shape up into a fresh block.
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+
 S3_MODELS="s3://${S3_BUCKET:-restaurant-menu-corpus}/${S3_PREFIX:-v2}/models/gemma-4-e4b-it"
 KV_DIR="$WORK/kv"                # ONLY the 54 kv-shared tensors (105 MB), not the 16 GB base
 MERGED="$WORK/merged"            # the SFT student, merged bf16
