@@ -13,6 +13,101 @@ Conventions:
 
 ---
 
+## 2026-08-10 — GRPO run 2 (50 steps, 2×B200): the policy moved, the task did not
+
+The fixes from the 2026-08-09 post-mortem all landed and all did what they were supposed
+to. The model still did not get better. **GRPO is not paying for itself yet.**
+
+**Config:** 2×B200 180 GB DDP colocate, pod `khn3njeymdf2yi` ($13.58/hr), G=16,
+`max_completion_length` 24576, bs=1 × accum 16 (global 32 = 2 prompts/step), lr **1e-5**,
+temp **1.2**, `max_tool_calls` 6, `max_tool_chars` 16000, `vllm_gpu_memory_utilization`
+0.14 + `vllm_max_model_length` 32768, cache `live`. 872 train prompts + a **30-prompt
+held-out probe** every 10 steps at `num_generations_eval=2`. Stopped at step 55/150;
+adapter = `checkpoint-50`. ~640-830 s/step. Artifacts:
+`v2/models/gemma-4-e4b-it/grpo/gemma-menu-grpo-v2/`, eval under
+`v2/eval/grpo-gemma-menu-grpo-v2/`, W&B `menu-grpo/wju9smmb`.
+
+**The learning rate was the diagnosis and the fix worked.** `lora/b_norm_vs_sft` (now
+logged every step through TRL's own `_metrics`) rose monotonically to **0.042** by step
+50 — vs 0.0063 for the whole previous 100-step run at 1e-6, i.e. **~13× the movement in
+half the steps.** Two steps at 1e-5 passed the entire earlier run. Whatever is wrong now,
+"the optimizer never moved the policy" is no longer it.
+
+**The probe (steps 10→50), which is the point of this run:**
+
+| step | reward | struct | found | ground | clip | calls |
+|---|---|---|---|---|---|---|
+| 10 | 0.536 | 0.883 | 0.667 | 0.376 | 0.317 | 14.9 |
+| 30 | 0.533 | 0.917 | 0.667 | 0.361 | 0.267 | 15.3 |
+| 50 | 0.539 | 0.967 | 0.750 | 0.326 | 0.200 | 12.7 |
+
+Reward is FLAT (spread 0.09 ≈ 2 SEM over 5 points). What did move is **cost**, not
+quality: `clipped_ratio` 0.32→0.20 and `call_frequency` 14.9→12.7. The policy is learning
+to finish inside its budget, not to build better menus.
+
+**Paired eval, 500 episodes, same seeded plan, both models served in one session on one
+cache (n=498 paired; SFT re-measured rather than quoted from 2026-08-08):**
+
+| metric | SFT | GRPO | paired delta | t |
+|---|---|---|---|---|
+| schema-valid | 0.998 | 0.998 | 0.000 | — |
+| found accuracy | 0.791 | 0.791 | 0.000 | — |
+| **item F1** | **0.559** | **0.539** | **−0.018** | −1.77 |
+| precision | 0.832 | 0.819 | −0.004 | −0.52 |
+| recall | 0.576 | 0.558 | −0.016 | −1.58 |
+| price agreement | 0.922 | 0.916 | −0.009 | −1.00 |
+
+**Nothing is significant** (all |t| < 1.96) and the per-episode F1 record is **71 wins /
+75 losses** — a coin flip. 50 steps of GRPO produced a policy statistically
+indistinguishable from the SFT student, trending very slightly worse. `found_accuracy` is
+identical to four decimals, which is itself telling: the reward's `found` term is not
+changing behaviour at all.
+
+**Takeaway / where to look next.** The reward moved the things it directly pays for
+(termination, tool-call count) and not the thing we care about (menu completeness —
+recall 0.558 vs the teacher's reference). Candidate explanations, cheapest first: (1) 50
+steps × 2 prompts = 100 restaurants is simply too little data; (2) the grounding term
+rewards faithfulness to scraped evidence, which a model can maximize by reporting FEWER
+items — note `item_count_delta` got *worse*, −5.8 → −6.6, exactly the direction a
+precision-flavoured reward pushes; (3) `structure_reward` saturated at ~0.97 contributes
+no advantage, so two-thirds of the weight vector is inert. (2) is the one worth testing —
+it predicts that GRPO as currently specified *cannot* fix the recall gap, because the
+reward is not asking for recall.
+
+### Traps paid for on this run (all fixed in the branch)
+
+- **`to_text_only.py` silently produced a RANDOM model.** Merging a GRPO adapter yields an
+  already-text-only checkpoint; the remap only handled `model.language_model.*` prefixes,
+  so `new_sd` came out nearly empty and `load_state_dict(strict=False)` left **665 tensors
+  at random init**. It printed `missing=665` and saved anyway. The artifact loaded and
+  served fine and scored **0/500 schema-valid** while SFT scored 499/500 in the same
+  session; weight norms sat ~28% below source (q_proj 63.1→45.5). Now passes unknown keys
+  through and **exits non-zero on any missing tensor**.
+- **The coherence probe that proved nothing.** `"The capital of France is"` → `"France is
+  France is..."` looked like proof of corruption — until the *known-good* SFT model
+  produced the identical loop. These students are SFT'd so hard onto one templated task
+  that raw-text probes are worthless as health checks. The real evidence was the tensor
+  norms.
+- **`PRAGMA busy_timeout=30000` on `cache.sqlite`.** The in-process `threading.Lock`
+  cannot serialize two DDP ranks; WAL allows one writer and sqlite's default timeout of 0
+  raises `database is locked` on first collision. Invisible on one GPU.
+- **`expandable_segments`.** The 2-GPU smoke OOM'd holding **51.3 GiB reserved but
+  unallocated** — variable-length rollouts plus the probe's second length distribution.
+- **vLLM util has a FLOOR.** 0.12 never reached a rollout: vLLM sizes its KV pool to serve
+  one request at the model's max seq len (Gemma-4 defaults to 131072 → 2.18 GiB) and
+  refuses to start. `--vllm-max-model-len 32768` makes the same budget hold ~4× more
+  sequences.
+- **Blackwell needs a self-consistent pip CUDA toolchain.** vLLM picks FlashInfer on
+  sm_100 and JIT-compiles trtllm-gen FMHA, failing three times in sequence (~4 min apart,
+  each after the 15 GB policy load): `ninja` not on PATH; nvcc 13.2 vs runtime-13.0
+  headers; nvvm emitting PTX 9.2 for a 13.0 ptxas; then `-lcudart` in a `lib64/` the wheel
+  lacks. Pin the nvcc set DOWN to 13.0.
+- **Don't `| tee` TRL's output into a tmux pane.** Its rich completions table on an fd
+  wandb's console capture left non-blocking killed a launch 11 min in with
+  `BlockingIOError`.
+
+---
+
 ## 2026-08-08 — GRPO launch debugging: TRL's parse loses Gemma finals (bug #11) + the real backward memory model
 
 Standing up the real GRPO run (1×H200 SECURE $4.59/hr, pod `p0lbxgcnvn06vi`) surfaced one
