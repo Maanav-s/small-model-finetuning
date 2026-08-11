@@ -168,7 +168,10 @@
     const agent = meta && meta.agent;
     if (!agent) return "";
     const variant = meta.prompt_variant ? ` · ${esc(meta.prompt_variant)} prompt` : "";
-    return `<div class="by">extracted by ${esc(AGENT_LABEL[agent] || agent)}${variant}</div>`;
+    // Which weights produced this. Without it a screenshot of the untrained base is
+    // indistinguishable from one of the shipped student.
+    const ckpt = meta.checkpoint ? ` · ${esc(meta.checkpoint)}` : "";
+    return `<div class="by">extracted by ${esc(AGENT_LABEL[agent] || agent)}${ckpt}${variant}</div>`;
   }
 
   // The model reports it couldn't find the menu at all (schema: found=false).
@@ -248,6 +251,26 @@
       btn.disabled = false;
     }
   });
+
+  // Ask the server what it actually loaded, then (a) preselect the prompt variant
+  // that checkpoint was trained under -- serving a distilled student under the
+  // TEACHER prompt is a train/serve mismatch that under-reports it -- and (b) name
+  // the checkpoint in the header so the page can never misrepresent which weights
+  // are answering. Purely additive: if the endpoint is missing, nothing changes.
+  (async () => {
+    try {
+      const cfg = await (await fetch("/api/config")).json();
+      if (cfg.default_variant) variantSel.value = cfg.default_variant;
+      if (cfg.checkpoint) {
+        const tag = document.createElement("div");
+        tag.className = "by";
+        tag.style.marginBottom = "10px";
+        tag.textContent = `serving ${cfg.checkpoint}` +
+          (cfg.quantized ? " · 4-bit" : " · bf16");
+        document.querySelector(".status").before(tag);
+      }
+    } catch (e) { /* server too old for /api/config -- leave the UI as-is */ }
+  })();
 </script>
 </body>
 </html>

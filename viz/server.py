@@ -76,6 +76,13 @@ CLAUDE_AGENTS = {"claude": CLAUDE_SONNET_ID, "claude-haiku": HAIKU_MODEL_ID}
 # on a bigger-RAM machine to load full-quality bf16 instead.
 _QUANTIZE = os.environ.get("VIZ_QUANTIZE", "1") != "0"
 
+# VIZ_ADAPTER: path to a trained PEFT adapter (e.g. models/sft-adapter) to load on
+# top of the base. Unset = the raw base model. This is how the viz serves the
+# SHIPPED student rather than an untrained Gemma.
+_ADAPTER = os.environ.get("VIZ_ADAPTER", "").strip()
+# A label for the UI, so a screenshot can never be mistaken for the wrong model.
+_CHECKPOINT = (Path(_ADAPTER).name if _ADAPTER else "base (untrained)")
+
 _ENGINE: dict = {}                 # model/tokenizer/client, populated at startup
 _EPISODE_LOCK = threading.Lock()   # serialize episodes (single GPU: concurrent generate() would race/OOM)
 
@@ -112,6 +119,24 @@ def _get_tools() -> tuple:
 async def lifespan(app: FastAPI):
     """Load the model and Anthropic client once at startup (tools are built lazily)."""
     model, tokenizer = load_model(quantize=_QUANTIZE, attn="sdpa")
+    if _ADAPTER:
+        # REFUSE 4-bit + adapter. The adapter was trained against a bf16 base, and
+        # serving it on a 4-bit one is the single most expensive mistake in this
+        # project's history: it cost ~32 points of success rate (24% -> 56% when
+        # fixed; see notes/experiments.md). A demo that silently does this shows
+        # numbers far below the README's and looks like the model is bad.
+        if _QUANTIZE:
+            raise SystemExit(
+                "VIZ_ADAPTER is set but VIZ_QUANTIZE is on: an adapter trained on a "
+                "bf16 base misbehaves badly on a 4-bit one (~32 points of success "
+                "rate). Re-launch with VIZ_QUANTIZE=0, or unset VIZ_ADAPTER to serve "
+                "the untrained base."
+            )
+        from peft import PeftModel
+
+        print(f"Applying adapter {_ADAPTER} ...", flush=True)
+        model = PeftModel.from_pretrained(model, _ADAPTER)
+        model.eval()
     # Claude is optional: only wire it up if a key is present, so the server still
     # boots (Gemma-only) without ANTHROPIC_API_KEY.
     anthropic_client = anthropic.Anthropic() if os.environ.get("ANTHROPIC_API_KEY") else None
@@ -120,6 +145,7 @@ async def lifespan(app: FastAPI):
         tokenizer=tokenizer,
         anthropic_client=anthropic_client,
     )
+    print(f"Gemma checkpoint: {_CHECKPOINT} ({'4-bit' if _QUANTIZE else 'bf16'})")
     print(f"Agents available: gemma{' + claude' if anthropic_client else ' (claude disabled: no ANTHROPIC_API_KEY)'}")
     print(f"web_search (Brave): {'key set' if has_search_key() else 'NO KEY — set BRAVE_API_KEY'}")
     print("scrape_url (local Chromium): no key needed")
@@ -150,6 +176,8 @@ def extract(req: ExtractRequest) -> dict:
     variant = (req.prompt_variant or "teacher").lower()
     # Echoed back on every response so the page can label how it was produced.
     meta = {"agent": agent, "prompt_variant": variant}
+    if agent == "gemma":
+        meta["checkpoint"] = _CHECKPOINT
 
     def fail(error: str, raw: str = ""):
         return {"ok": False, "error": error, "raw": raw, **meta}
@@ -197,6 +225,23 @@ def extract(req: ExtractRequest) -> dict:
     if parsed is None:
         return fail(f"Model output was not valid JSON: {err}", raw=answer)
     return {"ok": True, "menu": parsed, "raw": answer, **meta}
+
+
+@app.get("/api/config")
+def config() -> dict:
+    """What the server is actually serving, so the page can label + default itself.
+
+    `default_variant` matters: a trained student was distilled under the STUDENT
+    prompt and is evaluated under it, so defaulting the UI to "teacher" would be a
+    train/serve mismatch and would under-report the model. The raw base has no such
+    constraint and keeps the teacher prompt (its guidance is all it has).
+    """
+    return {
+        "checkpoint": _CHECKPOINT,
+        "quantized": _QUANTIZE,
+        "default_variant": "student" if _ADAPTER else "teacher",
+        "claude": _ENGINE.get("anthropic_client") is not None,
+    }
 
 
 @app.get("/")
