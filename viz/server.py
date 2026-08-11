@@ -198,8 +198,10 @@ def extract(req: ExtractRequest) -> dict:
     except SystemExit as e:
         return fail(str(e))
 
-    # Build the prompt with this request's dietary restrictions + variant (live path).
-    system_prompt = build_system_prompt(req.dietary, live=True, variant=variant)
+    # Build the prompt with this request's dietary restrictions + variant. (There is
+    # no `live=` argument any more: v2 removed the offline stub, so every prompt is
+    # the live one. Passing it raised TypeError on EVERY extraction.)
+    system_prompt = build_system_prompt(req.dietary, variant=variant)
 
     # Mark the start of the episode so the buffered tool-call prints below can be
     # attributed to a query/agent. flush=True so it shows immediately even though
@@ -216,7 +218,10 @@ def extract(req: ExtractRequest) -> dict:
                 _ENGINE["model"], _ENGINE["tokenizer"], query, tools, registry, system_prompt
             )
         else:
-            answer = run_claude_episode(
+            # claude_agent.run_episode returns (final_text, messages) -- unpack it.
+            # Binding the tuple to `answer` fed a tuple to extract_json and made
+            # every Claude extraction fail as unparseable.
+            answer, _messages = run_claude_episode(
                 _ENGINE["anthropic_client"], query, tools, registry, system_prompt,
                 model=CLAUDE_AGENTS[agent],
             )
