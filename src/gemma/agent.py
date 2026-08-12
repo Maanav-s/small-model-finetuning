@@ -57,6 +57,41 @@ def render_prompt(tokenizer, messages: list[dict], tools: list) -> str:
 
 END_OF_TURN = "<turn|>"   # Gemma 4's end-of-turn marker
 
+CHANNEL_OPEN = "<|channel>"
+CHANNEL_CLOSE = "<channel|>"
+
+
+def open_channel_suffix(prompt: str) -> str:
+    """The unclosed reasoning-channel opener the TEMPLATE pre-wrote, if any.
+
+    The SFT tokenizer's template opens the thinking channel for the model after a
+    tool response, so the generation prompt ends with `<|channel>thought\\n` and the
+    completion starts *inside* that channel -- as prose, with no opener of its own.
+    `parse_response` then reads the whole turn as plain content and reports NO tool
+    calls, even though the text ends in a perfectly well-formed one:
+
+        step 0  prompt ends '<|turn>model\\n'      -> model emits '<|channel>thought'
+                text is self-contained             -> parses: thinking + tool_calls
+        step 1+ prompt ends '<|channel>thought\\n' -> text starts mid-channel
+                                                   -> parses: content, NO tool_calls
+
+    The loop then treats a tool call as the final answer and the episode ends on
+    prose instead of JSON. Re-attaching this suffix makes every turn look like step
+    0, which is what the parser can actually read.
+
+    Why not `parse_response(prefix=...)`, which exists for exactly this: the kwarg
+    raises TypeError on the transformers versions we run (checked 5.10 and 5.13), so
+    parse_turn's prefix branch never engages. This works regardless of version.
+
+    Returns "" when the prompt does not end inside an open channel, so the step-0
+    case and the base model's template are both untouched.
+    """
+    i = prompt.rfind(CHANNEL_OPEN)
+    if i == -1:
+        return ""
+    tail = prompt[i:]
+    return "" if CHANNEL_CLOSE in tail else tail
+
 
 def strip_end_of_turn(text: str) -> str:
     """Drop a trailing `<turn|>` (end-of-turn), leaving any other marker alone.
@@ -106,7 +141,9 @@ def parse_turn(tokenizer, text: str, prefix: str) -> dict:
     genuine parse failure (malformed tool-call arguments) must still propagate, since
     run_episode's recovery path depends on it.
     """
-    text = strip_end_of_turn(text)
+    # Re-attach a channel opener the template pre-wrote into the prompt, so the text
+    # is self-contained no matter which parse path below we land on.
+    text = open_channel_suffix(prefix) + strip_end_of_turn(text)
     try:
         return tokenizer.parse_response(text, prefix=prefix)
     except TypeError:

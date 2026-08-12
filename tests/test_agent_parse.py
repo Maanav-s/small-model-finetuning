@@ -51,6 +51,72 @@ class FakeTokenizer:
         return {"role": "assistant", "content": text}
 
 
+class ChannelSensitiveTokenizer:
+    """parse_response as the real Gemma-4 tokenizer behaves on a mid-channel turn.
+
+    Measured live (2026-08-12, SFT tokenizer + transformers 5.10 and 5.13): a tool
+    call is only recognised when the text is a SELF-CONTAINED turn -- i.e. it starts
+    at a channel opener (or at the tool call itself). Text that starts as prose,
+    because the template already opened the channel in the PROMPT, parses to plain
+    content and the tool call is lost. `prefix=` does not help: it raises TypeError
+    on both versions.
+    """
+
+    def parse_response(self, text, prefix=None):
+        if prefix is not None:
+            raise TypeError("parse_response() got an unexpected keyword 'prefix'")
+        if text.startswith(ag.CHANNEL_OPEN) or text.startswith("<|tool_call>"):
+            out = {"role": "assistant"}
+            if "<|tool_call>" in text:
+                out["tool_calls"] = [{"type": "function",
+                                      "function": {"name": "scrape_url", "arguments": {}}}]
+            if ag.CHANNEL_CLOSE in text:
+                out["thinking"] = text.split(ag.CHANNEL_CLOSE)[0]
+            return out
+        return {"role": "assistant", "content": text}
+
+
+MID_CHANNEL_TEXT = (
+    "The user wants the menu.\nI will scrape it.<channel|>"
+    "<|tool_call>call:scrape_url{}<tool_call|>"
+)
+
+
+class TestOpenChannelSuffix:
+    """The template pre-writes `<|channel>thought` after a tool response, so every
+    turn AFTER the first starts mid-channel. Without re-attaching it, the loop reads
+    a tool call as the final answer and the episode ends on prose, not JSON."""
+
+    def test_returns_the_opener_the_template_pre_wrote(self):
+        prompt = "...tool output...<tool_response|><|channel>thought\n"
+        assert ag.open_channel_suffix(prompt) == "<|channel>thought\n"
+
+    def test_empty_when_the_channel_was_closed_again(self):
+        prompt = "<|channel>thought\nreasoned<channel|>done<turn|>\n<|turn>model\n"
+        assert ag.open_channel_suffix(prompt) == ""
+
+    def test_empty_when_the_prompt_has_no_channel(self):
+        # step 0: the model opens the channel itself, so nothing to re-attach
+        assert ag.open_channel_suffix("<|turn>user\nx<turn|>\n<|turn>model\n") == ""
+
+    def test_tool_call_is_lost_without_the_fix(self):
+        """Pins the bug itself, so a regression is unambiguous."""
+        tok = ChannelSensitiveTokenizer()
+        assert "tool_calls" not in tok.parse_response(MID_CHANNEL_TEXT)
+
+    def test_parse_turn_recovers_the_tool_call(self):
+        tok = ChannelSensitiveTokenizer()
+        parsed = ag.parse_turn(tok, MID_CHANNEL_TEXT, "<tool_response|><|channel>thought\n")
+        assert parsed.get("tool_calls"), "the tool call must survive a mid-channel turn"
+
+    def test_a_self_contained_turn_is_unchanged(self):
+        """Step 0 already parses; the fix must not double-open its channel."""
+        tok = ChannelSensitiveTokenizer()
+        text = ag.CHANNEL_OPEN + "thought\nreasoning<channel|><|tool_call>call:x{}<tool_call|>"
+        parsed = ag.parse_turn(tok, text, "<|turn>model\n")
+        assert parsed.get("tool_calls")
+
+
 class TestStripEndOfTurn:
     def test_strips_only_a_trailing_end_of_turn(self):
         assert ag.strip_end_of_turn("answer<turn|>") == "answer"
