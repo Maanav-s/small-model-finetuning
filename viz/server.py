@@ -91,6 +91,14 @@ _ADAPTER = os.environ.get("VIZ_ADAPTER", "").strip()
 # nothing but fast decode. That is what keeps inference byte-matched to training.
 _VLLM_URL = os.environ.get("VIZ_GEMMA_VLLM_URL", "").strip()
 _VLLM_MODEL = os.environ.get("VIZ_GEMMA_VLLM_MODEL", "gemma-menu").strip()
+# Per-turn generation budget. Deliberately well above the 4096 the eval ran at:
+# a dietary-conditioned episode over a large menu annotates every dish before it
+# writes any JSON, and 4096 cuts it off mid-reasoning -- which surfaces to the user
+# as "not valid JSON" with no clue that the model just ran out of room (measured
+# 2026-08-12: that episode needed 6159). build_gemma_completions still clamps this
+# to whatever the server's context window leaves after the prompt, so raising it
+# cannot cause the 400 that clamp exists to prevent.
+_VLLM_MAX_TOKENS = int(os.environ.get("VIZ_GEMMA_MAX_TOKENS", "16384"))
 
 # A label for the UI, so a screenshot can never be mistaken for the wrong model.
 if _VLLM_URL:
@@ -159,7 +167,8 @@ def _load_vllm_backend():
     # it a long, tool-heavy episode 400s -- silently failing exactly the episodes that
     # gathered the most evidence (see openai_agent.build_gemma_completions).
     generate = build_gemma_completions(
-        build_client(_VLLM_URL), _VLLM_MODEL, tokenizer=tokenizer,
+        build_client(_VLLM_URL), _VLLM_MODEL, max_tokens=_VLLM_MAX_TOKENS,
+        tokenizer=tokenizer,
     )
     return None, tokenizer, generate
 

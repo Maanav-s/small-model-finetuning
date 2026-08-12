@@ -180,6 +180,15 @@ def build_gemma_completions(client, model: str, max_tokens: int = 4096,
         text = choice.text
         if getattr(choice, "stop_reason", None) == stop:
             text += stop  # restore the marker vLLM stripped, so parse_response is happy
+        elif getattr(choice, "finish_reason", None) == "length":
+            # NOT cosmetic. A truncated turn has no closing `<channel|>`, so the whole
+            # thing parses as `thinking` with no content, and the caller hands the raw
+            # reasoning back as if it were the answer -- the user sees "not valid JSON"
+            # and no hint that the model simply ran out of room. Measured 2026-08-12:
+            # a dietary-conditioned episode over a large menu reasoned past 4096 tokens
+            # (it annotates every dish) and needed 6159 to finish.
+            print(f"  [warn] generation hit the {eff_max}-token budget and was cut off "
+                  f"mid-turn; this turn is incomplete (raise max_tokens)", flush=True)
         return text
 
     return generate

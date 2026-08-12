@@ -186,6 +186,51 @@ def test_run_episode_reraises_non_context_error():
         run_episode(client, "teacher", "X", TOOLS, REGISTRY, "SYS")
 
 
+class _CompletionsClient:
+    """The RAW /v1/completions surface build_gemma_completions talks to.
+
+    Separate from FakeClient, which doubles the chat/tools path -- the Gemma student
+    deliberately does NOT use that one (no Gemma-4 tool parser in vLLM).
+    """
+
+    def __init__(self, text, *, stop_reason=None, finish_reason="stop"):
+        self.calls = []
+        outer = self
+
+        class _C:
+            def create(self, **kw):
+                outer.calls.append(kw)
+                choice = type("Ch", (), {"text": text, "stop_reason": stop_reason,
+                                         "finish_reason": finish_reason})()
+                return type("R", (), {"choices": [choice]})()
+
+        self.completions = _C()
+
+
+def test_gemma_completions_restores_the_stripped_stop_marker():
+    """vLLM strips the stop string; parse_response needs it back or it sees no call."""
+    client = _CompletionsClient("call:web_search{}", stop_reason="<tool_call|>")
+    gen = oa.build_gemma_completions(client, "m", max_model_len=40960)
+    assert gen("prompt").endswith("<tool_call|>")
+
+
+def test_gemma_completions_warns_when_the_turn_is_cut_off(capsys):
+    """A truncated turn has no closing channel, so it parses as pure `thinking` and
+    the caller returns the raw reasoning as if it were the answer. Silent truncation
+    reads to the user as 'the model emitted garbage'; say so instead."""
+    client = _CompletionsClient("reasoning...", finish_reason="length")
+    gen = oa.build_gemma_completions(client, "m", max_tokens=4096, max_model_len=40960)
+    gen("prompt")
+    assert "cut off" in capsys.readouterr().out
+
+
+def test_gemma_completions_passes_the_requested_budget_through():
+    client = _CompletionsClient("x", finish_reason="stop")
+    gen = oa.build_gemma_completions(client, "m", max_tokens=16384, max_model_len=98304)
+    gen("prompt")
+    assert client.calls[0]["max_tokens"] == 16384
+
+
 def test_output_budget_clamps_to_window(monkeypatch):
     # Known (small) window + large prompt -> requested max_tokens clamped below
     # MAX_TOKENS but never under the floor.
