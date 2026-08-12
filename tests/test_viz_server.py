@@ -64,7 +64,8 @@ def test_extraction_builds_a_real_prompt_and_returns_the_menu(client, monkeypatc
     what the endpoint passes, for both variants and with restrictions set."""
     seen = {}
 
-    def fake_episode(model, tokenizer, name, tools, registry, system_prompt):
+    def fake_episode(model, tokenizer, name, tools, registry, system_prompt,
+                     vllm_generate=None):
         seen["prompt"] = system_prompt
         return json.dumps(MENU)
 
@@ -117,6 +118,58 @@ def test_config_defaults_to_the_variant_the_checkpoint_was_trained_under(client,
 
     monkeypatch.setattr(server, "_ADAPTER", "")
     assert client.get("/api/config").json()["default_variant"] == "teacher"
+
+
+# --- the vLLM backend ---------------------------------------------------------
+
+def test_vllm_generate_is_passed_through_to_the_loop(client, monkeypatch):
+    """On the vLLM path `model` is None and generation is delegated -- the loop is
+    otherwise identical, so a dropped vllm_generate would look like 'model is None'
+    deep inside agent.generate_turn rather than a config error."""
+    seen = {}
+
+    def fake_episode(model, tokenizer, name, tools, registry, system_prompt, vllm_generate=None):
+        seen["model"] = model
+        seen["vllm_generate"] = vllm_generate
+        return json.dumps(MENU)
+
+    monkeypatch.setitem(server._ENGINE, "model", None)
+    monkeypatch.setitem(server._ENGINE, "vllm_generate", lambda prompt: "x")
+    monkeypatch.setattr(server, "run_gemma_episode", fake_episode)
+
+    assert _post(client)["ok"] is True
+    assert seen["model"] is None
+    assert callable(seen["vllm_generate"])
+
+
+def test_vllm_plus_adapter_is_refused(monkeypatch):
+    """Both set = the adapter silently does nothing, and the UI would label the
+    served model as the adapter's. Fail loudly at startup instead."""
+    monkeypatch.setattr(server, "_VLLM_URL", "http://127.0.0.1:8001/v1")
+    monkeypatch.setattr(server, "_ADAPTER", "models/sft-adapter")
+    with pytest.raises(SystemExit, match="mutually exclusive"):
+        server._load_vllm_backend()
+
+
+def test_config_reports_the_backend_and_still_defaults_to_student(client, monkeypatch):
+    monkeypatch.setattr(server, "_VLLM_URL", "http://127.0.0.1:8001/v1")
+    monkeypatch.setattr(server, "_ADAPTER", "")
+    cfg = client.get("/api/config").json()
+    # vLLM here always serves a MERGED student, so the student prompt is still right
+    assert cfg["backend"] == "vllm"
+    assert cfg["default_variant"] == "student"
+    assert cfg["quantized"] is False
+
+
+def test_adapter_on_a_4bit_base_is_refused(monkeypatch):
+    """The ~32-point trap. VIZ_QUANTIZE defaults ON, so the obvious launch command
+    would otherwise be the broken one."""
+    monkeypatch.setattr(server, "_VLLM_URL", "")
+    monkeypatch.setattr(server, "_ADAPTER", "models/sft-adapter")
+    monkeypatch.setattr(server, "_QUANTIZE", True)
+    monkeypatch.setattr(server, "load_model", lambda **kw: (object(), object()))
+    with pytest.raises(SystemExit, match="4-bit"):
+        server._load_local_backend()
 
 
 # --- input validation ---------------------------------------------------------

@@ -48,7 +48,7 @@ from pydantic import BaseModel
 # convention run_agent.py / run_claude.py set up so we can reuse both engines.
 _REPO = Path(__file__).resolve().parent.parent
 _SRC = _REPO / "src"
-for _p in (_SRC, _SRC / "gemma", _SRC / "claude"):
+for _p in (_SRC, _SRC / "gemma", _SRC / "claude", _SRC / "serving"):
     sys.path.insert(0, str(_p))
 
 load_dotenv(_REPO / ".env")  # BRAVE_API_KEY (+ ANTHROPIC_API_KEY for Claude)
@@ -80,8 +80,25 @@ _QUANTIZE = os.environ.get("VIZ_QUANTIZE", "1") != "0"
 # top of the base. Unset = the raw base model. This is how the viz serves the
 # SHIPPED student rather than an untrained Gemma.
 _ADAPTER = os.environ.get("VIZ_ADAPTER", "").strip()
+
+# VIZ_GEMMA_VLLM_URL: serve Gemma from a vLLM server instead of loading it in-process
+# (~3x faster decode, and no 15 GB of weights in this process). The checkpoint is
+# whatever vLLM was started on -- a MERGED bf16 text-only build, so there is no
+# adapter to apply here and VIZ_ADAPTER is meaningless (and refused) in this mode.
+#
+# The student goes over raw /v1/completions, NOT chat/tools: vLLM ships no Gemma-4
+# tool-call parser, so we keep OUR chat template and OUR parser and let vLLM do
+# nothing but fast decode. That is what keeps inference byte-matched to training.
+_VLLM_URL = os.environ.get("VIZ_GEMMA_VLLM_URL", "").strip()
+_VLLM_MODEL = os.environ.get("VIZ_GEMMA_VLLM_MODEL", "gemma-menu").strip()
+
 # A label for the UI, so a screenshot can never be mistaken for the wrong model.
-_CHECKPOINT = (Path(_ADAPTER).name if _ADAPTER else "base (untrained)")
+if _VLLM_URL:
+    _CHECKPOINT = f"{_VLLM_MODEL} (vLLM)"
+elif _ADAPTER:
+    _CHECKPOINT = Path(_ADAPTER).name
+else:
+    _CHECKPOINT = "base (untrained)"
 
 _ENGINE: dict = {}                 # model/tokenizer/client, populated at startup
 _EPISODE_LOCK = threading.Lock()   # serialize episodes (single GPU: concurrent generate() would race/OOM)
@@ -115,9 +132,40 @@ def _get_tools() -> tuple:
         return _TOOLS_CACHE[0]
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    """Load the model and Anthropic client once at startup (tools are built lazily)."""
+def _load_vllm_backend():
+    """Tokenizer + a vLLM-backed generate(). No weights live in this process.
+
+    The student goes over raw /v1/completions with OUR chat template and OUR parser,
+    never vLLM's chat/tools path -- vLLM ships no Gemma-4 tool-call parser, and
+    re-templating would drift from the exact wire format the model was SFT'd on.
+    """
+    if _ADAPTER:
+        raise SystemExit(
+            "VIZ_ADAPTER and VIZ_GEMMA_VLLM_URL are mutually exclusive: on the vLLM path "
+            "the adapter must already be MERGED into the served checkpoint. Setting it "
+            "here would quietly do nothing and report the served model's menus as the "
+            "adapter's."
+        )
+    from transformers import AutoTokenizer
+
+    from model import MODEL_ID
+    from openai_agent import build_client, build_gemma_completions
+
+    # GEMMA_MODEL_PATH should point at the SAME checkpoint vLLM is serving, so the
+    # template we render with matches the weights byte for byte.
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
+    print(f"Gemma served by vLLM at {_VLLM_URL} (model={_VLLM_MODEL})", flush=True)
+    # Passing the tokenizer clamps max_tokens to the server's context window. Without
+    # it a long, tool-heavy episode 400s -- silently failing exactly the episodes that
+    # gathered the most evidence (see openai_agent.build_gemma_completions).
+    generate = build_gemma_completions(
+        build_client(_VLLM_URL), _VLLM_MODEL, tokenizer=tokenizer,
+    )
+    return None, tokenizer, generate
+
+
+def _load_local_backend():
+    """Load Gemma in-process via HF transformers, optionally with a PEFT adapter."""
     model, tokenizer = load_model(quantize=_QUANTIZE, attn="sdpa")
     if _ADAPTER:
         # REFUSE 4-bit + adapter. The adapter was trained against a bf16 base, and
@@ -137,6 +185,17 @@ async def lifespan(app: FastAPI):
         print(f"Applying adapter {_ADAPTER} ...", flush=True)
         model = PeftModel.from_pretrained(model, _ADAPTER)
         model.eval()
+    return model, tokenizer
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Load the model and Anthropic client once at startup (tools are built lazily)."""
+    if _VLLM_URL:
+        model, tokenizer, vllm_generate = _load_vllm_backend()
+    else:
+        model, tokenizer = _load_local_backend()
+        vllm_generate = None
     # Claude is optional: only wire it up if a key is present, so the server still
     # boots (Gemma-only) without ANTHROPIC_API_KEY.
     anthropic_client = anthropic.Anthropic() if os.environ.get("ANTHROPIC_API_KEY") else None
@@ -144,8 +203,10 @@ async def lifespan(app: FastAPI):
         model=model,
         tokenizer=tokenizer,
         anthropic_client=anthropic_client,
+        vllm_generate=vllm_generate,
     )
-    print(f"Gemma checkpoint: {_CHECKPOINT} ({'4-bit' if _QUANTIZE else 'bf16'})")
+    precision = "vLLM" if _VLLM_URL else ("4-bit" if _QUANTIZE else "bf16")
+    print(f"Gemma checkpoint: {_CHECKPOINT} ({precision})")
     print(f"Agents available: gemma{' + claude' if anthropic_client else ' (claude disabled: no ANTHROPIC_API_KEY)'}")
     print(f"web_search (Brave): {'key set' if has_search_key() else 'NO KEY — set BRAVE_API_KEY'}")
     print("scrape_url (local Chromium): no key needed")
@@ -214,8 +275,12 @@ def extract(req: ExtractRequest) -> dict:
 
     with _EPISODE_LOCK:
         if agent == "gemma":
+            # Same loop either way. On the vLLM path `model` is None and generation is
+            # delegated to vllm_generate; everything else -- template, parser, tool
+            # loop -- is identical, which is the point.
             answer = run_gemma_episode(
-                _ENGINE["model"], _ENGINE["tokenizer"], query, tools, registry, system_prompt
+                _ENGINE["model"], _ENGINE["tokenizer"], query, tools, registry, system_prompt,
+                vllm_generate=_ENGINE.get("vllm_generate"),
             )
         else:
             # claude_agent.run_episode returns (final_text, messages) -- unpack it.
@@ -241,10 +306,12 @@ def config() -> dict:
     train/serve mismatch and would under-report the model. The raw base has no such
     constraint and keeps the teacher prompt (its guidance is all it has).
     """
+    trained = bool(_ADAPTER or _VLLM_URL)   # vLLM here always serves a merged student
     return {
         "checkpoint": _CHECKPOINT,
-        "quantized": _QUANTIZE,
-        "default_variant": "student" if _ADAPTER else "teacher",
+        "quantized": _QUANTIZE and not _VLLM_URL,
+        "backend": "vllm" if _VLLM_URL else "transformers",
+        "default_variant": "student" if trained else "teacher",
         "claude": _ENGINE.get("anthropic_client") is not None,
     }
 

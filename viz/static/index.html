@@ -266,7 +266,7 @@
         tag.className = "by";
         tag.style.marginBottom = "10px";
         tag.textContent = `serving ${cfg.checkpoint}` +
-          (cfg.quantized ? " · 4-bit" : " · bf16");
+          (cfg.backend === "vllm" ? "" : (cfg.quantized ? " · 4-bit" : " · bf16"));
         document.querySelector(".status").before(tag);
       }
     } catch (e) { /* server too old for /api/config -- leave the UI as-is */ }
