@@ -181,6 +181,24 @@ The HF `model.generate` path is single-GPU and not thread-safe, which is why [sc
 
 - **Serve the merged bf16 checkpoint, never 4-bit base + adapter** (the v1 QLoRA-fidelity finding: an adapter trained on a bf16 base misbehaves on a 4-bit base — 4-bit serving alone cost ~32 points of success rate; see [notes/experiments.md](notes/experiments.md)).
 
+### Serving on the 24 GB dev box (A10G, measured 2026-08-12)
+
+The devbox *can* serve Gemma-4 on vLLM — its driver is 595 (≥580), and Ampere falls back to `TRITON_ATTN` cleanly, exactly as on the A100. Three things are load-bearing, and the viz drives it via `VIZ_GEMMA_VLLM_URL` (see [viz/server.py](viz/server.py)):
+
+- **Pin `transformers==5.13.0` in the vLLM venv.** 5.14+ (checked 5.14.1 and 5.15.0) raises `AmbiguousGlobalPerLayerAttributeError: 'head_dim' is a per-layer attribute` while merely *loading* the config — inside transformers' own `validate_architecture`, before vLLM gets a say. Gemma-4's mixed 256/512 heads are exactly the heterogeneity that guard fires on. Symptom: the serve dies instantly with a transformers traceback and no vLLM error at all.
+- **`--enforce-eager` is REQUIRED at 24 GB, not an optimisation.** Without it CUDA-graph capture eats the headroom and vLLM refuses to start: `1.6 GiB KV cache is needed ... available 0.19 GiB ... estimated maximum model length is 6080`. With it, at `--gpu-memory-utilization 0.92`, the same box reports **343,681 tokens** of KV — a 1800× difference in usable cache, from one flag.
+- **Render with the SERVED checkpoint's tokenizer, not the base's.** The SFT template (18.1 KB) and the base template (16.9 KB) differ: the SFT one pre-opens the thinking channel after a tool response, so a completion starts mid-channel and `parse_response` loses the tool call (fixed by `open_channel_suffix` in [src/gemma/agent.py](src/gemma/agent.py); `parse_response(prefix=...)` does NOT help — the kwarg raises TypeError on 5.10 and 5.13 alike). Pointing `GEMMA_MODEL_PATH` at the base while serving SFT weights hides the bug *and* is a train/serve mismatch.
+
+```bash
+env PATH=/opt/vllm/bin:$PATH /opt/vllm/bin/vllm serve /path/merged-text \
+    --served-model-name gemma-menu --max-model-len 98304 \
+    --gpu-memory-utilization 0.92 --enforce-eager --host 127.0.0.1 --port 8001
+```
+
+Measured on the same episode with a warm cache: **157 s on vLLM vs 317 s on HF transformers (2.0×)**, byte-identical menu. The HF path's ~5 min is almost entirely generation — tool calls off a warm cache are free (302 s cold vs 317 s warm).
+
+`merged-text` for the SFT student now lives at `v2/models/gemma-4-e4b-it/sft/gemma-menu-sft/merged-text/` so it never has to be rebuilt. **This box cannot rebuild it**: `to_text_only.py` needs ~35 GB of RAM (it holds the source and the new text model at once) against the devbox's 15 GB. Build it on a pod.
+
 ### GRPO (`--use-vllm`) is a DIFFERENT setup from serving — don't copy the eval recipe
 
 - **ONE unified cu130 env, not two.** Eval talks to a vLLM **server** over HTTP, so vLLM lives in its own venv (CLAUDE.md's "never install vllm into `.venv`" rule). TRL's GRPO **colocate** mode imports `vllm` **in-process** alongside the trainer, so vLLM + torch + trl MUST share one env. Build it vLLM-first so it pins the stack, then add the rest — the repo's `torch>=2.11.0` is satisfied by vLLM's cu130 wheel, and on a CUDA-13 host cu130 is the *correct* build (the `cu128` pin in [pyproject.toml](pyproject.toml) is a dev-box convention, not a requirement):
