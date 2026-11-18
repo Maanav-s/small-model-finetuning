@@ -67,6 +67,7 @@ from claude_agent import (                              # noqa: E402
     run_episode as run_claude_episode,
 )
 from schema import extract_json                        # noqa: E402
+from cache import Cache                                # noqa: E402
 
 # UI agent value -> Claude model id. Both run the SAME claude_agent loop; only the
 # model differs (and the loop picks the right thinking config per model).
@@ -99,6 +100,16 @@ _VLLM_MODEL = os.environ.get("VIZ_GEMMA_VLLM_MODEL", "gemma-menu").strip()
 # to whatever the server's context window leaves after the prompt, so raising it
 # cannot cause the 400 that clamp exists to prevent.
 _VLLM_MAX_TOKENS = int(os.environ.get("VIZ_GEMMA_MAX_TOKENS", "16384"))
+
+# VIZ_CACHE_PATH: the Phase-2 tool-call cache (data/cache.sqlite). Every OTHER
+# caller of setup_tools() passes one; the viz was the lone exception, so every
+# demo search/scrape went to the live network and paid full latency for pages
+# the corpus had already captured. Default policy is "live": a hit is served
+# from SQLite, a miss still goes out and is stored. Set VIZ_CACHE_PATH="" to
+# force the old always-live behaviour, or VIZ_CACHE_POLICY=canned to guarantee
+# a demo makes no network calls at all (a miss then returns a miss, not a hang).
+_CACHE_PATH = os.environ.get("VIZ_CACHE_PATH", str(_REPO / "data" / "cache.sqlite")).strip()
+_CACHE_POLICY = os.environ.get("VIZ_CACHE_POLICY", "live").strip()
 
 # A label for the UI, so a screenshot can never be mistaken for the wrong model.
 if _VLLM_URL:
@@ -135,7 +146,10 @@ def _get_tools() -> tuple:
     """
     with _TOOLS_LOCK:
         if not _TOOLS_CACHE:
-            tools, registry, _ = setup_tools()
+            cache = None
+            if _CACHE_PATH and Path(_CACHE_PATH).exists():
+                cache = Cache(_CACHE_PATH, miss_policy=_CACHE_POLICY)
+            tools, registry, _ = setup_tools(cache=cache)
             _TOOLS_CACHE.append((tools, registry))
         return _TOOLS_CACHE[0]
 
@@ -219,6 +233,11 @@ async def lifespan(app: FastAPI):
     print(f"Agents available: gemma{' + claude' if anthropic_client else ' (claude disabled: no ANTHROPIC_API_KEY)'}")
     print(f"web_search (Brave): {'key set' if has_search_key() else 'NO KEY — set BRAVE_API_KEY'}")
     print("scrape_url (local Chromium): no key needed")
+    if _CACHE_PATH and Path(_CACHE_PATH).exists():
+        _mb = Path(_CACHE_PATH).stat().st_size / 1e6
+        print(f"tool cache: {_CACHE_PATH} ({_mb:.0f} MB, miss_policy={_CACHE_POLICY})")
+    else:
+        print(f"tool cache: OFF — every search/scrape goes live ({_CACHE_PATH or 'unset'})")
     print("Visualizer ready -> http://127.0.0.1:8000")
     yield
 
