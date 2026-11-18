@@ -2,23 +2,26 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Trace Review</title>
 <style>
+  /* Dark grey + neon/leafy green, unconditional: this used to be a light theme
+     with a prefers-color-scheme dark override, which meant the UI flipped with
+     the OS setting. One theme keeps screenshots and screen recordings stable.
+     --accent (neon) and --keep (leafy) are deliberately DIFFERENT greens: keep
+     is a semantic verdict colour and must not read as a link or a price. */
   :root {
-    --bg: #f6f7f9; --panel: #ffffff; --border: #e2e5ea; --text: #1a1d21;
-    --muted: #6b7280; --accent: #2563eb;
-    --keep: #16a34a; --keep-bg: #dcfce7; --reject: #dc2626; --reject-bg: #fee2e2;
-    --review: #d97706; --review-bg: #fef3c7; --code: #f1f3f5;
-  }
-  @media (prefers-color-scheme: dark) {
-    :root {
-      --bg: #14171a; --panel: #1c2024; --border: #2c3238; --text: #e6e9ee;
-      --muted: #9aa4b0; --accent: #60a5fa;
-      --keep: #4ade80; --keep-bg: #14351f; --reject: #f87171; --reject-bg: #3a1717;
-      --review: #fbbf24; --review-bg: #3a2c0f; --code: #161a1e;
-    }
+    --bg: #16191b; --panel: #212629; --border: #333b3e; --text: #e9efe9;
+    --muted: #93a398; --accent: #5ef08a;
+    --keep: #39d353; --keep-bg: #15301c; --reject: #f87171; --reject-bg: #3a1717;
+    --review: #fbbf24; --review-bg: #3a2c0f; --code: #1a1f21;
+    /* Ink for text ON a filled keep/reject button. These fills are light enough
+       that the old white text fell under ~2.6:1 contrast; near-black reads. */
+    --on-solid: #10140f;
   }
   * { box-sizing: border-box; }
   body {
-    margin: 0; font: 15px/1.5 system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+    /* Serif, matching the menu visualizer's stack so the two pages read as one
+       app. Code-ish surfaces (.tool-call/.tool-result/.sib-ctx) set their own
+       monospace and are deliberately untouched. */
+    margin: 0; font: 15px/1.5 Georgia, "Times New Roman", serif;
     background: var(--bg); color: var(--text);
   }
   header {
@@ -27,7 +30,8 @@
     border-bottom: 1px solid var(--border);
   }
   header h1 { font-size: 16px; margin: 0; font-weight: 700; }
-  .progress { font-variant-numeric: tabular-nums; color: var(--muted); }
+  .leaf { color: var(--accent); vertical-align: -3px; margin-right: 7px; }
+  .progress { font-variant-numeric: lining-nums tabular-nums; color: var(--muted); }
   .progress b { color: var(--text); }
   .spacer { flex: 1; }
   button, select {
@@ -46,9 +50,11 @@
     display: flex; gap: 8px; align-items: center; font-size: 13px;
   }
   .navitem:hover { background: var(--bg); }
-  .navitem.active { background: var(--review-bg); }
+  /* Green-tinted, with an accent rail: the old --review-bg (amber) read as a
+     muddy brown against this palette and looked like a warning, not a cursor. */
+  .navitem.active { background: #1e2b22; box-shadow: inset 3px 0 0 var(--accent); }
   .navitem .nm { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .nav-g { font-size: 11px; font-variant-numeric: tabular-nums; padding: 0 5px; border-radius: 999px; flex: none; }
+  .nav-g { font-size: 11px; font-variant-numeric: lining-nums tabular-nums; padding: 0 5px; border-radius: 999px; flex: none; }
   .nav-g.g-red { background: var(--reject-bg); color: var(--reject); }
   .nav-g.g-amber { background: var(--review-bg); color: var(--review); }
   .nav-g.g-green { background: var(--keep-bg); color: var(--keep); }
@@ -59,7 +65,10 @@
   .title { font-size: 26px; font-weight: 700; margin: 0 0 2px; }
   .sub { color: var(--muted); margin-bottom: 12px; }
   .badges { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 10px; }
-  .badge { font-size: 12px; padding: 3px 9px; border-radius: 999px; border: 1px solid var(--border); }
+  /* lining figures: the trace-id badge is a hex hash, and Georgia's default
+     old-style figures make one hard to read against. */
+  .badge { font-size: 12px; padding: 3px 9px; border-radius: 999px; border: 1px solid var(--border);
+           font-variant-numeric: lining-nums; }
   .badge.found { background: var(--keep-bg); color: var(--keep); border-color: transparent; }
   .badge.notfound { background: var(--reject-bg); color: var(--reject); border-color: transparent; }
   .badge.diet { background: var(--review-bg); color: var(--review); border-color: transparent; }
@@ -70,7 +79,7 @@
   .item { display: flex; justify-content: space-between; gap: 12px; padding: 3px 0; border-bottom: 1px dashed var(--border); }
   .item .iname { font-weight: 500; }
   .item .idesc { color: var(--muted); font-size: 13px; }
-  .item .price { font-variant-numeric: tabular-nums; white-space: nowrap; color: var(--accent); }
+  .item .price { font-variant-numeric: lining-nums tabular-nums; white-space: nowrap; color: var(--accent); }
   a { color: var(--accent); word-break: break-all; }
   details { margin-top: 8px; }
   summary { cursor: pointer; font-weight: 600; }
@@ -80,16 +89,16 @@
   .tool-result { font-family: ui-monospace, Menlo, monospace; font-size: 12px; background: var(--code); padding: 6px 8px; border-radius: 6px; margin: 4px 0; white-space: pre-wrap; max-height: 180px; overflow: auto; }
   .decide { position: sticky; bottom: 0; display: flex; gap: 12px; padding: 14px 0 4px; background: linear-gradient(transparent, var(--bg) 30%); }
   .btn-keep { font-size: 16px; font-weight: 700; padding: 12px 26px; border-radius: 10px; }
-  .btn-keep.on { background: var(--keep); color: #fff; border-color: var(--keep); }
+  .btn-keep.on { background: var(--keep); color: var(--on-solid); border-color: var(--keep); }
   .btn-reject { font-size: 16px; font-weight: 700; padding: 12px 26px; border-radius: 10px; }
-  .btn-reject.on { background: var(--reject); color: #fff; border-color: var(--reject); }
+  .btn-reject.on { background: var(--reject); color: var(--on-solid); border-color: var(--reject); }
   .hint { color: var(--muted); font-size: 12px; align-self: center; }
   .toast { position: fixed; bottom: 18px; right: 18px; background: var(--panel); border: 1px solid var(--border); padding: 10px 16px; border-radius: 8px; box-shadow: 0 4px 16px rgba(0,0,0,.2); opacity: 0; transition: opacity .2s; }
   .toast.show { opacity: 1; }
   .sibling-panel { border: 1px solid var(--border); border-radius: 10px; padding: 12px 14px; margin-bottom: 12px; background: var(--code); }
   .sibling-head { display: flex; gap: 10px; align-items: baseline; flex-wrap: wrap; margin-bottom: 8px; }
   .sibling-head .rname { font-weight: 700; }
-  .grounding { font-variant-numeric: tabular-nums; font-weight: 700; padding: 1px 8px; border-radius: 999px; }
+  .grounding { font-variant-numeric: lining-nums tabular-nums; font-weight: 700; padding: 1px 8px; border-radius: 999px; }
   .grounding.g-red { background: var(--reject-bg); color: var(--reject); }
   .grounding.g-amber { background: var(--review-bg); color: var(--review); }
   .grounding.g-green { background: var(--keep-bg); color: var(--keep); }
@@ -109,12 +118,12 @@
   .open-sib { margin: 8px 0 4px; font-size: 13px; }
   .sibling-actions { margin: 8px 0; display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
   .sibling-actions button { font-size: 13px; padding: 5px 12px; }
-  .sibling-actions .sib-reject.on { background: var(--reject); color: #fff; border-color: var(--reject); }
-  .sibling-actions .sib-keep.on { background: var(--keep); color: #fff; border-color: var(--keep); }
+  .sibling-actions .sib-reject.on { background: var(--reject); color: var(--on-solid); border-color: var(--reject); }
+  .sibling-actions .sib-keep.on { background: var(--keep); color: var(--on-solid); border-color: var(--keep); }
   .sibling-actions .sib-actlabel { color: var(--muted); font-size: 12px; }
   .sib-decided { font-size: 11px; font-weight: 700; padding: 1px 8px; border-radius: 999px; text-transform: uppercase; letter-spacing: .04em; }
-  .sib-decided.reject { background: var(--reject); color: #fff; }
-  .sib-decided.keep { background: var(--keep); color: #fff; }
+  .sib-decided.reject { background: var(--reject); color: var(--on-solid); }
+  .sib-decided.keep { background: var(--keep); color: var(--on-solid); }
   .sibling-panel.sib-rejected { border-color: var(--reject); box-shadow: inset 0 0 0 1px var(--reject); }
   .sibling-view-banner { background: var(--review-bg); color: var(--review); padding: 12px 16px; border-radius: 10px; margin-bottom: 16px; display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
   .sibling-view-banner .lbl { font-weight: 700; text-transform: uppercase; font-size: 12px; letter-spacing: .04em; }
@@ -123,7 +132,7 @@
 </style>
 
 <header>
-  <h1>Trace Review</h1>
+  <h1><svg class="leaf" viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><path d="M4 20C4 10 10 4 20 4c0 10-6 16-16 16z" fill="currentColor"/><path d="M5.5 18.5C9.5 14.5 13.5 10.5 17.5 6.5" stroke="var(--panel)" stroke-width="1.6" stroke-linecap="round" fill="none"/></svg>Trace Review</h1>
   <span class="progress" id="progress">…</span>
   <div class="spacer"></div>
   <label class="hint">scope
