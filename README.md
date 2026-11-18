@@ -1,10 +1,12 @@
 # small-model-finetuning
 
-Fine-tune a small open-weight LLM (`google/gemma-4-E4B-it` — ~8B total, ~4B-effective text path) to take a **restaurant name** as input and return its **menu as structured JSON**, using **web search + scraping as inference-time tools**. The model doesn't memorize menus — it learns to *drive the tools* (search → scrape → extract) and emit the schema in [src/schema.py](src/schema.py).
+Fine-tune a small open-weight LLM (`google/gemma-4-E4B-it` — ~8B total, ~4B-effective text path) to take a **restaurant name** as input and return its **menu as structured JSON**, using **web search and scraping as inference-time tools**. The model doesn't memorize menus — it learns to *drive the tools* (search → scrape → extract) and emit the schema in [src/schema.py](src/schema.py).
 
-The teacher is a self-hosted `Qwen/Qwen3-235B-A22B-Instruct-2507-FP8`; the student is Gemma-4-E4B-it, distilled from the teacher's trajectories under a **leaner prompt than the teacher saw** (context distillation), then evaluated against the teacher's own traces.
+The teacher is a self-hosted `Qwen/Qwen3-235B-A22B-Instruct-2507-FP8`; the student is Gemma-4-E4B-it, distilled from the teacher's trajectories under a **leaner prompt than the teacher saw** (context distillation), then scored against the teacher's own traces.
 
-**This project is complete.** All five phases ran, everything is measured, and the results are below. For the engineering notes and the hard-won constraints behind every design choice, read [CLAUDE.md](CLAUDE.md) — it is the living source of truth. The narrative log of every run is [notes/experiments.md](notes/experiments.md).
+**This project is complete.** All five phases ran, everything is measured, and the results are below. The engineering notes and the hard-won constraints behind each design choice live in [CLAUDE.md](CLAUDE.md); the narrative log of every run is [notes/experiments.md](notes/experiments.md).
+
+---
 
 ## Results
 
@@ -21,46 +23,46 @@ The teacher is a self-hosted `Qwen/Qwen3-235B-A22B-Instruct-2507-FP8`; the stude
 
 **SFT is the result.** +0.12 item F1 and +9 points of precision over the untrained base, schema-validity 95.4% → 100%, and — the sharpest gain — **calibration**: false-finds (claiming a menu for a restaurant that has none) drop 29 → 10. On *finding* the menu at all the 8B student essentially matches the 235B teacher (81.3% vs 82.0%) while running 2.2× faster. What it has not closed is **completeness**: precision 0.827 against recall 0.573 — when it answers it is right, it just returns a partial menu. That gap is what GRPO was supposed to fix.
 
-**GRPO did not fix it.** Two runs, the second with the learning rate fixed (‖B‖ moved 13× further than run 1 in half the steps), produced a policy statistically indistinguishable from the SFT student — 71 wins / 75 losses per episode, all |t| < 1.96. The held-out probe stayed flat while `clipped_ratio` fell 0.32 → 0.20: the policy learned to *finish inside its budget*, not to build better menus. The standing diagnosis is the reward, not the optimizer — the grounding term pays for faithfulness to scraped evidence, which is maximized by reporting **fewer** items, while the real gap is recall. Training was called off there rather than scaled up. Full post-mortem in [notes/experiments.md](notes/experiments.md).
+**GRPO did not fix it.** Two runs, the second with the learning rate corrected (‖B‖ moved 13× further than run 1 in half the steps), produced a policy statistically indistinguishable from the SFT student — 71 wins / 75 losses per episode, all |t| < 1.96. The held-out probe stayed flat while `clipped_ratio` fell 0.32 → 0.20: the policy learned to *finish inside its budget*, not to build better menus. The standing diagnosis is the reward, not the optimizer — the grounding term pays for faithfulness to scraped evidence, which is maximized by reporting **fewer** items, while the real gap is recall. Training was called off there rather than scaled up. Full post-mortem in [notes/experiments.md](notes/experiments.md).
 
-Machine-readable reports (per-model JSON + the generated table) are committed under [results/](results/); per-episode candidate traces are archived to S3. The chart above is generated from those reports — `uv run python scripts/analysis/make_charts.py` — so it cannot drift from them.
+Machine-readable reports (per-model JSON plus the generated table) are committed under [results/](results/); per-episode candidate traces are archived to S3. The chart is generated from those reports — `uv run python scripts/analysis/make_charts.py` — so it cannot drift from them.
 
-## Pipeline
-
-| Phase | What it produced |
+| phase | what it produced |
 |---|---|
 | 1. Agentic tool-call loop | `web_search` + `scrape_url` driving Gemma-4 through the Gemma-4 tool wire format |
-| 2. Tool-call caching + teacher corpus | 2233 teacher traces (2074 kept after review) + a content-addressed SQLite cache |
+| 2. Tool caching + teacher corpus | 2,233 teacher traces and a content-addressed SQLite cache of every fetch |
 | 3. SFT distillation | the shipped LoRA adapter — r=16, α=32, lr 2e-4, 3 epochs, ~35M trainable params |
 | 4. GRPO RL | trace-free RL on a teacher-free reward — measured, null, stopped |
 | 5. Eval | two scored run-sets, paired against the teacher's references |
 
 Every stage after phase 1 runs on rented RunPod GPUs, driven by the phased bootstrap scripts in [scripts/infra/](scripts/infra/) ([eval_pod.sh](scripts/infra/eval_pod.sh), [grpo_pod.sh](scripts/infra/grpo_pod.sh)) — each is idempotent phase-by-phase and documented in its own header.
 
-### Data flow
+---
 
-Restaurant names in, a trained-and-scored model out. Two SQLite files are the only durable state; every box is a script under [scripts/](scripts/).
+## 01 · Data — collecting and cleaning the corpus
+
+None of this is a downloaded dataset. The restaurants come from public map data, the labels are a much larger model's own agentic trajectories, and the web pages those trajectories read are captured as they are fetched — so any run can later be replayed against the same bytes. Two SQLite files are the only durable state; every box below is a script under [scripts/](scripts/).
 
 ```mermaid
 flowchart TB
-    H["<b>harvest.py</b><br/>restaurant names + cities<br/>from POI APIs"] --> DB
-    DB[("<b>corpus.sqlite</b><br/>restaurants · traces")]
+    H["<b>harvest.py</b><br/>Overpass (OSM) + Google Places<br/>name · city · is_chain<br/><i>stratified by cuisine, 70%+ independents</i>"] --> DB
+    DB[("<b>corpus.sqlite</b><br/>3,005 restaurants · traces")]
     DB --> AS["<b>assign_splits.py</b><br/>seeded, deterministic,<br/>disjoint by restaurant"]
-    AS --> SP["sft 1502 &nbsp;·&nbsp; grpo 902 &nbsp;·&nbsp; eval 601"]
+    AS --> SP["sft 1,502 &nbsp;·&nbsp; grpo 902 &nbsp;·&nbsp; eval 601"]
 
-    SP --> WC["<b>warm_cache.py</b><br/>6 query templates × 3 URLs × 2 modes<br/><i>no teacher tokens spent</i>"]
-    WC --> CACHE[("<b>cache.sqlite</b><br/>search + scrape rows")]
+    SP --> WC["<b>warm_cache.py</b><br/>query templates × top-N URLs × both scrape modes<br/><i>no teacher tokens spent</i>"]
+    WC --> CACHE[("<b>cache.sqlite</b><br/>41,565 rows · 209 MB")]
 
-    SP --> BC["<b>build_corpus.py</b><br/>run the Qwen3-235B teacher<br/>over sft + eval restaurants"]
+    SP --> BC["<b>build_corpus.py</b><br/>run the Qwen3-235B teacher over<br/>the sft + eval restaurants<br/>tool budget: 8 calls per episode"]
     CACHE -.->|"served tool calls"| BC
-    BC -->|"2233 traces<br/>+ grounding at write"| DB
+    BC -->|"2,233 sft traces for training<br/>1,490 unrestricted + 743 diet-conditioned<br/>+ the eval references every score is paired against<br/>grounding computed at write"| DB
 
-    DB --> RV["<b>viz/review.py</b><br/>human review → rejected flag<br/><i>159 rejected, 2074 kept</i>"]
+    DB --> RV["<b>viz/review.py</b><br/>five reject gates → rejected flag<br/><i>158 rejected, 2,075 kept</i>"]
     RV --> DB
     CACHE --> CC["<b>clean_cache.py</b><br/>slim · reclassify · clip<br/><i>2.15 GB → 339 MB</i>"]
     CC --> CACHE
 
-    DB --> BS["<b>build_sft.py</b><br/>kept sft traces, re-rendered<br/>under the STUDENT prompt"]
+    DB --> BS["<b>build_sft.py</b><br/>kept traces, re-rendered<br/>under the STUDENT prompt"]
     DB --> BG["<b>build_grpo.py</b><br/>grpo-split prompts only<br/><i>trace-free — RL rolls out on-policy</i>"]
 
     BS --> TS["<b>train_sft.py</b><br/>LoRA r=16, 3 epochs, 2×H200"]
@@ -80,19 +82,137 @@ flowchart TB
     class ADP,ADP2,RES out
 ```
 
-The ordering constraint that matters: **`warm_cache` runs before `build_corpus`**, and the teacher runs before any student. The warm pre-pays the *student's* exploration distribution (not just the path the teacher happened to take), and the teacher's eval pass is what *creates* the reference traces every later score is measured against.
+The ordering constraint that matters: **`warm_cache` runs before `build_corpus`**, and the teacher runs before any student. The warm pre-pays the *student's* exploration distribution — not just the path the teacher happened to take — which is what makes a frozen, network-free evaluation possible at all. The teacher's eval pass is what *creates* the reference traces every later score is measured against.
 
-## How it works
+### The five reject gates
 
-- **The contract** ([src/schema.py](src/schema.py)) is the single source of truth. The prompt shows the model `SCHEMA_SNIPPET`; the eval validates against `MENU_SCHEMA`; the GRPO reward imports the same module. They cannot drift.
-- **The tools** ([src/backends.py](src/backends.py)) are Brave search over REST plus a **local headless Chromium** — no scrape vendor, no API key. Local scraping buys determinism: a hosted scraper's server-side cache returned 351 chars cold and 15,069 warm for the same URL, which is a reproducibility hazard when the output becomes training data.
-- **The cache** ([src/cache.py](src/cache.py)) is content-addressed SQLite with a pluggable miss policy (`live | canned | error`), so one code path serves SFT data collection, frozen GRPO rollouts, and the product.
-- **Context distillation** ([src/prompts.py](src/prompts.py)): behavioral guidance that shapes *how* the agent works but not *what the right menu is* (scrape strategy, persistence, identity verification, source selection) is **teacher-only**. The student trains on the teacher's trajectories under a prompt that omits it, so the behavior lands in the weights instead of the context window. Anything target-defining — the schema, the food-only scope rule, the dietary restrictions — is identical across both variants, enforced by construction in `build_system_prompt`.
-- **Serving** is vLLM. The Gemma student goes through raw `/v1/completions` with *our* chat template and *our* parser (vLLM ships no Gemma-4 tool-call parser), never the chat/tools path.
+Cleaning is mechanical rather than hand review. Each gate writes its reason into the trace row, so the cut is auditable after the fact:
 
-### The read-through tool cache
+| gate | what it drops | count |
+|---|---|---|
+| A | a found menu with fewer than 4 items — a scrape that half-worked | 58 |
+| B | the diet-conditioned sibling of a trace A already rejected | 27 |
+| C | grounding below 40% — items that don't appear in the text the agent scraped | 21 |
+| D | output that doesn't validate against `MENU_SCHEMA` | 3 |
+| E | a menu lifted off an aggregator (allmenus, Yelp, DoorDash) rather than the restaurant | 49 |
 
-The model only ever sees two generically-named tools. Everything below `tools.py` — the cache, the provider, the fetch strategy — is invisible to it, which is why no vendor name leaks into the training data. A call is a **cache read first**; the network is only reached on a miss, and only when the policy allows it.
+**2,233 traces → 2,075 kept → 2,074 training examples** (1,662 found, 412 deliberate not-founds). Grounding is the gate that earns its keep: every extracted item is matched back against the text the agent actually scraped during that episode, so a trace under 40% grounded is a trace that invented food, and it leaves. What survives averages **0.98**.
+
+### The corpus database
+
+`data/corpus.sqlite` is the single source of truth for the data layer: the restaurants, their split, every teacher trajectory, its grounding score, and the review verdict — one file, three tables. v1 spread this across `restaurants.jsonl`, `splits.json`, `traces/*.json`, `reject_list.txt` and `grounding.json`, and they drifted.
+
+```mermaid
+erDiagram
+    restaurants ||--o{ traces : "one per dietary variant"
+    corpus_meta {
+        TEXT key PK
+        TEXT value "harvest + split provenance"
+    }
+    restaurants {
+        TEXT restaurant_id PK "hash of name + city"
+        TEXT name
+        TEXT city
+        TEXT source "which POI API it came from"
+        INTEGER is_chain "nullable — not every API tags chains"
+        TEXT split "sft | grpo | eval — NULL until assigned"
+    }
+    traces {
+        TEXT trace_id PK "hash of restaurant_id + restrictions"
+        TEXT restaurant_id FK
+        TEXT dietary_restrictions "JSON: null or a list"
+        TEXT model "which teacher produced it"
+        TEXT trace_source "teacher | student_dagger"
+        INTEGER dagger_round
+        TEXT prompt_variant "teacher | student"
+        INTEGER found "did it report a menu"
+        INTEGER schema_valid
+        REAL grounding "fraction of items present in the scraped text"
+        TEXT unmatched_items "JSON — the ungrounded names, for review"
+        TEXT final_json "the menu"
+        TEXT messages "JSON — the FULL trajectory, incl. tool turns"
+        TEXT queries "JSON — what it searched"
+        TEXT urls "JSON — what it scraped"
+        INTEGER cache_version
+        TEXT parse_error
+        INTEGER rejected "set by viz/review.py — 158 of 2,233"
+        TEXT reject_reason "which gate, and its measurement"
+        TEXT reviewed_at "NULL = not yet reviewed"
+        TEXT captured_at
+    }
+```
+
+`messages` holding the entire trajectory is what makes SFT re-rendering possible: `build_sft.py` replays the teacher's turns under the **student** prompt, so the distillation target is generated once and re-projected as often as the prompt changes.
+
+---
+
+## 02 · Training — context distillation, not prompt copying
+
+The naive version of this stage captures the teacher's trajectories and trains on them verbatim. That bakes in a dependency: the targets are only correct given a prompt full of guidance the student would then also need at inference, so the work has moved into the prompt rather than into the weights.
+
+So the prompt is split in two, by construction, in [src/prompts.py](src/prompts.py):
+
+- **Shared, because it defines what the right menu is** — the schema, the food-only scope rule, the tool declarations, and the diner's dietary restrictions. (The scope rule looks behavioral but decides *which items belong*, so it stays shared. The restriction is a per-episode input; drop it from the student and a filtered-menu target becomes incoherent.)
+- **Teacher-only, because it only shapes how the agent works** — try the plain fetch before the browser render, don't give up after one search, confirm the page is the same restaurant, prefer the restaurant's own site over a delivery app.
+
+```mermaid
+flowchart LR
+    TP["<b>Teacher system prompt</b><br/>schema · scope rule · tools · restriction<br/><b>+ scrape strategy · persistence</b><br/><b>+ identity check · source preference</b>"]
+    SP["<b>Student system prompt</b><br/>schema · scope rule · tools · restriction<br/><i>teacher guidance absent</i>"]
+
+    TP -->|"drives"| RO["<b>Teacher rollout</b><br/>Qwen3-235B with live tools<br/>tool_call ⇄ tool_response, then the JSON<br/>2,233 episodes captured"]
+    RO -->|"2,233 → 2,074"| RR["<b>build_sft.py re-render</b><br/>all reasoning dropped (action-only)<br/>tool results slimmed, capped at 24,000 chars<br/>re-rendered losslessly, or the trace is skipped"]
+    SP -->|"system turn replaced"| RR
+    RR --> EX(["2,074 examples<br/>loss on assistant tokens only"])
+
+    classDef out fill:#e9f6f0,stroke:#1a7f5a,color:#1f2328
+    class EX out
+```
+
+The behaviour now has to survive in the weights, which is why the dataset is built to show it **contrastively** — a search that returns both a delivery app and the restaurant's own site, with the teacher visibly picking the latter. If it fails to distill, the fix is more contrastive data, not leaking the guidance back into the student prompt.
+
+Loss lands only on tokens the student will itself have to produce; the scraped pages are context, not targets. That mask is computed by hand from the chat template's prefix-preservation property, because Gemma 4 ships no generation markers and the training library's own assistant-only flag is therefore a **silent no-op** — it returns an all-zero mask and trains on nothing.
+
+| knob | value | why it is that value |
+|---|---|---|
+| adapter | LoRA r=16, α=32, dropout 0.05 | attention + MLP projections; ~35M trainable params |
+| base precision | bf16, never 4-bit | a bf16-trained adapter on a 4-bit base cost ~32 points of success rate |
+| schedule | 3 epochs, lr 2e-4, cosine | effective batch 16 — 1 per device × 8 accumulation × 2 GPUs |
+| hardware | 2 × H200, DDP | gradient checkpointing on, packing off (varlen packing needs an attention kernel this model can't use) |
+| over-long examples | dropped, never truncated | right-truncation would cut off the JSON that is the entire target |
+
+> **The failure this fixed was termination, not menu quality.** The v1 student's dominant error was emitting nothing at all — it would gather evidence and never commit to an answer. Its menus were already teacher-quality *when it finished*. A single prompt rule forbidding the empty reply moved success 56% → 88% and empty output 38% → 12% on the same episodes: 16 episodes fixed, none regressed. Diagnosing that before reaching for more training saved the budget that would have gone into it.
+
+---
+
+## 03 · Weights — from adapter to something servable
+
+A trained adapter is not yet a served model. The two conversions between them are both easy to skip, and both fail in ways worth knowing about in advance.
+
+```mermaid
+flowchart LR
+    A["<b>LoRA adapter</b><br/>r=16 on the bf16 base<br/>~140 MB + meta.json lineage"]
+    A -->|"merge into the bf16 base"| M["<b>merged</b><br/>~15.9 GB bf16 safetensors<br/>multimodal class"]
+    M -->|"to_text_only.py --base<br/><i>--base is not optional</i>"| T["<b>merged-text</b><br/>Gemma4ForCausalLM, 7.46B<br/>vision/audio towers dropped<br/><b>+54 tensors copied from the base</b>"]
+    T -->|"serve"| V(["<b>vllm serve</b> — gemma-menu<br/>98,304-token context<br/>raw /v1/completions"])
+    A -.->|"never"| X["✗ 4-bit base + this bf16 adapter<br/><i>−32 points of success rate</i>"]
+
+    classDef out fill:#e9f6f0,stroke:#1a7f5a,color:#1f2328
+    classDef bad fill:#fdeeee,stroke:#b4423a,color:#1f2328
+    class V out
+    class X bad
+```
+
+- **Text-only rebuild.** Training writes model and tokenizer but no `preprocessor_config.json`, so vLLM sees the multimodal class, reaches for `AutoProcessor`, and dies. There is no image or audio input here anyway, so [scripts/train/to_text_only.py](scripts/train/to_text_only.py) rebuilds the checkpoint as a text-only causal model.
+- **The 54 missing tensors.** Gemma-4 E4B shares keys and values across its last 18 layers, so transformers never builds `k_norm`/`k_proj`/`v_proj` for layers 24–41 and silently drops them (2130 → 2076). Invisible under transformers and harmless to HF eval; vLLM builds a fused projection for every layer and refuses to start. `--base` copies them back in raw. The script's own *"0 missing, 0 unexpected"* report is a **false all-clear** — it proves transformers' expectations were met, not that the checkpoint is complete.
+
+---
+
+## 04 · Inference — one request, and where the cache sits
+
+At inference the model is an agent on a budget: eight tool calls, then it has to answer with whatever it has gathered. A partial menu beats an empty reply, and it also makes better training data than a refusal.
+
+The model only ever sees two generically-named tools, so no vendor name leaks into the data its tool calls get baked into. Everything below [src/tools.py](src/tools.py) — the cache, the provider, the fetch strategy — is invisible to it. A call is a **cache read first**; the network is reached only on a miss, and only when the policy allows it. The position of the cache is the design: it wraps the network backends **inside** the character cap, so what gets stored is the full slimmed page while the cap stays a read-time knob that can be retuned without re-scraping anything.
 
 ```mermaid
 flowchart TB
@@ -102,11 +222,11 @@ flowchart TB
     end
     T1 --> W
     T2 --> W
-    W["<b>src/tools.py</b> — vendor-neutral wrappers<br/>read-time MAX_TOOL_CHARS cap"]
+    W["<b>src/tools.py</b> — vendor-neutral wrappers<br/>read-time MAX_TOOL_CHARS cap (24,000)"]
 
     W --> K["<b>src/cache.py</b> — normalise to a key<br/>norm_query(q) &nbsp;·&nbsp; norm_scrape(url, mode)<br/>key_hash = sha256(namespace ‖ key ‖ cache_version)"]
     K --> HIT{"row present?"}
-    HIT -->|"yes — status ok / empty"| SERVE(["return the stored response"])
+    HIT -->|"yes — status ok / empty"| SERVE(["return the stored response<br/><i>0.000 s, no network</i>"])
     HIT -->|"absent, or a stored 'error'"| POL{"miss_policy"}
 
     POL -->|"<b>canned</b> — frozen replay"| CAN(["deterministic constant<br/>(never touches the network)"])
@@ -143,6 +263,17 @@ Three details carry most of the weight:
 - **`cache_version` is part of the hash.** Bump it when the stored response *shape* changes and the whole cache invalidates cleanly, with no delete step.
 - **The miss policy is what makes one code path serve three jobs**: `live` for corpus building and the product, `canned` for reproducible GRPO rollouts, `error` to assert a split is fully warmed before spending GPU time.
 
+What's in the store as shipped — 41,565 rows, 209 MB:
+
+| namespace | status | rows |
+|---|---|---|
+| scrape | ok | 18,075 |
+| scrape | empty | 11,662 |
+| scrape | error | 1,110 |
+| search | ok | 10,718 |
+
+split by render mode, 16,663 `direct` and 14,184 `browser`.
+
 ```mermaid
 erDiagram
     cache {
@@ -158,51 +289,48 @@ erDiagram
     }
 ```
 
-### The corpus database
+**Serving the student.** The Gemma student goes through raw `/v1/completions` with *our* chat template and *our* parser, never vLLM's chat/tools path: vLLM ships no Gemma-4 tool-call parser, and re-templating through a chat endpoint would drift from the exact wire format the model was fine-tuned on. Each turn re-renders the prompt from the whole message list, which is only safe because Gemma 4's template is token-prefix-preserving for this shape of trajectory — rendering the first *k* messages is an exact prefix of rendering *k+1*. That property is what lets the training mask be computed by hand, and it is also why a parse failure is fed back as a synthesized tool response rather than a new user turn: a mid-episode user message rewrites earlier tokens and breaks the prefix.
 
-`data/corpus.sqlite` is the single source of truth for the data layer: the restaurants, their split, every teacher trajectory, its grounding score, and the human review verdict — one file, three tables. v1 spread this across `restaurants.jsonl`, `splits.json`, `traces/*.json`, `reject_list.txt` and `grounding.json`, and they drifted.
+---
 
-```mermaid
-erDiagram
-    restaurants ||--o{ traces : "one per dietary variant"
-    corpus_meta {
-        TEXT key PK
-        TEXT value "harvest + split provenance"
+## 05 · The output contract
+
+One file defines the menu shape, and the prompt, the validator, the grounding scorer and the RL reward all import it, so they cannot drift apart. It is deliberately small — two levels of nesting, three fields on an item. [src/schema.py](src/schema.py) holds both representations: `SCHEMA_SNIPPET`, the human-readable block shown to the model, and `MENU_SCHEMA`, the machine-checkable mirror.
+
+```jsonc
+{
+  "found": true,                      // required
+  "restaurant_name": "string",        // required
+  "cuisine": "string | null",
+  "menu": [                           // required
+    {
+      "section": "string",            // required
+      "items": [
+        {
+          "name": "string",           // required
+          "description": "string | null",
+          "price": "number | null"    // null = the menu lists none; never a guess
+        }
+      ]
     }
-    restaurants {
-        TEXT restaurant_id PK "hash of name + city"
-        TEXT name
-        TEXT city
-        TEXT source "which POI API it came from"
-        INTEGER is_chain "nullable — not every API tags chains"
-        TEXT split "sft | grpo | eval — NULL until assigned"
-    }
-    traces {
-        TEXT trace_id PK "hash of restaurant_id + restrictions"
-        TEXT restaurant_id FK
-        TEXT dietary_restrictions "JSON: null or a list"
-        TEXT model "which teacher produced it"
-        TEXT trace_source "teacher | student_dagger"
-        INTEGER dagger_round
-        TEXT prompt_variant "teacher | student"
-        INTEGER found "did it report a menu"
-        INTEGER schema_valid
-        REAL grounding "fraction of items present in the scraped text"
-        TEXT unmatched_items "JSON — the ungrounded names, for review"
-        TEXT final_json "the menu"
-        TEXT messages "JSON — the FULL trajectory, incl. tool turns"
-        TEXT queries "JSON — what it searched"
-        TEXT urls "JSON — what it scraped"
-        INTEGER cache_version
-        TEXT parse_error
-        INTEGER rejected "set by viz/review.py — 159 of 2233"
-        TEXT reject_reason
-        TEXT reviewed_at "NULL = not yet reviewed"
-        TEXT captured_at
-    }
+  ],
+  "source_url": "string | null"
+}
 ```
 
-`messages` holding the entire trajectory is what makes SFT re-rendering possible: `build_sft.py` replays the teacher's turns under the **student** prompt, so the distillation target is generated once and re-projected as often as the prompt changes.
+`price: null` means the menu itself lists no price. The model is told never to guess one, so null reads unambiguously as unknown rather than as a missing extraction.
+
+The `found` field has **three distinguishable outcomes**, and keeping the last two apart is the point:
+
+| outcome | meaning |
+|---|---|
+| `found: true`, `menu: [ … ]` | the normal result — every priced item that belongs on a food menu, in the sections the restaurant itself uses |
+| `found: true`, `menu: []` | a menu was found, and the diner's dietary restriction removed every item on it |
+| `found: false`, `menu: []`, `notes: "…"` | no page anywhere had this restaurant's menu, and `notes` records what was tried |
+
+Collapsing the last two would make abstention unscoreable. Keeping them machine-distinguishable is what lets found-false traces stay in the training set as deliberate anti-hallucination signal — capped at a fifth of the corpus, so abstention is never inflated into the model's default.
+
+---
 
 ## Layout
 
@@ -229,9 +357,9 @@ scripts/
   infra/                 corpus_sync (S3), runpod_create, eval_pod.sh, grpo_pod.sh,
                          serve_teacher.sh, smoke_teacher
 results/                 committed eval reports — the permanent record (see results/README.md)
-notes/                   plans + the experiment log
-tests/                   373 tests, no GPU or network required
-viz/                     local FastAPI trace-review / data-cleaning UI
+notes/                   plans, the experiment log, and architecture.html (the illustrated writeup)
+tests/                   395 tests, no GPU or network required
+viz/                     local FastAPI extraction demo + trace-review UI
 data/                    git-ignored; source of truth is S3 (see notes/S3_setup.md)
   corpus.sqlite          restaurants + sft/grpo/eval split + traces + grounding + reject flags
   cache.sqlite           tool-call cache
@@ -251,7 +379,7 @@ huggingface-cli login                # google/gemma-4-E4B-it is gated
 `.env` holds `BRAVE_API_KEY` (search; scrape needs no key), `HF_TOKEN` (gated model), the Claude baseline's `ANTHROPIC_API_KEY`, `WANDB_API_KEY`, and the S3 config (`S3_BUCKET`/`S3_PREFIX`/`AWS_*`). See [.env.example](.env.example).
 
 ```bash
-uv run pytest                        # 373 tests, ~3 min, no GPU or network
+uv run pytest                        # 395 tests, ~3 min, no GPU or network
 ```
 
 ## Running the stages
@@ -277,7 +405,8 @@ uv run python scripts/eval/eval.py --model gemma --gemma-vllm-base-url http://..
     --split eval --seed 42 --limit 500 --conditioned-frac 0.4 --json report.json
 uv run python scripts/eval/summarize.py results/<run-set> -o results/<run-set>/README.md
 
-# Review / clean traces locally (writes the reject flags in corpus.sqlite)
+# The live extraction demo (port 8000) and the trace-review UI (port 8001)
+uv run uvicorn viz.server:app --host 127.0.0.1 --port 8000
 uv run uvicorn viz.review:app --host 127.0.0.1 --port 8001
 ```
 

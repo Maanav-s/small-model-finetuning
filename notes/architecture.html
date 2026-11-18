@@ -1,0 +1,642 @@
+<title>Gemma Menu Agent</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500&display=swap">
+<style>
+  /* Single committed dark theme, matching the recorded demo UI: graphite ground,
+     one leaf-green accent, Georgia for prose, JetBrains Mono for anything the
+     code actually calls by name. */
+  :root {
+    color-scheme: dark;
+    --bg: #16191b;
+    --card: #212629;
+    --field: #1a1f21;
+    --ink: #e9efe9;
+    --muted: #93a398;
+    --line: #333b3e;
+    --accent: #5ef08a;
+    --accent-soft: #1d3326;
+    --serif: Georgia, "Times New Roman", serif;
+    --mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--ink);
+    font: 17px/1.65 var(--serif);
+    padding-left: max(16px, env(safe-area-inset-left, 0px));
+    padding-right: max(16px, env(safe-area-inset-right, 0px));
+    padding-block: 48px 72px;
+  }
+
+  .page { max-width: 1040px; margin: 0 auto; }
+  .prose { max-width: 70ch; }
+
+  h1 {
+    font-size: clamp(32px, 5vw, 46px);
+    line-height: 1.1;
+    margin: 0 0 14px;
+    text-wrap: balance;
+  }
+  h1 .leaf { color: var(--accent); vertical-align: -4px; margin-right: 10px; }
+  .standfirst { color: var(--muted); font-size: 19px; margin: 0 0 8px; max-width: 64ch; }
+  .meta { color: var(--muted); font-family: var(--mono); font-size: 12px; letter-spacing: .02em; margin-top: 18px; line-height: 1.7; }
+
+  h2 {
+    font-size: 26px;
+    margin: 64px 0 6px;
+    padding-top: 22px;
+    border-top: 1px solid var(--line);
+    text-wrap: balance;
+  }
+  h2 .num {
+    font-family: var(--mono);
+    font-size: 13px;
+    color: var(--accent);
+    display: block;
+    margin-bottom: 8px;
+    letter-spacing: .08em;
+  }
+  p { margin: 0 0 14px; }
+  code { font-family: var(--mono); font-size: .82em; background: var(--field); border: 1px solid var(--line); border-radius: 4px; padding: 1px 5px; }
+  strong { color: #fff; font-weight: 700; }
+  em { font-style: italic; }
+
+  figure { margin: 30px 0 34px; }
+  .fig-scroll { overflow-x: auto; border: 1px solid var(--line); border-radius: 8px; background: #141819; padding: 14px; }
+  .fig-scroll svg { display: block; width: 100%; min-width: 720px; height: auto; }
+  figcaption {
+    color: var(--muted);
+    font-size: 14px;
+    line-height: 1.55;
+    margin-top: 12px;
+    max-width: 80ch;
+  }
+  figcaption b { color: var(--ink); font-weight: 700; }
+
+  table { border-collapse: collapse; width: 100%; margin: 22px 0 10px; font-size: 15px; }
+  th, td { text-align: right; padding: 9px 10px; border-bottom: 1px solid var(--line); font-variant-numeric: lining-nums tabular-nums; }
+  th:first-child, td:first-child { text-align: left; }
+  thead th { color: var(--muted); font-weight: 400; font-size: 12px; font-family: var(--mono); letter-spacing: .04em; border-bottom-color: var(--ink); }
+  tbody tr.win td { background: var(--accent-soft); }
+  tbody tr.win td:first-child { color: var(--accent); }
+  .t-wrap { overflow-x: auto; }
+  td.note, th.note { text-align: left; color: var(--muted); font-family: var(--mono); font-size: 12px; }
+
+  .callout {
+    border-left: 2px solid var(--accent);
+    background: var(--field);
+    padding: 14px 18px;
+    margin: 24px 0;
+    max-width: 80ch;
+  }
+  .callout p:last-child { margin-bottom: 0; }
+
+  .fine { color: var(--muted); font-size: 14px; max-width: 80ch; }
+  .fine b { color: var(--ink); font-weight: 700; }
+  svg text { font-family: "JetBrains Mono", ui-monospace, monospace; }
+</style>
+
+<div class="page">
+
+  <header>
+    <h1><svg class="leaf" width="30" height="30" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M20 3c0 9-5.4 14-11 14a6.6 6.6 0 0 1-3.3-.8C7.2 11 11 7.8 16 6.5 11.4 7 7.3 9.6 5.2 14.3A6.9 6.9 0 0 1 4 10.4C4 6.3 8.5 3 20 3zM4.6 18.2C4.2 19.4 4 20.6 4 22H2c0-1.6.3-3.1.8-4.5l1.8.7z"/></svg>Gemma Menu Agent</h1>
+    <p class="standfirst">A 7.5B open-weight model fine-tuned to take a restaurant name, search and scrape the live web with tools, and return that restaurant's menu as validated JSON. Five diagrams for the parts a demo can't show: how the training data was collected and cleaned, what the fine-tune actually changed, and what happens inside one request.</p>
+    <p class="meta">google/gemma-4-E4B-it &nbsp;·&nbsp; LoRA SFT distilled from Qwen3-235B &nbsp;·&nbsp; served on vLLM &nbsp;·&nbsp; every figure drawn from the shipped code and the live databases</p>
+  </header>
+
+  <div class="prose">
+    <h2><span class="num">RESULTS</span>What the fine-tune bought</h2>
+    <p>One seeded 500-episode plan over a held-out split of 601 restaurants: same tools, same cache, same prompt. The only thing that differs between rows is the weights.</p>
+  </div>
+
+  <div class="t-wrap">
+    <table>
+      <thead>
+        <tr><th>model</th><th>schema-valid</th><th>found acc</th><th>item F1</th><th>precision</th><th>recall</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>Gemma-4-E4B base</td><td>95.4%</td><td>74.1%</td><td>0.438</td><td>0.737</td><td>0.459</td></tr>
+        <tr class="win"><td>+ LoRA SFT (shipped)</td><td>100.0%</td><td>81.3%</td><td>0.560</td><td>0.827</td><td>0.573</td></tr>
+        <tr><td>+ GRPO, 50 steps</td><td>99.8%</td><td>79.1%</td><td>0.539</td><td>0.819</td><td>0.558</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p class="fine">SFT adds <b>+0.12 item F1</b> and <b>+9 points of precision</b> over the base, and takes schema validity to 100%. The RL stage is a null result rather than a regression — 71 wins to 75 losses per episode, every t-statistic inside ±1.96 — so it was measured, written up, and called off instead of scaled up. The SFT student is what ships.</p>
+
+  <h2><span class="num">01 · DATA</span>Collecting and cleaning the corpus</h2>
+  <div class="prose">
+    <p>None of this is a downloaded dataset. The restaurants come from public map data, the labels are a much larger model's own agentic trajectories, and the web pages those trajectories read are captured as they are fetched — so any run can later be replayed against the same bytes.</p>
+  </div>
+
+  <figure>
+    <div class="fig-scroll">
+      <svg viewBox="0 0 1040 440" role="img" aria-label="Pipeline from restaurant harvest through the teacher rollout and five reject gates to 2,075 kept traces, with every tool fetch captured in a content-addressed SQLite cache.">
+        <defs>
+          <marker id="f1a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0 0 L10 5 L0 10 z" fill="#93a398"/>
+          </marker>
+        </defs>
+
+        <g fill="#212629" stroke="#333b3e">
+          <rect x="12" y="68" width="158" height="146" rx="6"/>
+          <rect x="226" y="68" width="158" height="146" rx="6"/>
+          <rect x="440" y="68" width="158" height="146" rx="6"/>
+          <rect x="654" y="68" width="158" height="146" rx="6"/>
+          <rect x="868" y="68" width="160" height="146" rx="6"/>
+        </g>
+
+        <g font-size="12.5" fill="#e9efe9">
+          <text x="26" y="92">harvest.py</text>
+          <text x="240" y="92">corpus.sqlite</text>
+          <text x="454" y="92">build_corpus.py</text>
+          <text x="668" y="92">5 reject gates</text>
+          <text x="882" y="92">SFT corpus</text>
+        </g>
+
+        <g font-size="10" fill="#93a398">
+          <text x="26" y="116">Overpass (OSM) +</text>
+          <text x="26" y="133">Google Places search</text>
+          <text x="26" y="150">name · city · is_chain</text>
+          <text x="26" y="174">stratified by cuisine,</text>
+          <text x="26" y="191">70%+ independents</text>
+
+          <text x="240" y="116">3,005 restaurants</text>
+          <text x="240" y="140">one DB holds rows,</text>
+          <text x="240" y="157">split, traces, grounding</text>
+          <text x="240" y="174">and reject flags</text>
+
+          <text x="454" y="116">Qwen3-235B teacher,</text>
+          <text x="454" y="133">FP8 on 4×H100, vLLM</text>
+          <text x="454" y="157">tool budget: 8 calls</text>
+          <text x="454" y="181">1,490 unrestricted +</text>
+          <text x="454" y="198">743 diet-conditioned</text>
+
+          <text x="882" y="116">2,075 traces kept</text>
+          <text x="882" y="140">158 rejected (7.1%)</text>
+          <text x="882" y="157">mean grounding 0.98</text>
+          <text x="882" y="181">2,074 training</text>
+          <text x="882" y="198">examples written</text>
+        </g>
+
+        <g font-size="9.5">
+          <g fill="#93a398">
+            <text x="668" y="116">A thin menu &lt;4 items</text>
+            <text x="668" y="136">B sibling of an A</text>
+            <text x="668" y="156">C grounding &lt;40%</text>
+            <text x="668" y="176">D invalid schema</text>
+            <text x="668" y="196">E aggregator-sourced</text>
+          </g>
+          <g fill="#5ef08a" text-anchor="end">
+            <text x="806" y="116">58</text>
+            <text x="806" y="136">27</text>
+            <text x="806" y="156">21</text>
+            <text x="806" y="176">3</text>
+            <text x="806" y="196">49</text>
+          </g>
+        </g>
+
+        <g stroke="#93a398" stroke-width="1.3" marker-end="url(#f1a)">
+          <line x1="170" y1="145" x2="222" y2="145"/>
+          <line x1="384" y1="145" x2="436" y2="145"/>
+          <line x1="598" y1="145" x2="650" y2="145"/>
+          <line x1="812" y1="145" x2="864" y2="145"/>
+        </g>
+        <g font-size="9.5" fill="#93a398" text-anchor="middle">
+          <text x="196" y="124">3,005</text><text x="196" y="135">rows</text>
+          <text x="410" y="124">1,502</text><text x="410" y="135">sft rows</text>
+          <text x="624" y="124">2,233</text><text x="624" y="135">traces</text>
+          <text x="838" y="124">−158</text><text x="838" y="135">dropped</text>
+        </g>
+
+        <line x1="305" y1="214" x2="305" y2="222" stroke="#333b3e" stroke-width="1.3"/>
+        <g fill="#1a1f21" stroke="#333b3e">
+          <rect x="226" y="222" width="158" height="22" rx="4"/>
+          <rect x="226" y="250" width="158" height="22" rx="4"/>
+          <rect x="226" y="278" width="158" height="22" rx="4"/>
+        </g>
+        <g font-size="9.5" fill="#93a398">
+          <text x="238" y="237"><tspan fill="#5ef08a">sft 1,502</tspan> → teacher traces</text>
+          <text x="238" y="265"><tspan fill="#5ef08a">grpo 902</tspan> → RL prompts</text>
+          <text x="238" y="293"><tspan fill="#5ef08a">eval 601</tspan> → never trained on</text>
+        </g>
+        <text x="305" y="318" font-size="9.5" fill="#93a398" text-anchor="middle">split 50 / 30 / 20, seeded and re-derivable</text>
+
+        <g fill="#212629" stroke="#333b3e">
+          <rect x="226" y="340" width="158" height="76" rx="6"/>
+          <rect x="440" y="340" width="588" height="76" rx="6"/>
+        </g>
+        <text x="240" y="362" font-size="12.5" fill="#e9efe9">warm_cache.py</text>
+        <g font-size="9.5" fill="#93a398">
+          <text x="240" y="380">grpo + eval splits,</text>
+          <text x="240" y="394">3 queries × 5 URLs</text>
+          <text x="240" y="408">× 2 modes, no teacher</text>
+        </g>
+        <text x="454" y="362" font-size="12.5" fill="#e9efe9">data/cache.sqlite — <tspan fill="#5ef08a">41,565 rows · 209 MB</tspan></text>
+        <g font-size="9.5" fill="#93a398">
+          <text x="454" y="382">scrape ok 18,075 · empty 11,662 · error 1,110 · search ok 10,718</text>
+          <text x="454" y="402">&quot;empty&quot; is a permanent negative — a bot-walled app, a PDF, a dead end — and is never re-fetched</text>
+        </g>
+        <g stroke="#93a398" stroke-width="1.3" marker-end="url(#f1a)">
+          <line x1="384" y1="378" x2="436" y2="378"/>
+          <line x1="519" y1="214" x2="519" y2="336"/>
+        </g>
+        <text x="410" y="370" font-size="9.5" fill="#93a398" text-anchor="middle">writes</text>
+        <g font-size="9.5" fill="#93a398">
+          <text x="528" y="268">every search and</text>
+          <text x="528" y="282">scrape, stored once</text>
+        </g>
+      </svg>
+    </div>
+    <figcaption><b>Harvest to training corpus.</b> The teacher's web traffic is a by-product worth keeping: each fetch is stored under <code>sha256(namespace | normalized key | version)</code>, so later runs replay the same bytes instead of re-paying for them. <code>warm_cache</code> then pre-fetches the paths the <em>student</em> might explore on the other two splits, which is what makes a frozen, network-free evaluation possible at all. The five gates are mechanical rather than hand review — thin menus, their diet-conditioned siblings, items that don't appear in the scraped text, schema failures, and menus that turned out to be lifted off an aggregator.</figcaption>
+  </figure>
+
+  <div class="prose">
+    <p>Grounding is the gate that earns its keep. Every extracted item is matched back against the text the agent actually scraped during that episode, so a trace under 40% grounded is a trace that invented food, and it leaves. What survives averages <strong>0.98</strong>.</p>
+  </div>
+
+  <h2><span class="num">02 · TRAINING</span>Context distillation, not prompt copying</h2>
+  <div class="prose">
+    <p>The naive version of this stage captures the teacher's trajectories and trains on them verbatim. That bakes in a dependency: the targets are only correct given a prompt full of guidance the student would then also need at inference, so the work has moved into the prompt rather than into the weights.</p>
+    <p>So the prompt is split in two. Anything that defines <em>what</em> the right menu is — the schema, the food-only scope rule, the tool declarations, the diner's dietary restrictions — is identical for both models. Anything that only shapes <em>how</em> the agent works — try the plain fetch before the browser render, don't give up after one search, confirm the page is the same restaurant, prefer the restaurant's own site over a delivery app — is teacher-only, and the student has to learn it from the trajectories themselves.</p>
+  </div>
+
+  <figure>
+    <div class="fig-scroll">
+      <svg viewBox="0 0 1040 430" role="img" aria-label="The teacher's trajectory is re-rendered under the student system prompt with teacher guidance absent, and the training loss is masked to assistant tokens only.">
+        <defs>
+          <marker id="f2a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0 0 L10 5 L0 10 z" fill="#93a398"/>
+          </marker>
+          <marker id="f2b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0 0 L10 5 L0 10 z" fill="#5ef08a"/>
+          </marker>
+        </defs>
+
+        <g fill="#212629" stroke="#333b3e">
+          <rect x="12" y="20" width="286" height="160" rx="6"/>
+          <rect x="377" y="20" width="286" height="160" rx="6"/>
+          <rect x="742" y="20" width="286" height="160" rx="6"/>
+          <rect x="377" y="226" width="286" height="110" rx="6"/>
+        </g>
+
+        <g font-size="12.5" fill="#e9efe9">
+          <text x="28" y="44">Teacher system prompt</text>
+          <text x="393" y="44">Teacher rollout</text>
+          <text x="758" y="44">Student system prompt</text>
+          <text x="393" y="250">build_sft.py re-render</text>
+        </g>
+
+        <g font-size="10" fill="#93a398">
+          <text x="28" y="68">schema snippet</text>
+          <text x="28" y="85">food-only scope rule</text>
+          <text x="28" y="102">tool declarations</text>
+          <text x="28" y="119">dietary restriction, if any</text>
+
+          <text x="758" y="68">schema snippet</text>
+          <text x="758" y="85">food-only scope rule</text>
+          <text x="758" y="102">tool declarations</text>
+          <text x="758" y="119">dietary restriction, if any</text>
+
+          <text x="393" y="68">Qwen3-235B with live tools</text>
+          <text x="393" y="85">tool_call into tool_response, ×8</text>
+          <text x="393" y="102">then the final menu JSON</text>
+          <text x="393" y="126">2,233 episodes captured</text>
+          <text x="393" y="143">under the teacher prompt</text>
+
+          <text x="393" y="276">all reasoning dropped (action-only)</text>
+          <text x="393" y="296">tool results slimmed, capped at 24,000 chars</text>
+          <text x="393" y="316">re-rendered losslessly, or the trace is skipped</text>
+        </g>
+
+        <rect x="28" y="130" width="254" height="40" rx="4" fill="#1d3326" stroke="#5ef08a"/>
+        <g font-size="9.5" fill="#5ef08a">
+          <text x="38" y="146">+ scrape strategy · persistence</text>
+          <text x="38" y="161">+ identity check · source preference</text>
+        </g>
+        <rect x="758" y="130" width="254" height="40" rx="4" fill="none" stroke="#5ef08a" stroke-dasharray="4 4"/>
+        <text x="885" y="154" font-size="9.5" fill="#5ef08a" text-anchor="middle">teacher guidance absent</text>
+
+        <g stroke="#93a398" stroke-width="1.3" marker-end="url(#f2a)">
+          <line x1="298" y1="100" x2="373" y2="100"/>
+          <line x1="520" y1="180" x2="520" y2="222"/>
+        </g>
+        <text x="335" y="92" font-size="9.5" fill="#93a398" text-anchor="middle">drives</text>
+        <text x="528" y="206" font-size="9.5" fill="#93a398">2,233 → 2,074</text>
+
+        <polyline points="885,180 885,281 667,281" fill="none" stroke="#5ef08a" stroke-width="1.4" marker-end="url(#f2b)"/>
+        <text x="778" y="272" font-size="10" fill="#5ef08a" text-anchor="middle">system turn replaced</text>
+
+        <g stroke="#333b3e">
+          <rect x="12"  y="352" width="190" height="34" rx="3" fill="#1a1f21"/>
+          <rect x="202" y="352" width="90"  height="34" rx="3" fill="#1a1f21"/>
+          <rect x="292" y="352" width="120" height="34" rx="3" fill="#1d3326" stroke="#5ef08a"/>
+          <rect x="412" y="352" width="160" height="34" rx="3" fill="#1a1f21"/>
+          <rect x="572" y="352" width="120" height="34" rx="3" fill="#1d3326" stroke="#5ef08a"/>
+          <rect x="692" y="352" width="160" height="34" rx="3" fill="#1a1f21"/>
+          <rect x="852" y="352" width="176" height="34" rx="3" fill="#1d3326" stroke="#5ef08a"/>
+        </g>
+        <g font-size="9.5" text-anchor="middle">
+          <text x="107" y="374" fill="#93a398">system + tools</text>
+          <text x="247" y="374" fill="#93a398">user</text>
+          <text x="352" y="374" fill="#5ef08a">tool_call</text>
+          <text x="492" y="374" fill="#93a398">tool_response</text>
+          <text x="632" y="374" fill="#5ef08a">tool_call</text>
+          <text x="772" y="374" fill="#93a398">tool_response</text>
+          <text x="940" y="374" fill="#5ef08a">final JSON</text>
+        </g>
+        <g font-size="9.5">
+          <rect x="12" y="399" width="12" height="12" rx="2" fill="#1d3326" stroke="#5ef08a"/>
+          <text x="30" y="409" fill="#93a398">loss computed here</text>
+          <rect x="186" y="399" width="12" height="12" rx="2" fill="#1a1f21" stroke="#333b3e"/>
+          <text x="204" y="409" fill="#93a398">label −100, no loss</text>
+          <text x="364" y="409" fill="#93a398">the mask is computed by hand from the template's own prefix property, token by token</text>
+        </g>
+      </svg>
+    </div>
+    <figcaption><b>The distillation seam.</b> One trajectory, two prompts: captured under the teacher's, trained under the student's. The behaviour now has to survive in the weights, which is why the dataset is built to show it contrastively — a search that returns both a delivery app and the restaurant's own site, with the teacher visibly picking the latter. Loss lands only on tokens the student will itself have to produce; the scraped pages are context, not targets. The mask is built by hand because Gemma 4's template carries no generation markers, which makes the training library's own assistant-only flag a silent no-op — it returns an all-zero mask and trains on nothing.</figcaption>
+  </figure>
+
+  <div class="t-wrap">
+    <table>
+      <thead><tr><th>knob</th><th class="note">value</th><th class="note">why it is that value</th></tr></thead>
+      <tbody>
+        <tr><td>adapter</td><td class="note">LoRA r=16, alpha 32, dropout 0.05</td><td class="note">attention + MLP projections; 140 MB of trainable weights</td></tr>
+        <tr><td>base precision</td><td class="note">bf16, never 4-bit</td><td class="note">a bf16-trained adapter on a 4-bit base cost ~32 points of success rate</td></tr>
+        <tr><td>schedule</td><td class="note">3 epochs, lr 2e-4, cosine</td><td class="note">effective batch 16 — 1 per device, 8 accumulation steps, 2 GPUs</td></tr>
+        <tr><td>hardware</td><td class="note">2 × H200, DDP</td><td class="note">gradient checkpointing on, packing off (needs an attention kernel this model can't use)</td></tr>
+        <tr><td>over-long examples</td><td class="note">dropped, never truncated</td><td class="note">right-truncation would cut off the JSON that is the entire target</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="callout">
+    <p><strong>The failure this fixed was termination, not menu quality.</strong> The student's dominant error was emitting nothing at all — it would gather evidence and never commit to an answer. Its menus were already teacher-quality <em>when it finished</em>. A single prompt rule forbidding the empty reply moved success from 56% to 88% and empty output from 38% to 12% on the same episodes: 16 episodes fixed, none regressed. Diagnosing that before reaching for more training saved the budget that would have gone into it.</p>
+  </div>
+
+  <h2><span class="num">03 · WEIGHTS</span>From adapter to something servable</h2>
+  <div class="prose">
+    <p>A trained adapter is not yet a served model. The two conversions between them are both easy to skip, and both fail in ways worth knowing about in advance.</p>
+  </div>
+
+  <figure>
+    <div class="fig-scroll">
+      <svg viewBox="0 0 1040 290" role="img" aria-label="The adapter is merged into the bf16 base, converted to a text-only causal model with 54 key-value-shared tensors copied from the base, then served on vLLM. Serving a 4-bit base with this adapter is the dead end.">
+        <defs>
+          <marker id="f3a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0 0 L10 5 L0 10 z" fill="#93a398"/>
+          </marker>
+        </defs>
+
+        <g fill="#212629" stroke="#333b3e">
+          <rect x="12" y="40" width="206" height="108" rx="6"/>
+          <rect x="286" y="40" width="206" height="108" rx="6"/>
+          <rect x="560" y="40" width="206" height="108" rx="6"/>
+          <rect x="834" y="40" width="194" height="108" rx="6"/>
+        </g>
+        <g font-size="12.5" fill="#e9efe9">
+          <text x="28" y="66">LoRA adapter</text>
+          <text x="302" y="66">merged</text>
+          <text x="576" y="66">merged-text</text>
+          <text x="850" y="66">vllm serve</text>
+        </g>
+        <g font-size="10" fill="#93a398">
+          <text x="28" y="90">r=16, on the bf16 base</text>
+          <text x="28" y="110">~140 MB</text>
+          <text x="28" y="130">+ meta.json lineage</text>
+
+          <text x="302" y="90">bf16 safetensors</text>
+          <text x="302" y="110">~15.9 GB</text>
+          <text x="302" y="130">multimodal class</text>
+
+          <text x="576" y="90">Gemma4ForCausalLM</text>
+          <text x="576" y="110">7.46B params</text>
+          <text x="576" y="130">vision/audio towers gone</text>
+
+          <text x="850" y="90">served as gemma-menu</text>
+          <text x="850" y="110">98,304-token context</text>
+          <text x="850" y="130">raw /v1/completions</text>
+        </g>
+
+        <g stroke="#93a398" stroke-width="1.3" marker-end="url(#f3a)">
+          <line x1="218" y1="94" x2="282" y2="94"/>
+          <line x1="492" y1="94" x2="556" y2="94"/>
+          <line x1="766" y1="94" x2="830" y2="94"/>
+        </g>
+        <g font-size="9.5" fill="#93a398" text-anchor="middle">
+          <text x="250" y="20">merge into</text><text x="250" y="31">the bf16 base</text>
+          <text x="524" y="20">to_text_only.py</text><text x="524" y="31">--base is not optional</text>
+          <text x="798" y="26">serve</text>
+        </g>
+
+        <path d="M663 148 L663 172" stroke="#5ef08a" stroke-width="1.2" stroke-dasharray="3 3" fill="none"/>
+        <g>
+          <text x="400" y="190" font-size="10" fill="#5ef08a">+54 tensors copied raw out of the base checkpoint</text>
+          <text x="400" y="209" font-size="9.5" fill="#93a398">Gemma-4 E4B shares keys and values across its last 18 layers, so transformers never builds k_norm/k_proj/v_proj</text>
+          <text x="400" y="225" font-size="9.5" fill="#93a398">for layers 24–41 and drops them. Invisible under transformers; vLLM needs all of them and refuses to start.</text>
+        </g>
+
+        <path d="M115 148 L115 212" stroke="#93a398" stroke-width="1.2" stroke-dasharray="3 3" fill="none"/>
+        <rect x="12" y="212" width="344" height="58" rx="6" fill="none" stroke="#93a398" stroke-dasharray="4 4"/>
+        <g font-size="10" fill="#93a398">
+          <text x="28" y="236">✗ 4-bit base + this bf16-trained adapter</text>
+          <text x="28" y="256">−32 points of success rate. Now guarded against in code.</text>
+        </g>
+      </svg>
+    </div>
+    <figcaption><b>Two conversions and one dead end.</b> The checkpoint has to be rebuilt as a text-only causal model — there is no image or audio input here, and the multimodal class demands a preprocessor config that training never wrote — and the tensors Gemma-4's key-value sharing leaves uninstantiated have to be copied back in from the base. The conversion script's own &ldquo;0 missing, 0 unexpected&rdquo; report is a false all-clear: it proves transformers' expectations were met, not that the checkpoint is complete.</figcaption>
+  </figure>
+
+  <h2><span class="num">04 · INFERENCE</span>One request, and where the cache sits</h2>
+  <div class="prose">
+    <p>At inference the model is an agent on a budget: eight tool calls, then it has to answer with whatever it has gathered. A partial menu beats an empty reply — and it also makes better training data than a refusal.</p>
+    <p>The cache is the piece worth drawing, because its <em>position</em> is the design. It wraps the network backends <em>inside</em> the character cap, so what gets stored is the full slimmed page while the cap stays a read-time knob that can be retuned without re-scraping anything.</p>
+  </div>
+
+  <figure>
+    <div class="fig-scroll">
+      <svg viewBox="0 0 1040 470" role="img" aria-label="One request loop: render the prompt, call vLLM, parse a tool call, pass through the capping wrapper into the content-addressed cache and only then to the live network, then feed the capped result back into the next prompt.">
+        <defs>
+          <marker id="f4a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0 0 L10 5 L0 10 z" fill="#93a398"/>
+          </marker>
+          <marker id="f4b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0 0 L10 5 L0 10 z" fill="#5ef08a"/>
+          </marker>
+        </defs>
+
+        <g fill="#212629" stroke="#333b3e">
+          <rect x="12" y="32" width="232" height="78" rx="6"/>
+          <rect x="12" y="140" width="232" height="78" rx="6"/>
+          <rect x="12" y="248" width="232" height="78" rx="6"/>
+          <rect x="12" y="356" width="232" height="78" rx="6"/>
+        </g>
+        <g font-size="12.5" fill="#e9efe9">
+          <text x="28" y="54">render the prompt</text>
+          <text x="28" y="162">vLLM /v1/completions</text>
+          <text x="28" y="270">parse the completion</text>
+          <text x="28" y="378">validate and return</text>
+        </g>
+        <g font-size="9.5" fill="#93a398">
+          <text x="28" y="76">the served checkpoint's own</text>
+          <text x="28" y="92">tokenizer, not the base's</text>
+          <text x="28" y="184">our template, our parser —</text>
+          <text x="28" y="200">no chat or tools endpoint</text>
+          <text x="28" y="292">re-append the stop token</text>
+          <text x="28" y="308">that vLLM strips off</text>
+          <text x="28" y="400">extract_json + MENU_SCHEMA</text>
+          <text x="28" y="416">after 8 calls, finalize anyway</text>
+        </g>
+        <g stroke="#93a398" stroke-width="1.3" marker-end="url(#f4a)">
+          <line x1="128" y1="110" x2="128" y2="136"/>
+          <line x1="128" y1="218" x2="128" y2="244"/>
+          <line x1="128" y1="326" x2="128" y2="352"/>
+        </g>
+        <g font-size="9" fill="#93a398">
+          <text x="136" y="127">prompt string</text>
+          <text x="136" y="235">completion</text>
+          <text x="136" y="343">no tool call left</text>
+        </g>
+
+        <rect x="320" y="100" width="708" height="350" rx="8" fill="none" stroke="#333b3e"/>
+        <text x="336" y="122" font-size="11.5" fill="#e9efe9">tools.py wrapper — caps every result at 24,000 chars, and warns when it does</text>
+        <rect x="352" y="156" width="644" height="270" rx="8" fill="none" stroke="#5ef08a"/>
+        <text x="368" y="178" font-size="11.5" fill="#5ef08a">Cache.wrap — key = sha256(namespace | normalized key | version)</text>
+
+        <rect x="372" y="200" width="160" height="84" rx="6" fill="#212629" stroke="#333b3e"/>
+        <text x="386" y="222" font-size="11.5" fill="#e9efe9">cache lookup</text>
+        <g font-size="9.5" fill="#93a398">
+          <text x="386" y="242">41,565 rows · 209 MB</text>
+          <text x="386" y="262">hit → stored body,</text>
+          <text x="386" y="276">0.000 s, no network</text>
+        </g>
+
+        <rect x="556" y="200" width="424" height="84" rx="6" fill="#1a1f21" stroke="#333b3e"/>
+        <g font-size="9.5">
+          <text x="570" y="226"><tspan fill="#5ef08a">live</tspan><tspan fill="#93a398"> — a miss goes out, and the result is stored (demo, corpus build)</tspan></text>
+          <text x="570" y="248"><tspan fill="#5ef08a">canned</tspan><tspan fill="#93a398"> — a miss returns a constant, zero network (frozen eval, RL)</tspan></text>
+          <text x="570" y="270"><tspan fill="#5ef08a">error</tspan><tspan fill="#93a398"> — a miss raises, for strict debugging</tspan></text>
+        </g>
+
+        <rect x="384" y="324" width="580" height="86" rx="6" fill="#212629" stroke="#333b3e"/>
+        <text x="400" y="346" font-size="11.5" fill="#e9efe9">backends — the only code that touches the network</text>
+        <g font-size="9.5" fill="#93a398">
+          <text x="400" y="366">Brave /res/v1/web/search · local headless Chromium</text>
+          <text x="400" y="384">plain fetch first, escalating to a scrolling browser render</text>
+          <text x="400" y="402">slims at the source: base64 URIs, images, dead links, blank runs</text>
+        </g>
+
+        <g stroke="#93a398" stroke-width="1.3" marker-end="url(#f4a)">
+          <line x1="244" y1="287" x2="316" y2="287"/>
+          <line x1="430" y1="288" x2="430" y2="320"/>
+          <line x1="520" y1="320" x2="520" y2="288"/>
+        </g>
+        <text x="280" y="279" font-size="9" fill="#93a398" text-anchor="middle">tool call</text>
+        <text x="438" y="308" font-size="9" fill="#93a398">miss</text>
+        <text x="528" y="308" font-size="9" fill="#93a398">store</text>
+
+        <polyline points="674,100 674,20 128,20 128,28" fill="none" stroke="#5ef08a" stroke-width="1.4" marker-end="url(#f4b)"/>
+        <text x="401" y="14" font-size="10" fill="#5ef08a" text-anchor="middle">tool_response, capped — bundled into the assistant turn, which becomes the next prompt</text>
+      </svg>
+    </div>
+    <figcaption><b>The request path.</b> The student is driven through the raw completions endpoint deliberately: vLLM ships no tool-call parser for Gemma 4, and re-templating through a chat endpoint would drift from the exact wire format the model was fine-tuned on. Because the cache sits inside the cap and outside the network, one code path serves three jobs — a live demo, a frozen evaluation that makes no network calls at all, and a corpus build that pays for each page exactly once.</figcaption>
+  </figure>
+
+  <div class="prose">
+    <p>Each turn re-renders the prompt from the whole message list, which is only safe because Gemma 4's template is token-prefix-preserving for this shape of trajectory: rendering the first <em>k</em> messages is an exact prefix of rendering <em>k+1</em>. That property is what lets the training mask be computed by hand, and it is also why a parse failure is fed back as a synthesized tool response rather than a new user turn — a mid-episode user message rewrites earlier tokens and breaks the prefix.</p>
+  </div>
+
+  <h2><span class="num">05 · CONTRACT</span>The output schema</h2>
+  <div class="prose">
+    <p>One file defines the menu shape, and the prompt, the validator, the grounding scorer and the RL reward all import it, so they cannot drift apart. It is deliberately small: two levels of nesting, three fields on an item.</p>
+  </div>
+
+  <figure>
+    <div class="fig-scroll">
+      <svg viewBox="0 0 1040 470" role="img" aria-label="The menu JSON schema: a top-level object holding a list of sections, each holding items with name, description and price, plus the three distinguishable outcomes of the found field.">
+        <defs>
+          <marker id="f5a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0 0 L10 5 L0 10 z" fill="#93a398"/>
+          </marker>
+          <marker id="f5b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0 0 L10 5 L0 10 z" fill="#5ef08a"/>
+          </marker>
+        </defs>
+
+        <g fill="#212629" stroke="#333b3e">
+          <rect x="12" y="24" width="400" height="190" rx="6"/>
+          <rect x="452" y="100" width="250" height="110" rx="6"/>
+          <rect x="742" y="90" width="286" height="170" rx="6"/>
+        </g>
+        <g font-size="12.5" fill="#e9efe9">
+          <text x="28" y="48">the menu object</text>
+          <text x="468" y="124">a section</text>
+          <text x="758" y="114">an item</text>
+        </g>
+
+        <g fill="#5ef08a">
+          <circle cx="32" cy="74" r="3"/><circle cx="32" cy="98" r="3"/><circle cx="32" cy="146" r="3"/>
+          <circle cx="472" cy="150" r="3"/><circle cx="472" cy="174" r="3"/>
+          <circle cx="762" cy="140" r="3"/>
+        </g>
+        <g fill="none" stroke="#93a398">
+          <circle cx="32" cy="122" r="3"/><circle cx="32" cy="170" r="3"/>
+          <circle cx="762" cy="164" r="3"/><circle cx="762" cy="188" r="3"/>
+        </g>
+        <g font-size="10.5" fill="#93a398">
+          <text x="46" y="78">found: <tspan fill="#e9efe9">boolean</tspan></text>
+          <text x="46" y="102">restaurant_name: <tspan fill="#e9efe9">string</tspan></text>
+          <text x="46" y="126">cuisine: <tspan fill="#e9efe9">string | null</tspan></text>
+          <text x="46" y="150">menu: <tspan fill="#e9efe9">[ section, … ]</tspan></text>
+          <text x="46" y="174">source_url: <tspan fill="#e9efe9">string | null</tspan></text>
+
+          <text x="486" y="154">section: <tspan fill="#e9efe9">string</tspan></text>
+          <text x="486" y="178">items: <tspan fill="#e9efe9">[ item, … ]</tspan></text>
+
+          <text x="776" y="144">name: <tspan fill="#e9efe9">string</tspan></text>
+          <text x="776" y="168">description: <tspan fill="#e9efe9">string | null</tspan></text>
+          <text x="776" y="192">price: <tspan fill="#e9efe9">number | null</tspan></text>
+        </g>
+        <g font-size="9.5" fill="#93a398">
+          <text x="46" y="200"><tspan fill="#5ef08a">●</tspan> required &nbsp; ○ nullable</text>
+          <text x="758" y="222">null means the menu itself lists none.</text>
+          <text x="758" y="238">The model is told never to guess a price,</text>
+          <text x="758" y="254">so null reads unambiguously as unknown.</text>
+        </g>
+
+        <g stroke="#93a398" stroke-width="1.3" marker-end="url(#f5a)">
+          <line x1="412" y1="148" x2="448" y2="152"/>
+          <line x1="702" y1="178" x2="738" y2="176"/>
+        </g>
+
+        <path d="M82 214 L82 330" stroke="#5ef08a" stroke-width="1.2" stroke-dasharray="3 3" fill="none"/>
+        <rect x="12" y="330" width="140" height="60" rx="6" fill="#1d3326" stroke="#5ef08a"/>
+        <text x="82" y="357" font-size="12.5" fill="#5ef08a" text-anchor="middle">found</text>
+        <text x="82" y="375" font-size="9" fill="#93a398" text-anchor="middle">three outcomes</text>
+
+        <g fill="#1a1f21" stroke="#333b3e">
+          <rect x="192" y="270" width="836" height="52" rx="6"/>
+          <rect x="192" y="338" width="836" height="52" rx="6"/>
+          <rect x="192" y="406" width="836" height="52" rx="6"/>
+        </g>
+        <g stroke="#5ef08a" stroke-width="1.3" marker-end="url(#f5b)" fill="none">
+          <line x1="152" y1="348" x2="186" y2="300"/>
+          <line x1="152" y1="360" x2="186" y2="364"/>
+          <line x1="152" y1="372" x2="186" y2="428"/>
+        </g>
+        <g font-size="10.5">
+          <text x="210" y="292" fill="#5ef08a">found: true · menu: [ 8 sections, 53 items ]</text>
+          <text x="210" y="311" fill="#93a398">the normal result — every priced item that belongs on a food menu, in the sections the restaurant itself uses</text>
+          <text x="210" y="360" fill="#5ef08a">found: true · menu: [ ]</text>
+          <text x="210" y="379" fill="#93a398">a menu was found, and the diner's dietary restriction removed every item on it</text>
+          <text x="210" y="428" fill="#5ef08a">found: false · menu: [ ] · notes: &quot;…&quot;</text>
+          <text x="210" y="447" fill="#93a398">no page anywhere had this restaurant's menu, and notes records what was tried</text>
+        </g>
+      </svg>
+    </div>
+    <figcaption><b>Why the last two rows stay separate.</b> &ldquo;I found a menu and nothing survived your restrictions&rdquo; and &ldquo;I could not find a menu&rdquo; are different answers, and collapsing them would make abstention unscoreable. Keeping them machine-distinguishable is what lets found-false traces stay in the training set as deliberate anti-hallucination signal — capped at a fifth of the corpus, so abstention is never inflated into the model's default.</figcaption>
+  </figure>
+
+  <p class="meta">Corpus and cache figures queried from the live databases rather than quoted from the README: 3,005 restaurants, 2,233 teacher traces, 41,565 cached fetches.</p>
+
+</div>

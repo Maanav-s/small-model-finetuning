@@ -134,6 +134,10 @@ celerybeat.pid
 # (v2 retired the loose reject_list.txt/grounding.json — both are now DB fields.)
 data/*
 
+# Local checkout of weights pulled from S3 (adapter + served tokenizer). Same rule
+# as data/: S3 is the source of truth, never committed.
+models/
+
 # Eval RESULTS are the exception: results/<run-set>/*.json + README.md ARE committed
 # (the permanent, in-repo record of every scored run -- see results/README.md). Only
 # the bulky per-episode candidate traces stay out; they are archived to
